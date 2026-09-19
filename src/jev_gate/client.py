@@ -47,7 +47,7 @@ def evaluate(state, questions, api_key, model="jev-latest", transport=None):
         raw = _real_transport(state, questions, api_key, model)
     try:
         answers = raw["answers"]
-        return {
+        out = {
             "decision": {
                 "choice": answers["decision"]["choice"],
                 "confidence": float(answers["decision"]["confidence"]),
@@ -59,5 +59,8 @@ def evaluate(state, questions, api_key, model="jev-latest", transport=None):
             },
             "model": raw.get("model", model),
         }
+        if "pick" in answers:
+            out["pick"] = {"choice": answers["pick"]["choice"]}
+        return out
     except Exception as exc:
         raise JevCallError(f"bad-response: {exc}") from exc

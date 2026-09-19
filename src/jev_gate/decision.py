@@ -6,6 +6,8 @@ RISK_MAX = 1.5
 
 
 def combine(decision_choice, decision_confidence, safe_noul, risk_score, halt_kind):
+    if decision_choice not in ("allow", "deny", "ask-human"):
+        return {"action": "ask-human", "reason": "unknown-choice"}
     if decision_choice == "ask-human":
         return {"action": "ask-human", "reason": "jev-asked-human"}
     if decision_confidence < CONF_FLOOR:
@@ -20,6 +22,6 @@ def combine(decision_choice, decision_confidence, safe_noul, risk_score, halt_ki
         return {"action": "ask-human", "reason": "read-low-confidence"}
     if halt_kind in ("write", "multichoice") and decision_confidence < READ_ALLOW:
         return {"action": "ask-human", "reason": "write-low-confidence"}
-    if halt_kind == "destructive" and decision_confidence < DESTRUCTIVE_ALLOW:
+    if halt_kind not in ("read", "write", "multichoice") and decision_confidence < DESTRUCTIVE_ALLOW:
         return {"action": "ask-human", "reason": "destructive-low-confidence"}
     return {"action": "allow", "reason": "jev-allow"}

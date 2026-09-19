@@ -8,7 +8,21 @@ from . import decision as decision_mod
 from . import schemas as schemas_mod
 
 
-def decide_event(event, evaluate_fn):
+def _classify_error(exc):
+    name = type(exc).__name__
+    msg = str(exc) if exc is not None else ""
+    if "missing-api-key" in msg:
+        return "missing-key"
+    if msg.startswith("bad-response"):
+        return "bad-response"
+    if msg.startswith("missing-sdk"):
+        return "transport"
+    if name == "JevCallError":
+        return "transport"
+    return "exception"
+
+
+def decide_event(event, evaluate_fn, _error_box=None):
     try:
         objective = event["objective"]
         halt = event["halt"]
@@ -26,7 +40,23 @@ def decide_event(event, evaluate_fn):
         )
         pick = None
         if halt.get("kind") == "multichoice" and combined["action"] == "allow":
-            pick = halt.get("options", [None])[0]
+            options = halt.get("options") or []
+            choice = None
+            try:
+                choice = result.get("pick", {}).get("choice")
+            except Exception:
+                choice = None
+            if choice not in options:
+                if _error_box is not None:
+                    _error_box["error_class"] = "bad-response"
+                return {
+                    "action": "ask-human",
+                    "reason": "fail-open",
+                    "pick": None,
+                    "confidence": 0.0,
+                    "model": None,
+                }
+            pick = choice
         return {
             "action": combined["action"],
             "reason": combined["reason"],
@@ -34,7 +64,9 @@ def decide_event(event, evaluate_fn):
             "confidence": float(result["decision"]["confidence"]),
             "model": result.get("model"),
         }
-    except Exception:
+    except Exception as exc:
+        if _error_box is not None:
+            _error_box["error_class"] = _classify_error(exc)
         return {
             "action": "ask-human",
             "reason": "fail-open",
@@ -56,17 +88,21 @@ def main():
     def real_evaluate(state, questions):
         return client_mod.evaluate(state, questions, api_key=api_key, model=model)
 
-    out = decide_event(event if event else {"objective": "", "halt": {"kind": "write"}}, real_evaluate)
+    error_box = {}
+    out = decide_event(event if event else {"objective": "", "halt": {"kind": "write"}}, real_evaluate, error_box)
     log_path = os.environ.get("JEV_GATE_LOG", "decisions.jsonl")
     try:
         with open(log_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
+            entry = {
                 "at": datetime.now(timezone.utc).isoformat(),
                 "model": out.get("model"),
                 "action": out.get("action"),
                 "reason": out.get("reason"),
                 "confidence": out.get("confidence"),
-            }) + "\n")
+            }
+            if out.get("reason") == "fail-open" and error_box.get("error_class"):
+                entry["error_class"] = error_box["error_class"]
+            handle.write(json.dumps(entry) + "\n")
     except Exception:
         pass
     sys.stdout.write(json.dumps(out))

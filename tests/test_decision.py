@@ -32,3 +32,17 @@ def test_deny_passes_through():
     from jev_gate.decision import combine
     out = combine("deny", 0.9, 0.9, 0.1, "read")
     assert out["action"] == "deny"
+
+
+def test_unknown_choice_asks_human():
+    from jev_gate.decision import combine
+    out = combine("maybe", 0.95, 0.9, 0.1, "read")
+    assert out["action"] == "ask-human"
+
+
+def test_unknown_kind_defaults_to_destructive_threshold():
+    from jev_gate.decision import combine
+    low = combine("allow", 0.7, 0.9, 0.1, "exec")
+    assert low["action"] == "ask-human"
+    high = combine("allow", 0.92, 0.9, 0.1, "exec")
+    assert high["action"] == "allow"
