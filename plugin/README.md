@@ -2,6 +2,9 @@
 
 Lets Jev answer permission prompts automatically. Allow goes through,
 deny blocks, anything uncertain falls back to your manual prompt.
+Agent questions to you are triaged too: Jev lets good ones through
+and rejects noise, but the answer is always yours — the v2 permission
+reply carries no option choice, so auto-answering is not possible.
 
 Requires OpenCode v2 (stable 1.x never fires the permission hook),
 Python 3.10+ with the `typesafe-sdk` package, and a TypeSafe API key.

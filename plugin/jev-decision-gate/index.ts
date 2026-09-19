@@ -20,12 +20,30 @@ const CATASTROPHIC = [
 const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database))/i
 
 function kindFor(action: string, resources: string[]): string | null {
-  if (action === "question") return null
+  if (action === "question") return "multichoice"
   if (action === "read" || action === "glob" || action === "grep" || action === "external_directory") return "read"
   if (action === "edit") return "write"
   const text = resources.join("\n")
   if (DESTRUCTIVE_HINT.test(text)) return "destructive"
   return "write"
+}
+
+function parseOptions(resources: string[]): string[] {
+  for (const resource of resources) {
+    try {
+      const parsed: unknown = JSON.parse(resource)
+      const list = Array.isArray(parsed) ? parsed : (parsed as { options?: unknown }).options
+      if (Array.isArray(list)) {
+        const labels = list
+          .map((item) => (typeof item === "string" ? item : (item as { label?: unknown }).label))
+          .filter((label): label is string => typeof label === "string" && label.length > 0)
+        if (labels.length > 0) return labels
+      }
+    } catch {
+      continue
+    }
+  }
+  return []
 }
 
 function isEnabled(options: Record<string, unknown>): boolean {
@@ -176,9 +194,14 @@ export default Plugin.define({
 
         try {
           const objective = await objectiveFor(ctx, sessionID)
+          const halt: Record<string, unknown> = { kind, tool: action, detail: joined.slice(0, 4000) }
+          if (kind === "multichoice") {
+            const options = parseOptions(resources)
+            if (options.length > 0) halt.options = options
+          }
           const gateEvent = {
             objective,
-            halt: { kind, tool: action, detail: joined.slice(0, 4000) },
+            halt,
             context: { sessionID },
             policy: { default: "ask-human when unsure" },
           }
@@ -191,6 +214,7 @@ export default Plugin.define({
             reason: decision.reason,
             confidence: decision.confidence,
             model: decision.model,
+            pick: decision.pick ?? null,
             elapsedMs,
             objectiveChars: objective.length,
             hasKey: apiKeyOf(options) !== "",
