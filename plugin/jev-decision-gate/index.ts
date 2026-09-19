@@ -182,7 +182,7 @@ export default Plugin.define({
         if (CATASTROPHIC.some((re) => re.test(joined))) {
           logLine(options, { action: "reject", reason: "catastrophic-pattern", tool: action })
           try {
-            await ctx.permission.reply({ sessionID, requestID, reply: "reject" })
+            await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
           } catch {
             // Fall through to the human prompt.
           }
@@ -220,9 +220,9 @@ export default Plugin.define({
             hasKey: apiKeyOf(options) !== "",
           })
           if (decision.action === "allow") {
-            await ctx.permission.reply({ sessionID, requestID, reply: "once" })
+            await ctx.permission.reply({ sessionID, requestID, decision: "once" })
           } else if (decision.action === "deny") {
-            await ctx.permission.reply({ sessionID, requestID, reply: "reject" })
+            await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
           }
           // ask-human: no reply, the human prompt appears.
         } catch {
