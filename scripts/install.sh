@@ -59,10 +59,13 @@ plugins = [p for p in plugins if not (
     (isinstance(p, str) and "jev-decision-gate" in p))]
 plugins.append({"package": plugin_pkg, "options": {"logFile": log_file}})
 cfg["plugins"] = plugins
-perms = cfg.get("permissions", [])
-if not any(isinstance(p, dict) and p.get("action") == "shell" for p in perms):
-    perms.append({"action": "shell", "resource": "*", "effect": "ask"})
-cfg["permissions"] = perms
+if "permission" not in cfg:
+    cfg["permission"] = "ask"
+elif cfg["permission"] != "ask":
+    print(f"WARN: permission is {cfg['permission']!r}, not left alone — "
+          "the gate needs \"permission\": \"ask\" to receive permission.asked "
+          "events at all; set it yourself if you want the gate to do anything.",
+          file=sys.stderr)
 with open(config_path, "w") as f:
     json.dump(cfg, f, indent=2)
 print(f"wrote {config_path}")
