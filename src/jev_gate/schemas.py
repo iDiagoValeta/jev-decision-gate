@@ -145,7 +145,8 @@ def build_questions(halt):
             "type": "choice",
             "instructions": (
                 "Which option best serves the objective? Answer with the exact option text. "
-                "This is a RECOMMENDATION recorded in the log; the human makes the final choice."
+                "Your choice is submitted automatically as the agent's answer when autonomous; "
+                "only use ask-human on the decision question when a human must choose."
             ),
             "criteria": {
                 name: {"summary": f"Option {i + 1}: {name}", "signals": []}

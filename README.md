@@ -2,13 +2,17 @@
 
 Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
 calls get approved automatically, anything Jev calls risky or
-uncertain falls back to your manual prompt.
+uncertain falls back to your manual prompt — with a desktop popup
+(`notify-send` + `zenity`) so you notice when the gate delegates.
 
 ```
 opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ jev_gate (Python) ──▶ Jev API
      ▲                                │ allow → reply once
      │                                │ deny → reply reject
-     │                                │ ask-human → silence (you decide)
+     │                                │ ask-human → silence + desktop alert
+     │
+     └──question form (GET /api/form)──▶ plugin/ ──▶ Jev pick
+            ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
 ```
 
 The plugin builds a curated brief per halt — objective, halt kind,
@@ -22,10 +26,19 @@ broken gate never silently allows.
 Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, force-push,
 `mkfs`, fork bombs, ...) are rejected instantly without calling Jev.
 
-Agent questions to you (multichoice) are triaged too: Jev records a
-**recommendation** (`pick` in the log, options numbered `1. 2. 3.`),
-but the final choice is always yours — the v2 permission reply
-carries no option field, so auto-answering is impossible by design.
+Agent questions (multichoice) are auto-answered when Jev can pick:
+the permission to open the question tool is passthrough-allowed
+without session context; OpenCode then opens a **form**
+(`metadata.kind=question`). The plugin polls `GET /api/form` (and
+listens for `form.created` / legacy question events), asks Jev for a
+pick, and submits
+`POST /api/session/{sessionID}/form/{formID}/reply` with
+`{"answer":{"q0":"<pick>"}}`. If Jev is unsure or the submit fails,
+you get the desktop alert and answer in the TUI. Live-verified on
+2.0.11 that form reply unblocks the question tool and the agent
+continued (`ELEGIDO=pizza`, idle succeeded) — not a claim that every
+hang case is fixed; see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Requirements
 
@@ -51,7 +64,7 @@ python3 -m jev_gate.doctor
 
 Or manually — see [plugin/README.md](plugin/README.md) for the full
 options table (`typesafeKey`, `logFile`, `gateDir`, `enabled`,
-`timeoutMs`). Disable anytime with `"enabled": false` or
+`timeoutMs`, `pythonBin`). Disable anytime with `"enabled": false` or
 `JEV_GATE_ENABLED=0`.
 
 ## Safety model
@@ -77,7 +90,8 @@ Every decision is appended to a JSONL log (v2 schema:
   `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps
-- `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2
+- `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2,
+  `verify_autonomy.py` (live autonomy check)
 - `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
 ## Develop
