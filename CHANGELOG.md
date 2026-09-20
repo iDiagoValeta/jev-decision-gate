@@ -24,6 +24,10 @@ versioning follows [SemVer](https://semver.org/).
   allow/deny verdict flows with `pick: null`.
 - Fail-open now carries `error` (stdout) → `error_class` (plugin
   log), so Jev-side failures stay visible under single-writer.
+- One reply per request across plugin instances: first claimant wins
+  via an exclusive marker (`.jev-gate-replied/<requestID>`); losers
+  log `duplicate-suppressed`. Every line carries `inst`+`pid` plus
+  `resKinds`/`optionsCount` for diagnosis.
 
 ### Added
 - Unified v2 decision log (`sessionID`, `requestID`, `kind`, `detail_sha256`, `elapsedMs`).

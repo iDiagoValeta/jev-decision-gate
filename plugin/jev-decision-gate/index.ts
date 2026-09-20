@@ -112,6 +112,26 @@ function numberedOptions(options: string[]): string {
   return options.map((o, i) => `${i + 1}. ${o}`).join("\n")
 }
 
+function resourceKinds(resources: string[]): string {
+  return resources
+    .map((r) => {
+      const t = r.trim()
+      if (!t) return "empty"
+      if (t.startsWith("{") || t.startsWith("[")) {
+        try {
+          const p: unknown = JSON.parse(t)
+          if (Array.isArray(p)) return `json-array[${p.length}]`
+          if (p && typeof p === "object") return `json-keys:${Object.keys(p).slice(0, 8).join(",")}`
+          return "json-scalar"
+        } catch {
+          return "json-broken"
+        }
+      }
+      return `text:${t.length}ch`
+    })
+    .join("|")
+}
+
 function isEnabled(options: Record<string, unknown>): boolean {
   if (typeof options.enabled === "boolean") return options.enabled
   const env = (process.env.JEV_GATE_ENABLED ?? "").toLowerCase()
@@ -157,6 +177,54 @@ function logLine(options: Record<string, unknown>, entry: Record<string, unknown
   }
 }
 
+// Cross-instance reply claim: setup() may run more than once per
+// process (and several processes may share a gateDir), so in-memory
+// maps alone cannot guarantee a single reply. First claimant wins via
+// an exclusive marker file; losers skip the reply.
+function repliedDirOf(options: Record<string, unknown>): string {
+  return path.join(repoRoot(options), ".jev-gate-replied")
+}
+
+// Returns "won" (reply now), "lost" (someone else owns it) or "error"
+// (marker unusable — reply anyway, never suppress on FS trouble).
+function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
+  const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
+  try {
+    fs.mkdirSync(repliedDirOf(options), { recursive: true })
+    fs.writeFileSync(path.join(repliedDirOf(options), name), inst, { flag: "wx" })
+    return "won"
+  } catch (err) {
+    const code = (err as { code?: unknown }).code
+    if (code === "EEXIST") return "lost"
+    return "error"
+  }
+}
+
+function releaseReply(options: Record<string, unknown>, requestID: string): void {
+  const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
+  try {
+    fs.unlinkSync(path.join(repliedDirOf(options), name))
+  } catch {
+    // Best effort: a stale marker only risks one extra reply attempt.
+  }
+}
+
+function pruneReplied(options: Record<string, unknown>, maxAgeMs = 3600000): void {
+  try {
+    const dir = repliedDirOf(options)
+    const now = Date.now()
+    for (const f of fs.readdirSync(dir)) {
+      try {
+        const p = path.join(dir, f)
+        if (now - fs.statSync(p).mtimeMs > maxAgeMs) fs.unlinkSync(p)
+      } catch {
+        // Keep going; pruning is best effort.
+      }
+    }
+  } catch {
+    // Directory may not exist yet; nothing to prune.
+  }
+}
 function minimalEnv(options: Record<string, unknown>): Record<string, string | undefined> {
   return {
     PATH: process.env.PATH,
@@ -271,6 +339,10 @@ export default Plugin.define({
     // reply without calling Jev again.
     const inFlight = new Map<string, Promise<Record<string, unknown>>>()
     const resolved = new Map<string, { decision: string; repliedOk: boolean }>()
+    const inst = Math.random().toString(36).slice(2, 8)
+    const logEv = (entry: Record<string, unknown>): void =>
+      logLine(options, { inst, pid: process.pid, ...entry })
+    pruneReplied(options)
     const controller = new AbortController()
     void (async () => {
       try {
@@ -300,7 +372,7 @@ export default Plugin.define({
               // Still pending or already resolved; nothing more to do.
             }
           } else {
-            logLine(options, { sessionID, requestID, tool: action, gateAction: cached.decision === "allow" ? "allow" : cached.decision === "deny" ? "deny" : "ask-human", reason: "duplicate-suppressed" })
+            logEv({ sessionID, requestID, tool: action, gateAction: cached.decision === "allow" ? "allow" : cached.decision === "deny" ? "deny" : "ask-human", reason: "duplicate-suppressed" })
           }
           continue
         }
@@ -314,7 +386,7 @@ export default Plugin.define({
           continue
         }
 
-        const task = handleOne(ctx, options, sessionID, requestID, action, resources)
+        const task = handleOne(ctx, logEv, inst, options, sessionID, requestID, action, resources)
         inFlight.set(requestID, task)
         try {
           const outcome = await task
@@ -335,6 +407,8 @@ export default Plugin.define({
 
 async function handleOne(
   ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  log: (entry: Record<string, unknown>) => void,
+  inst: string,
   options: Record<string, unknown>,
   sessionID: string,
   requestID: string,
@@ -342,14 +416,21 @@ async function handleOne(
   resources: string[],
 ): Promise<{ decision: string; repliedOk: boolean }> {
   const joined = resources.join("\n")
+  const resKinds = resourceKinds(resources)
   if (isCatastrophic(joined)) {
-    logLine(options, { sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
+    log({ sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
     let repliedOk = false
-    try {
-      await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+    const claim = claimReply(options, requestID, inst)
+    if (claim !== "lost") {
+      try {
+        await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+        repliedOk = true
+      } catch {
+        if (claim === "won") releaseReply(options, requestID)
+        // Fall through to the human prompt.
+      }
+    } else {
       repliedOk = true
-    } catch {
-      // Fall through to the human prompt.
     }
     return { decision: "deny", repliedOk }
   }
@@ -379,7 +460,8 @@ async function handleOne(
     const startedAt = Date.now()
     const decision = await runGate(options, gateEvent)
     const elapsedMs = Date.now() - startedAt
-    logLine(options, {
+    const optsLogged = kind === "multichoice" ? (halt.options as string[] | undefined)?.length ?? 0 : undefined
+    log({
       sessionID,
       requestID,
       tool: action,
@@ -393,26 +475,28 @@ async function handleOne(
       objectiveChars: objective.length,
       detail_sha256: sha256Hex(joined),
       hasKey: apiKeyOf(options) !== "",
+      resKinds,
+      ...(optsLogged !== undefined ? { optionsCount: optsLogged } : {}),
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
     })
     let repliedOk = true
-    if (decision.action === "allow") {
-      try {
-        await ctx.permission.reply({ sessionID, requestID, decision: "once" })
-      } catch {
-        repliedOk = false
+    if (decision.action === "allow" || decision.action === "deny") {
+      const claim = claimReply(options, requestID, inst)
+      if (claim === "lost") {
+        log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "duplicate-suppressed" })
+        return { decision: String(decision.action), repliedOk: true }
       }
-    } else if (decision.action === "deny") {
       try {
-        await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+        await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
       } catch {
+        if (claim === "won") releaseReply(options, requestID)
         repliedOk = false
       }
     }
     // ask-human: no reply, the human prompt appears.
     return { decision: String(decision.action), repliedOk }
   } catch (err) {
-    logLine(options, {
+    log({
       sessionID,
       requestID,
       tool: action,
