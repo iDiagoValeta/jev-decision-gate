@@ -8,13 +8,20 @@ and `docs/ARCHITECTURE.md` instead.
 An OpenCode **v2** plugin (`plugin/jev-decision-gate/`) that intercepts
 `permission.asked` events and asks Jev (TypeSafe AI, via `src/jev_gate/`,
 a Python package spawned as a subprocess) to decide allow/deny/ask-human
-instead of always prompting a human. Two languages, one flow:
+instead of always prompting a human. Agent questions are a separate
+phase (pending form via `GET /api/form` → form reply API). Two languages,
+one flow:
 
 ```
 opencode v2 → index.ts (permission.asked) → spawn python3 -m jev_gate.cli
             → schemas.py builds the Jev brief → client.py calls Jev
             → decision.py combines the answer → cli.py prints JSON
-            → index.ts replies to opencode (or stays silent → human prompt)
+            → index.ts replies to opencode (or ask-human → silence + desktop alert)
+opencode v2 → question tool opens form (metadata.kind=question)
+            → index.ts polls GET /api/form (also listens form.created /
+              legacy question events) → Jev pick
+            → POST /api/session/{sessionID}/form/{formID}/reply
+              body {"answer":{"q0":"<pick>"}}
 ```
 
 Full flow and ADRs: `docs/ARCHITECTURE.md`. Read it before touching the
@@ -58,13 +65,14 @@ bug.
 
 | Path | Owns |
 | ---- | ---- |
-| `plugin/jev-decision-gate/index.ts` | opencode hook: catastrophic-pattern kill list, `kindFor`, conversation-context gathering, spawn, cross-instance dedup, logging |
+| `plugin/jev-decision-gate/index.ts` | opencode hook: catastrophic-pattern kill list, `kindFor`, conversation-context gathering, form-API answers (`/api/form` poll + reply), human alert popup, spawn (`pythonBin` / mise / `PYTHONPATH`), cross-instance dedup, logging |
 | `src/jev_gate/schemas.py` | Jev prompt brief, redaction, question shapes |
 | `src/jev_gate/client.py` | TypeSafe SDK wrapper, error mapping |
 | `src/jev_gate/decision.py` | pure allow/deny/ask-human combine logic (fully unit tested) |
 | `src/jev_gate/cli.py` | stdin/stdout contract with `index.ts`, v2 JSONL log |
 | `src/jev_gate/doctor.py` | install diagnostics, no secrets printed |
 | `scripts/measure.py` | reads the JSONL log: rates, p95, cost, by-session |
+| `scripts/verify_autonomy.py` | non-interactive live check that the plugin owns permission + form answers |
 | `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a decision-logic/kind change without a new case here is unreviewed |
 
 ## Non-negotiables (see `CONTRIBUTING.md` "Safety contract")
@@ -79,19 +87,26 @@ bug.
 3. **Policy changes need a golden case.** Anything touching
    `decision.py`'s combine logic or `kindFor` needs a new entry in
    `tests/golden.json`.
-4. **`multichoice` never calls `ctx.permission.reply` — but this does
-   NOT fix the question-tool hang, it's just a harmless simplification.**
-   The reply always arrives too late regardless ("Permission request
-   not found", confirmed) so skipping it costs nothing. It was *also*
-   tried as a fix for the hang after the human picks an option — ruled
-   out live on 2.0.11: picking still hangs even with zero reply
-   attempted. **The actual cause of the hang is still unknown.** Three
-   fix attempts failed (cross-instance race, skip-reply-once,
-   skip-reply-again-with-evidence) — do not attempt a fourth blind fix.
-   Read `docs/TROUBLESHOOTING.md` "Question dialog hangs" for what's
-   actually been ruled out (plugin disabled → works; plugin enabled in
-   any form tested so far → hangs) and the next diagnostic to actually
-   isolate it before changing more code.
+4. **Question tool is two-phase — do not collapse it back into a
+   single `permission.asked` Jev+`session.context` path.** On
+   `permission.asked` with `action === "question"`: passthrough-allow
+   (`permission.reply` once) with **no** `ctx.session.context` and
+   **no** Jev call (`reason: "question-permission-passthrough"`).
+   On OpenCode 2.0.x the question tool then opens a **form**
+   (`metadata.kind=question`, listed at `GET /api/form`). The plugin
+   polls `/api/form` (and also listens for `form.created` / legacy
+   question events); Jev picks; the plugin replies with
+   `POST /api/session/{sessionID}/form/{formID}/reply` body
+   `{"answer":{"q0":"<pick>"}}`. Log shows `phase: form-answer` then
+   `reason: question-answered`. That closes the old “pick is log-only”
+   model. Mid-flight `session.context` on the permission path was
+   implicated (not proven) in the post-pick hang; three earlier fixes
+   failed (cross-instance race, skip-reply-once, skip-reply-again-with-
+   evidence). Live-verified on 2.0.11: form reply unblocks the question
+   tool and the agent continued (`ELEGIDO=pizza`, idle succeeded) —
+   do **not** generalize that to “hang fixed for all cases.” Read
+   `docs/TROUBLESHOOTING.md` "Question dialog hangs" before changing
+   this path again.
 5. **`setup()` runs more than once per opencode process.** Confirmed in
    production logs (same `pid`, different `inst`). Any new code path
    that evaluates or replies to a `permission.asked` event must claim
@@ -126,13 +141,19 @@ npm --prefix plugin exec --no -- tsc --noEmit -p plugin/jev-decision-gate   # TS
 
 python3 -m jev_gate.doctor            # install/env diagnostics
 python3 scripts/measure.py            # read the decision log
+python3 scripts/verify_autonomy.py    # live autonomy check (needs running opencode service)
 ```
+
+The plugin auto-detects a mise-managed Python (`options.pythonBin` /
+`JEV_GATE_PYTHON`, else newest `~/.local/share/mise/installs/python/*/bin/python3`)
+and sets `PYTHONPATH=src` on the gate subprocess so `typesafe_sdk` resolves
+when the opencode service’s `/usr/bin/python3` lacks it.
 
 CI (`.github/workflows/ci.yml`) runs `pytest` on 3.10-3.12, `ruff`, and
 `tsc --noEmit`. There is no automated test for `index.ts` logic beyond
 the type check — the interactive permission/dialog flow can only be
-verified by hand against a live opencode v2 session (see
-`docs/TROUBLESHOOTING.md`).
+verified by hand (or `scripts/verify_autonomy.py`) against a live
+opencode v2 session (see `docs/TROUBLESHOOTING.md`).
 
 ## Documentation is not optional
 

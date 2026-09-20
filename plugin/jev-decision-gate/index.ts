@@ -77,16 +77,27 @@ export function isCatastrophic(joined: string): boolean {
   return CATASTROPHIC.some((re) => re.test(joined) || re.test(normalized))
 }
 
+// Documented OpenCode permission keys (https://opencode.ai/docs/permissions/):
+// read, edit, glob, grep, bash, task, skill, lsp, question, webfetch,
+// websearch, external_directory, doom_loop. edit also covers write/apply_patch.
+const READ_ACTIONS = new Set([
+  "read",
+  "glob",
+  "grep",
+  "external_directory",
+  "lsp",
+  "skill",
+  "todowrite",
+])
+const WRITE_ACTIONS = new Set(["edit", "bash", "write", "apply_patch", "task", "webfetch", "websearch"])
+
 export function kindFor(action: string, resources: string[]): string | null {
   if (action === "question") return "multichoice"
-  if (action === "read" || action === "glob" || action === "grep" || action === "external_directory") return "read"
-  if (action === "edit") {
-    const text = resources.join("\n")
-    if (DESTRUCTIVE_HINT.test(text)) return "destructive"
-    return "write"
-  }
+  if (action === "doom_loop") return "destructive"
+  if (READ_ACTIONS.has(action)) return "read"
   const text = resources.join("\n")
   if (DESTRUCTIVE_HINT.test(text)) return "destructive"
+  if (WRITE_ACTIONS.has(action)) return "write"
   return "write"
 }
 
@@ -230,22 +241,193 @@ function pruneReplied(options: Record<string, unknown>, maxAgeMs = 3600000): voi
     // Directory may not exist yet; nothing to prune.
   }
 }
+
+/** Attention-grabbing desktop alert when Jev delegates to a human. */
+export function alertHuman(title: string, body: string): void {
+  const text = redactSecrets(body).slice(0, 400)
+  const headline = title.slice(0, 120) || "Jev Decision Gate"
+  try {
+    const n = spawn(
+      "notify-send",
+      [
+        "-u",
+        "critical",
+        "-t",
+        "0",
+        "-a",
+        "Jev Decision Gate",
+        "--hint=string:sound-name:dialog-warning",
+        "--hint=string:desktop-entry:opencode",
+        headline,
+        text || "Jev needs your decision in OpenCode.",
+      ],
+      { stdio: "ignore", detached: true },
+    )
+    n.unref?.()
+  } catch {
+    // Notification is best-effort.
+  }
+  try {
+    const z = spawn(
+      "zenity",
+      ["--warning", "--title", headline, "--width=420", "--text", text || "Jev needs your decision in OpenCode."],
+      { stdio: "ignore", detached: true },
+    )
+    z.unref?.()
+  } catch {
+    // Dialog is best-effort; notify-send alone is enough on headless.
+  }
+}
+
+function labelsFromFormField(field: unknown): string[] {
+  if (!field || typeof field !== "object") return []
+  const opts = (field as { options?: unknown }).options
+  if (!Array.isArray(opts)) return []
+  return opts
+    .map((item) => {
+      if (typeof item === "string") return item
+      const o = item as { label?: unknown; value?: unknown }
+      if (typeof o.label === "string" && o.label) return o.label
+      if (typeof o.value === "string" && o.value) return o.value
+      return null
+    })
+    .filter((label): label is string => typeof label === "string" && label.length > 0)
+    .slice(0, 10)
+}
+
+function valueForPick(field: unknown, pick: string): string {
+  if (!field || typeof field !== "object") return pick
+  const opts = (field as { options?: unknown }).options
+  if (!Array.isArray(opts)) return pick
+  for (const item of opts) {
+    if (typeof item === "string" && item === pick) return pick
+    if (item && typeof item === "object") {
+      const o = item as { label?: unknown; value?: unknown }
+      if (o.label === pick || o.value === pick) {
+        return typeof o.value === "string" && o.value ? o.value : pick
+      }
+    }
+  }
+  return pick
+}
+
+/** List pending interactive forms (question tool uses kind=question forms on 2.0.x). */
+function listPendingForms(): Promise<Array<Record<string, unknown>>> {
+  return new Promise((resolve) => {
+    const child = spawn("opencode", ["api", "GET", "/api/form"], {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    let stdout = ""
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM")
+      } catch {
+        // ignore
+      }
+      resolve([])
+    }, 5000)
+    child.stdout?.on("data", (c) => {
+      if (stdout.length < 256_000) stdout += String(c)
+    })
+    child.on("error", () => {
+      clearTimeout(timer)
+      resolve([])
+    })
+    child.on("close", () => {
+      clearTimeout(timer)
+      try {
+        const parsed = JSON.parse(stdout) as { data?: unknown } | unknown
+        const data = parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data)
+          ? (parsed as { data: unknown[] }).data
+          : Array.isArray(parsed)
+            ? parsed
+            : []
+        resolve(data.filter((x): x is Record<string, unknown> => !!x && typeof x === "object") as Record<string, unknown>[])
+      } catch {
+        resolve([])
+      }
+    })
+  })
+}
+
+/** Submit answers to a pending OpenCode form (question tool on 2.0.x). */
+function replyFormAnswer(sessionID: string, formID: string, answer: Record<string, string>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ answer })
+    const child = spawn(
+      "opencode",
+      ["api", "POST", `/api/session/${sessionID}/form/${formID}/reply`, "-d", body],
+      { env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+    )
+    let stderr = ""
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM")
+      } catch {
+        // ignore
+      }
+      reject(new Error("form-reply timeout"))
+    }, 10000)
+    child.stderr?.on("data", (c) => {
+      if (stderr.length < 4000) stderr += String(c)
+    })
+    child.on("error", (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`form-reply exit ${code}: ${stderr.slice(0, 200)}`))
+    })
+  })
+}
+
+function pythonBin(options: Record<string, unknown>): string {
+  if (typeof options.pythonBin === "string" && options.pythonBin) return options.pythonBin
+  if (process.env.JEV_GATE_PYTHON) return process.env.JEV_GATE_PYTHON
+  // The opencode service often runs with /usr/bin/python3, which may not
+  // have typesafe-sdk. Prefer a mise-managed interpreter when present.
+  const home = process.env.HOME || ""
+  const miseRoot = path.join(home, ".local/share/mise/installs/python")
+  try {
+    const versions = fs.readdirSync(miseRoot).sort().reverse()
+    for (const v of versions) {
+      const bin = path.join(miseRoot, v, "bin", "python3")
+      if (fs.existsSync(bin)) return bin
+    }
+  } catch {
+    // fall through
+  }
+  return "python3"
+}
+
 function minimalEnv(options: Record<string, unknown>): Record<string, string | undefined> {
+  const root = repoRoot(options)
+  const src = path.join(root, "src")
+  const existing = process.env.PYTHONPATH ?? ""
+  const pyPath = existing ? `${src}${path.delimiter}${existing}` : src
   return {
     PATH: process.env.PATH,
     HOME: process.env.HOME,
-    PYTHONPATH: process.env.PYTHONPATH,
+    PYTHONPATH: pyPath,
     TYPESAFE_API_KEY: apiKeyOf(options),
     JEV_GATE_LOG: logFileOf(options),
     JEV_GATE_CLI_LOG: "0",
     JEV_MODEL: process.env.JEV_MODEL,
-    JEV_GATE_DIR: process.env.JEV_GATE_DIR,
+    JEV_GATE_DIR: process.env.JEV_GATE_DIR ?? root,
+    SSL_CERT_FILE: process.env.SSL_CERT_FILE,
+    REQUESTS_CA_BUNDLE: process.env.REQUESTS_CA_BUNDLE,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
   }
 }
 
 function runGate(options: Record<string, unknown>, event: Record<string, unknown>): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", ["-m", "jev_gate.cli"], {
+    const child = spawn(pythonBin(options), ["-m", "jev_gate.cli"], {
       cwd: repoRoot(options),
       env: minimalEnv(options),
     })
@@ -418,17 +600,59 @@ export default Plugin.define({
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
     const controller = new AbortController()
+    const formSeen = new Set<string>()
+    // Poll pending forms: on opencode 2.0.x the question tool opens a
+    // form (metadata.kind=question). Event names vary; polling /api/form
+    // is the durable autonomy path.
+    const pollMs = 750
+    const pollTimer = setInterval(() => {
+      void (async () => {
+        const pending = await listPendingForms()
+        for (const item of pending) {
+          const id = String(item.id ?? "")
+          if (!id || formSeen.has(id)) continue
+          const meta = (item.metadata ?? {}) as Record<string, unknown>
+          // Answer question-kind forms; other forms also get Jev if they have options.
+          formSeen.add(id)
+          try {
+            await handleFormAsked(ctx as Parameters<typeof handleFormAsked>[0], logEv, inst, options, item, endedSessions)
+          } catch {
+            formSeen.delete(id)
+          }
+          void meta
+        }
+      })()
+    }, pollMs)
+    ;(pollTimer as unknown as { unref?: () => void }).unref?.()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-        const evt = event as { type?: string; data?: Record<string, unknown> }
+        const evt = event as { type?: string; data?: Record<string, unknown>; properties?: Record<string, unknown> }
         if (evt.type === "session.deleted") {
-          const dead = String((evt.data ?? {}).sessionID ?? "")
+          const dead = String((evt.data ?? evt.properties ?? {}).sessionID ?? "")
           if (dead) endedSessions.add(dead)
           continue
         }
+        // Forms (question tool on 2.0.x) and legacy question events.
+        if (
+          evt.type === "form.created" ||
+          evt.type === "question.v2.asked" ||
+          evt.type === "question.asked"
+        ) {
+          const payload = (evt.properties ?? evt.data ?? {}) as Record<string, unknown>
+          const form = (payload.form && typeof payload.form === "object"
+            ? (payload.form as Record<string, unknown>)
+            : payload) as Record<string, unknown>
+          const fid = String(form.id ?? payload.id ?? "")
+          if (fid) formSeen.add(fid)
+          const task = handleFormAsked(ctx, logEv, inst, options, form, endedSessions)
+          void task.catch(() => {
+            // Failures are logged inside the handler.
+          })
+          continue
+        }
         if (evt.type !== "permission.asked") continue
-        const data = evt.data ?? {}
+        const data = evt.data ?? evt.properties ?? {}
         const sessionID = String(data.sessionID ?? "")
         const requestID = String(data.id ?? "")
         const action = String((data as { action?: unknown }).action ?? "")
@@ -499,9 +723,148 @@ export default Plugin.define({
         // Subscription ended (server shutdown). Nothing to report.
       }
     })()
-    return () => controller.abort()
+    return () => {
+      clearInterval(pollTimer)
+      controller.abort()
+    }
   },
 })
+
+async function handleFormAsked(
+  ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
+  log: (entry: Record<string, unknown>) => void,
+  inst: string,
+  options: Record<string, unknown>,
+  payload: Record<string, unknown>,
+  endedSessions: Set<string>,
+): Promise<void> {
+  const sessionID = String(payload.sessionID ?? "")
+  const formID = String(payload.id ?? "")
+  if (!sessionID || !formID) {
+    log({ sessionID: sessionID || null, requestID: formID || null, tool: "question", gateAction: "ask-human", reason: "missing-ids" })
+    return
+  }
+  const claim = claimReply(options, `form:${formID}`, inst)
+  if (claim === "lost") {
+    log({ sessionID, requestID: formID, tool: "question", gateAction: "ask-human", reason: "duplicate-suppressed" })
+    return
+  }
+  if (await sessionIsEnded(ctx, sessionID, endedSessions)) {
+    log({ sessionID, requestID: formID, tool: "question", gateAction: "ask-human", reason: "session-ended" })
+    return
+  }
+
+  const fields = Array.isArray(payload.fields) ? payload.fields : []
+  const answer: Record<string, string> = {}
+  const picks: string[] = []
+
+  try {
+    let objective = "Answer the agent's multiple-choice question to unblock the session"
+    try {
+      objective = await objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options)))
+    } catch {
+      // keep fallback
+    }
+
+    for (let fi = 0; fi < Math.max(fields.length, 1); fi++) {
+      const field = fields[fi]
+      const key =
+        field && typeof field === "object" && typeof (field as { key?: unknown }).key === "string"
+          ? String((field as { key: string }).key)
+          : `q${fi}`
+      const labels = labelsFromFormField(field)
+      const title = field && typeof field === "object" ? String((field as { title?: unknown }).title ?? "") : ""
+      const description =
+        field && typeof field === "object" ? String((field as { description?: unknown }).description ?? "") : ""
+      const detail = redactSecrets(
+        [title, description, labels.map((l, i) => `${i + 1}. ${l}`).join("\n")].filter(Boolean).join("\n").slice(0, 4000),
+      )
+      const halt: Record<string, unknown> = {
+        kind: "multichoice",
+        tool: "question",
+        detail: detail || "agent question form",
+      }
+      if (labels.length > 0) {
+        halt.options = labels
+        halt.numbered = numberedOptions(labels)
+      }
+      const startedAt = Date.now()
+      const decision = await runGate(options, {
+        objective,
+        halt,
+        context: { sessionID, requestID: formID, risk_hints: "interactive-form-question", fieldIndex: fi },
+        policy: { default: "ask-human when unsure" },
+      })
+      const elapsedMs = Date.now() - startedAt
+      log({
+        sessionID,
+        requestID: formID,
+        tool: "question",
+        kind: "multichoice",
+        gateAction: decision.action,
+        reason: decision.reason,
+        confidence: decision.confidence,
+        model: decision.model,
+        pick: decision.pick ?? null,
+        elapsedMs,
+        objectiveChars: objective.length,
+        hasKey: apiKeyOf(options) !== "",
+        optionsCount: labels.length,
+        fieldKey: key,
+        ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
+        phase: "form-answer",
+      })
+
+      if (decision.action !== "allow" || typeof decision.pick !== "string" || !decision.pick) {
+        alertHuman(
+          "Jev necesita tu decisión",
+          `Formulario: ${description || title || detail}`.slice(0, 280),
+        )
+        return
+      }
+      if (labels.length > 0 && !labels.includes(decision.pick)) {
+        alertHuman("Jev: opción inválida", `Jev eligió "${decision.pick}" fuera de la lista. Responde en OpenCode.`)
+        return
+      }
+      picks.push(decision.pick)
+      answer[key] = valueForPick(field, decision.pick)
+    }
+
+    try {
+      await replyFormAnswer(sessionID, formID, answer)
+      log({
+        sessionID,
+        requestID: formID,
+        tool: "question",
+        gateAction: "allow",
+        reason: "question-answered",
+        pick: picks.join(" | "),
+      })
+    } catch (err) {
+      log({
+        sessionID,
+        requestID: formID,
+        tool: "question",
+        gateAction: "ask-human",
+        reason: "form-reply-failed",
+        error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      })
+      alertHuman("Jev no pudo responder", `Fallo al enviar la respuesta del formulario. ${String(err).slice(0, 160)}`)
+    }
+  } catch (err) {
+    log({
+      sessionID,
+      requestID: formID,
+      tool: "question",
+      kind: "multichoice",
+      gateAction: "ask-human",
+      reason: "fail-open",
+      error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      phase: "form-answer",
+    })
+    alertHuman("Jev necesita tu decisión", "Error evaluando el formulario del agente. Responde en OpenCode.")
+  }
+}
 
 async function handleOne(
   ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
@@ -542,22 +905,56 @@ async function handleOne(
     return { decision: "deny", repliedOk }
   }
 
+  // question permission: allow the tool without session.context / Jev.
+  // Answering happens by polling /api/form and POSTing form replies.
+  // Touching session.context here was implicated in the post-pick hang.
+  if (action === "question") {
+    let repliedOk = true
+    try {
+      await ctx.permission.reply({ sessionID, requestID, decision: "once" })
+    } catch (err) {
+      log({
+        sessionID,
+        requestID,
+        tool: action,
+        kind: "multichoice",
+        gateAction: "allow",
+        reason: "reply-failed",
+        error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      })
+      repliedOk = false
+    }
+    log({
+      sessionID,
+      requestID,
+      tool: action,
+      kind: "multichoice",
+      gateAction: "allow",
+      reason: "question-permission-passthrough",
+      detail_sha256: sha256Hex(joined),
+      resKinds,
+      repliedOk,
+    })
+    return { decision: "allow", repliedOk }
+  }
+
   const kind = kindFor(action, resources)
-  if (kind === null) return { decision: "ask-human", repliedOk: true }
+  if (kind === null) {
+    alertHuman("Jev: permiso desconocido", `Acción no clasificada: ${action}. Decide en OpenCode.`)
+    return { decision: "ask-human", repliedOk: true }
+  }
 
   try {
     const objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))
     const rawDetail = joined.slice(0, 4000)
     const detail = redactSecrets(rawDetail)
-    const riskHints = DESTRUCTIVE_HINT.test(joined) ? "matches destructive-hint" : ""
+    const riskHints =
+      action === "doom_loop"
+        ? "doom_loop: identical tool call repeated"
+        : DESTRUCTIVE_HINT.test(joined)
+          ? "matches destructive-hint"
+          : ""
     const halt: Record<string, unknown> = { kind, tool: action, detail }
-    if (kind === "multichoice") {
-      const opts = parseOptions(resources)
-      if (opts.length > 0) {
-        halt.options = opts
-        halt.numbered = numberedOptions(opts)
-      }
-    }
     const gateEvent = {
       objective,
       halt,
@@ -567,7 +964,6 @@ async function handleOne(
     const startedAt = Date.now()
     const decision = await runGate(options, gateEvent)
     const elapsedMs = Date.now() - startedAt
-    const optsLogged = kind === "multichoice" ? (halt.options as string[] | undefined)?.length ?? 0 : undefined
     log({
       sessionID,
       requestID,
@@ -583,32 +979,22 @@ async function handleOne(
       detail_sha256: sha256Hex(joined),
       hasKey: apiKeyOf(options) !== "",
       resKinds,
-      ...(optsLogged !== undefined ? { optionsCount: optsLogged } : {}),
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
     })
     let repliedOk = true
-    // Multichoice never replies, even though that's normally the whole
-    // point of the gate (skip the manual click). Confirmed empirically
-    // on both 2.0.6 and 2.0.11: for this specific tool, the client
-    // commits to its own confirmation UI faster than Jev's round-trip
-    // (~750-900ms) can land, so the reply always arrives too late
-    // ("Permission request not found") and the human ends up clicking
-    // Allow manually regardless — replying costs nothing to skip. Worse,
-    // the *attempt* itself (even though it fails) leaves something
-    // broken for the follow-up step where the human picks an option:
-    // with the plugin fully disabled, picking works; with it enabled
-    // and attempting-and-failing this reply, picking hangs every time.
-    // `pick` stays a log-only recommendation either way — reply() has
-    // no option field, it was never going to answer for the human.
-    if (kind !== "multichoice" && (decision.action === "allow" || decision.action === "deny")) {
+    if (decision.action === "allow" || decision.action === "deny") {
       try {
         await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
       } catch (err) {
         log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
         repliedOk = false
       }
+    } else {
+      alertHuman(
+        "Jev necesita tu decisión",
+        `${action}: ${detail.slice(0, 220) || "permiso pendiente en OpenCode"}`,
+      )
     }
-    // ask-human, or multichoice: no reply, the human prompt appears.
     return { decision: String(decision.action), repliedOk }
   } catch (err) {
     if (err instanceof SessionEndedError || endedSessions.has(sessionID)) {
@@ -632,7 +1018,7 @@ async function handleOne(
       reason: "fail-open",
       error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
     })
-    // Fail silent: the human prompt appears.
+    alertHuman("Jev: error del gate", `Fail-open. Revisa OpenCode (${action}).`)
     return { decision: "ask-human", repliedOk: true }
   }
 }

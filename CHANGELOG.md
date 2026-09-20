@@ -6,6 +6,43 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added / Changed (2026-09-20–21, full autonomy)
+- **Full autonomy over documented OpenCode permission keys.** Jev now
+  evaluates allow/deny/ask-human for the keys listed in OpenCode's
+  permissions docs: `read`, `edit` (also covers `write` /
+  `apply_patch`), `glob`, `grep`, `bash`, `task`, `skill`, `lsp`,
+  `webfetch`, `websearch`, `external_directory`, and `doom_loop`
+  (`kindFor` maps these into read / write / destructive; unknown
+  actions still fail-open to ask-human).
+- **Question tool: two-phase handling via form API (2.0.x).** On
+  `permission.asked` for `action === "question"`, the plugin
+  passthrough-allows (`decision: "once"`) without calling
+  `ctx.session.context` or Jev (`reason: "question-permission-passthrough"`).
+  The question tool then opens a **form** (`metadata.kind=question`);
+  the plugin polls `GET /api/form` (also listens for `form.created` /
+  legacy question events), asks Jev for a `pick`, and POSTs
+  `opencode api POST /api/session/{sessionID}/form/{formID}/reply`
+  with body `{"answer":{"q0":"<pick>"}}`. Log shows
+  `phase: form-answer` then `reason: question-answered`. This closes
+  the previous “pick is log-only” model. Earlier drafts incorrectly
+  described a `question.v2.asked` / `/api/question` reply path — that
+  is not the live 2.0.11 surface. **Live-verified on 2.0.11:** form
+  reply unblocks the question tool and the agent continued
+  (`ELEGIDO=pizza`, idle succeeded). Do **not** treat that as “hang
+  fixed for all cases” (see `docs/TROUBLESHOOTING.md`).
+- **Python spawn: mise + PYTHONPATH.** Plugin resolves
+  `options.pythonBin` / `JEV_GATE_PYTHON`, else a mise-managed
+  interpreter under `~/.local/share/mise/installs/python/`, and sets
+  `PYTHONPATH=<repo>/src` so `typesafe_sdk` works when the service’s
+  `/usr/bin/python3` lacks it.
+- **`scripts/verify_autonomy.py`.** Non-interactive check that the
+  plugin owns permission + form answers against a running opencode
+  service (avoids racing `opencode run --auto`).
+- **Human alert on ask-human.** When Jev (or fail-open) delegates to a
+  human, the plugin fires `notify-send -u critical` and a best-effort
+  `zenity --warning` popup so the operator notices without watching the
+  TUI.
+
 ### Changed (2026-09-20, multichoice reply removed — did NOT fix the hang)
 - `multichoice` permission replies removed again: the reply to a
   `multichoice` permission consistently arrives after opencode's client

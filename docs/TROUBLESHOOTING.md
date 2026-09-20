@@ -13,7 +13,7 @@ python3 scripts/measure.py
 | Symptom in log | Cause | Fix |
 | -------------- | ----- | --- |
 | `reason: fail-open, error_class: missing-key` | no API key | `export TYPESAFE_API_KEY=...` (must be set in the *service's* env — see below) |
-| `error_class: transport` / `missing-sdk` | `typesafe-sdk` not installed | `pip install -e .` from repo root |
+| `error_class: transport` / `missing-sdk` | `typesafe-sdk` missing on the Python the plugin spawns (often the service’s `/usr/bin/python3`) | `pip install -e .` into that env, or set `pythonBin` / `JEV_GATE_PYTHON` to a mise/user interpreter (plugin also auto-detects mise and sets `PYTHONPATH=src`) |
 | `error_class: gate timeout` | Jev slow / offline | raise `timeoutMs` (max 30000) |
 | no log lines at all, `permission: "allow"` in config | confirmed: v2.0.11 does not emit `permission.asked` at all when the ambient mode is already `allow` — nothing to intercept | set `"permission": "ask"` (global or project config); that's what lets the gate substitute Jev for the human in the first place |
 | no log lines at all, `permission: "ask"` already set | hook never fired for another reason | check `opencode debug config` resolves your plugin path; re-check with `python3 -m jev_gate.doctor` |
@@ -112,24 +112,71 @@ unfamiliar line came from here.
 
 ## Question dialog hangs after picking an option
 
-**Status: NOT fixed. Three different fixes tried, all failed to
-resolve it. Stop and rethink before trying a fourth — see "What we
-actually know" below.**
+**Status (2026-09-21, OpenCode 2.0.11):** live-verified that the
+**form reply** path unblocks the question tool and the agent
+continued (`ELEGIDO=pizza`, idle succeeded). That is **not** a claim
+that every hang case is fixed for all configs — only that auto-answer
+via `POST .../form/.../reply` worked in that repro. Do not mark
+broader hang closure from a green `tsc` run alone.
 
-Timeline, in order, because each "fix" was reverted or disproven for a
-specific reason and it's worth knowing why before touching this again:
+### Current approach (full autonomy — form API)
+
+Two phases, deliberately separating permission unlock from answering.
+On 2.0.x the question tool opens a **form**, not a dedicated
+`/api/question` surface (older docs that said `question.v2.asked` →
+question reply API were wrong for this line):
+
+1. **`permission.asked` for `action === "question"`** —
+   passthrough-allow (`permission.reply({ decision: "once" })`) with
+   **no** `ctx.session.context`, **no** Jev call. Logged as
+   `reason: "question-permission-passthrough"`. Mid-flight
+   `session.context` on the permission path was the leading suspect
+   after earlier failures; this path avoids it by design.
+2. **Form answer** — question tool creates a form
+   (`metadata.kind=question`) listed at `GET /api/form`. The plugin
+   polls `/api/form` and also listens for `form.created` / legacy
+   `question.v2.asked` / `question.asked`. Jev evaluates options,
+   returns a `pick`, and the plugin POSTs
+   `opencode api POST /api/session/{sessionID}/form/{formID}/reply`
+   with body `{"answer":{"q0":"<pick>"}}`. Log shows
+   `phase: "form-answer"` then `reason: "question-answered"`. This
+   closes the old “pick is log-only” model. If Jev returns ask-human /
+   invalid pick / reply failure, the human is alerted
+   (`notify-send` + `zenity`) and must answer in the TUI.
+
+**Live evidence (auto-answer):**
+
+- Log: `question-permission-passthrough` → `phase: form-answer` →
+  `reason: question-answered`.
+- Agent wrote `ELEGIDO=pizza` and reached idle — verified on 2.0.11
+  (also exercisable non-interactively with
+  `scripts/verify_autonomy.py` against a running `opencode` service).
+
+**Still worth checking (human fallback / other hangs):**
+
+- Force ask-human (no key / Jev unsure) → desktop alert fires; picking
+  in the TUI should still work (does **not** hang).
+- If the human-pick path still hangs with this build, the hang is
+  not solved by form auto-answer alone — fall back to the isolation
+  diagnostic below.
+
+### Historical timeline (failed fixes — keep for context)
+
+Each earlier "fix" was reverted or disproven for a specific reason:
 
 1. **Auto-approve `multichoice` like any other kind** (original
-   design). Hangs after picking an option.
-2. **Fix: claim the requestID before calling Jev, not just before
-   replying**, to close a real cross-instance race (`setup()` runs more
-   than once per opencode process — confirmed, was causing duplicate
-   Jev calls). Genuine improvement (removed real duplicate work), but
-   verified on 2.0.6 to NOT be the cause of the hang: a single, clean,
-   race-free `jev-allow` reply still hung after picking.
-3. **Skip the reply for `multichoice` entirely** — tried once, reverted
-   because it seemed to trade the hang for a mandatory manual
-   Allow/Reject click that wasn't there before.
+   design: Jev + `session.context` on `permission.asked`, reply
+   once). Hangs after picking an option. `pick` was log-only.
+2. **Claim the requestID before calling Jev, not just before
+   replying**, to close a real cross-instance race (`setup()` runs
+   more than once per opencode process — confirmed, was causing
+   duplicate Jev calls). Genuine improvement (removed real duplicate
+   work), but verified on 2.0.6 to NOT be the cause of the hang: a
+   single, clean, race-free `jev-allow` reply still hung after
+   picking.
+3. **Skip the reply for `multichoice` entirely** — tried once,
+   reverted because it seemed to trade the hang for a mandatory
+   manual Allow/Reject click that wasn't there before.
 4. Live testing on 2.0.11 showed step 3's objection didn't hold: the
    reply to a `multichoice` permission consistently arrives ~750-900ms
    after the request, after the client has already shown its own
@@ -145,34 +192,50 @@ specific reason and it's worth knowing why before touching this again:
    is never attempted, and picking an option after approving still
    hangs the same way. The "reply attempt corrupts the follow-up"
    theory from step 4 is **wrong**, or at least incomplete.
+6. **Two-phase question handling via form API** (current, full
+   autonomy) — see above. Earlier drafts of this step incorrectly
+   targeted a `question.v2.asked` / `/api/question` reply path; live
+   2.0.11 uses forms (`GET /api/form` +
+   `POST .../form/{formID}/reply`). Auto-answer + agent continue
+   **live-verified** on that form path; broader “hang fixed for all
+   cases” is **not** claimed.
 
-**What we actually know:**
+**What we actually know (pre–full-autonomy evidence):**
 - Plugin fully disabled (`enabled: false`, zero event subscribers,
   zero session reads, nothing touches this permission at all) →
   picking works, confirmed twice.
-- Plugin enabled — even in its most passive form now (evaluates,
-  logs, never replies) — picking hangs, confirmed on both 2.0.6 and
-  2.0.11.
-- The one thing every "enabled" configuration shares, that "disabled"
-  doesn't, isn't just the reply attempt (ruled out) — it's `setup()`
-  subscribing to the event stream at all (confirmed still running
-  twice per process: the log always shows two `inst` values, one
-  `duplicate-suppressed`, one that actually evaluates) and calling
-  `ctx.session.context({sessionID})` for the same session while its
-  interactive tool call is still open. Neither has been isolated as
-  the actual cause yet — that's the next thing to test, not fix blind.
+- Plugin enabled under every pre–full-autonomy form tested (evaluate
+  + reply; evaluate + never reply) → picking hangs, confirmed on both
+  2.0.6 and 2.0.11.
+- Shared factors across those “enabled” configs: `setup()`
+  subscribing to the event stream (still runs twice per process:
+  two `inst` values, one `duplicate-suppressed`) and/or calling
+  `ctx.session.context({sessionID})` while the interactive tool call
+  is open. Full autonomy removes `session.context` from the
+  *permission* path for questions; it does not remove the double
+  subscription, and the *answer* path may still call `objectiveFor`
+  (with a fallback if it fails).
 
-**Do not attempt a fourth code change without isolating this first.**
-A clean next diagnostic (not yet run): make the plugin do *nothing at
-all* for `kind === "multichoice"` — no `objectiveFor`/`ctx.session.context`
-call, no Jev spawn, not even a log line, `return` immediately — while
-still leaving `ctx.event.subscribe` active (so the double-subscriber
-situation stays). If picking still hangs with that, the double
-subscription itself is implicated, not anything the handler does. If
-picking works, `ctx.session.context` mid-flight is the suspect. Either
-result points at something in opencode's own event/session handling
-during an interactive tool call, likely worth an upstream report rather
-than another patch here.
+### Next diagnostic (if human-pick / other cases still hang)
+
+Re-check auto-answer with `scripts/verify_autonomy.py` (or the
+keyboard repro below) and capture the JSONL sequence
+(`question-permission-passthrough` → `phase: "form-answer"` /
+`question-answered` or ask-human).
+
+If human picking still hangs after ask-human fallback:
+
+1. Confirm the permission path truly skipped context (log must show
+   `question-permission-passthrough`, no Jev `elapsedMs` on that
+   requestID for the permission phase).
+2. If it still hangs: isolate whether `ctx.event.subscribe` alone is
+   enough — temporarily no-op *all* question/form handling (permission
+   passthrough, `/api/form` poll, and form/question event handlers)
+   while leaving the subscriber active. Hang with that → double
+   subscription / upstream event handling; no hang → something on the
+   answer path (e.g. `objectiveFor` during form-answer) is still
+   implicated. Prefer an upstream report over another blind plugin
+   patch once isolated.
 
 **Repro:** `permission: "ask"` (required, see above), plugin enabled,
 API key loaded in the service's own environment. Close any running
@@ -180,11 +243,17 @@ API key loaded in the service's own environment. Close any running
 shell that has sourced `secrets.env`, open the TUI in a test directory,
 send: "Hazme una pregunta multiopción: qué cenamos hoy. Opciones
 exactamente: pizza, sushi, ensalada. Usa la herramienta de pregunta del
-sistema y espera mi respuesta." Watch for a `"tool":"question"` line
-with `gateAction:"allow"` in the log, then pick an option in the
-dialog. Success = the agent continues with your pick. This needs a
-human at the keyboard; it cannot be scripted (the failure is about
-what happens after a real click).
+sistema y espera mi respuesta."
+
+- Autonomy success = log shows passthrough then `form-answer` /
+  `question-answered`, agent continues without a click
+  (`scripts/verify_autonomy.py` automates this check).
+- Hang check (fallback) = force ask-human, pick manually; success =
+  agent continues with your pick.
+
+The human-pick hang case still needs a human at the keyboard; it
+cannot be scripted (the failure is about what happens after a real
+click).
 
 ## Which log file?
 
