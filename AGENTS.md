@@ -65,7 +65,7 @@ bug.
 | `src/jev_gate/cli.py` | stdin/stdout contract with `index.ts`, v2 JSONL log |
 | `src/jev_gate/doctor.py` | install diagnostics, no secrets printed |
 | `scripts/measure.py` | reads the JSONL log: rates, p95, cost, by-session |
-| `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a threshold/kind change without a new case here is unreviewed |
+| `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a decision-logic/kind change without a new case here is unreviewed |
 
 ## Non-negotiables (see `CONTRIBUTING.md` "Safety contract")
 
@@ -77,7 +77,7 @@ bug.
    independently, before send and before log — a change on one side
    without the other is a gap. `pytest -q` has redaction coverage.
 3. **Policy changes need a golden case.** Anything touching
-   `decision.py` thresholds or `kindFor` needs a new entry in
+   `decision.py`'s combine logic or `kindFor` needs a new entry in
    `tests/golden.json`.
 4. **Jev approves the tool call for `multichoice` too — never make it a
    manual click.** The whole point of the gate is removing the

@@ -74,7 +74,7 @@ Every decision is appended to a JSONL log (v2 schema:
 
 - `plugin/` — v2 adapter (TypeScript, zero runtime deps besides `@opencode/plugin`)
 - `src/jev_gate/` — gate: `schemas.py` (brief/redaction/questions),
-  `client.py` (Jev wrapper), `decision.py` (threshold policy),
+  `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps
 - `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2

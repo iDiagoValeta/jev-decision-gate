@@ -21,7 +21,7 @@ permission.asked (opencode v2)
       → build_state: curated brief + detail_sha256
       → build_questions: decision(choice) + safe(noul) + risk(score) [+ pick]
       → client.evaluate → Jev API (system_one)
-      → decision.combine: thresholds per kind
+      → decision.combine: pass through Jev's decision, no thresholds
       → stdout {action, reason, pick?, confidence, model, usage?}
   → plugin: allow→reply once, deny→reply reject, ask-human→silence
   → both sides append v2 JSONL (0600, no secrets)
@@ -82,7 +82,7 @@ permission.asked (opencode v2)
 | `plugin/jev-decision-gate/index.ts` | hook, catastrophic, kind, objective, spawn, log |
 | `src/jev_gate/schemas.py` | brief, redaction, questions |
 | `src/jev_gate/client.py` | SDK wrapper, usage passthrough |
-| `src/jev_gate/decision.py` | threshold combine (pure, fully tested) |
+| `src/jev_gate/decision.py` | decision combine, no thresholds (pure, fully tested) |
 | `src/jev_gate/cli.py` | stdin/stdout, v2 log, fail-open map |
 | `src/jev_gate/doctor.py` | diagnostics |
 | `scripts/measure.py` | rates, p95, cost, by-session |
