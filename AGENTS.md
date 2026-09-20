@@ -91,6 +91,22 @@ bug.
    the requestID first (see `claimReply` in `index.ts`) — assume you are
    racing a sibling instance, not assume you're the only handler.
 
+## Finish on main, nowhere else
+
+`main` is protected (PR + green CI required, no direct push). Work in
+a branch, open a PR, merge it once CI is green — then **delete the
+branch, local and remote, and leave only `main`**:
+
+```bash
+git checkout main && git pull origin main
+git branch -D <branch>
+git push origin --delete <branch>
+```
+
+A task isn't done while a feature branch is still sitting there,
+merged or not — `git branch -a` should show `main` and nothing else
+when you finish a piece of work.
+
 ## Commands
 
 ```bash
