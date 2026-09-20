@@ -1,8 +1,8 @@
 # jev-decision-gate
 
 Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
-calls get approved automatically with calibrated confidence, anything
-risky or uncertain falls back to your manual prompt.
+calls get approved automatically, anything Jev calls risky or
+uncertain falls back to your manual prompt.
 
 ```
 opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ jev_gate (Python) ──▶ Jev API
@@ -14,8 +14,10 @@ opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ 
 The plugin builds a curated brief per halt — objective, halt kind,
 tool, redacted detail, risk hints — so Jev judges in context.
 Jev answers three parallel questions (allow/deny/ask-human,
-is-this-safe, risk-score) and a pure threshold policy combines them.
-Any error fail-opens to ask-human: a broken gate never silently allows.
+is-this-safe, risk-score); the `decision` answer alone wins, at any
+confidence — safe/risk are recorded as evidence, not vetoes (see
+"Safety model" below for why). Any error fail-opens to ask-human: a
+broken gate never silently allows.
 
 Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, force-push,
 `mkfs`, fork bombs, ...) are rejected instantly without calling Jev.
@@ -27,7 +29,12 @@ carries no option field, so auto-answering is impossible by design.
 
 ## Requirements
 
-- OpenCode v2 (the v2 plugin hook; stable 1.x does not fire it)
+- OpenCode on the `@opencode/plugin` line (`permission.asked` events;
+  the older, more common `@opencode-ai/plugin` line does not fire it —
+  see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) if you're not
+  sure which one you have)
+- `"permission": "ask"` in your `opencode.json` (global or project) —
+  under `"allow"` there's nothing for the gate to intercept
 - Python 3.10+ with `pip install -e .` (pulls `typesafe-sdk`)
 - Node 20+ for the plugin adapter
 - A TypeSafe API key (`console.typesafe.ai`)
