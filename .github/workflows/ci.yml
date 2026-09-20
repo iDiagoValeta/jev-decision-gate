@@ -27,4 +27,4 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - run: npm --prefix plugin ci
-      - run: npm --prefix plugin exec --no -- tsc --noEmit -p jev-decision-gate
+      - run: npm --prefix plugin exec --no -- tsc --noEmit -p plugin/jev-decision-gate
