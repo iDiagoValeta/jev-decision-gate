@@ -6,6 +6,29 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (2026-09-20, question-tool hang: root cause confirmed)
+- `multichoice` permission replies removed again, this time backed by
+  live evidence rather than a guess: even with the cross-instance race
+  fixed (one clean Jev evaluation, no duplicate), the reply to a
+  `multichoice` permission consistently arrives after opencode's client
+  has already committed to its own confirmation UI, so it always lands
+  as `"Permission request not found"` — the manual Allow click was
+  happening regardless of what the plugin did. The *attempted* reply,
+  even failing, was additionally corrupting the follow-up step where
+  the human picks an option (confirmed: plugin disabled → picking
+  works; plugin enabled, reply attempted-and-failed → picking hangs,
+  every time, on 2.0.6 and 2.0.11 both). Skipping the reply costs
+  nothing the user didn't already have and removes that side effect.
+- Environment config: found and applied `opencode-pty`'s own native v2
+  build (`opencode-pty/v2` — a real `./v2` export, no shim needed).
+  Removed the 9 other community plugins and `opencode-worktree` from
+  global config — none ship a native v2 entry point, and
+  `opencode-worktree`'s own `package.json` points at a file that
+  doesn't exist in what got published. A hand-written v1→v2
+  compatibility shim was considered for the rest and deliberately not
+  built: three are auth plugins, and a shim bug in a credential flow is
+  worse than the plugin not loading.
+
 ### Changed (2026-09-20, environment consolidation)
 - Removed every redundant/stale opencode install accumulated across
   sessions on the dev machine (a hand-copied `opencode-v2` binary, a

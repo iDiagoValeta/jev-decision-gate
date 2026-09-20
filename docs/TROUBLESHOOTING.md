@@ -43,17 +43,40 @@ as a rewrite (different Hooks shape, `permission.ask(input, output)`
 with `output.status`, no `ctx.event.subscribe`), not a config tweak.
 
 **Community v1 plugins on the 2.x line:** tested against 2.0.11 with
-the 12 plugins previously carried in this environment's global config
-— 10 fail to load (`PluginModule.LoadError`, wrong Hooks shape for
-this API generation): `opencode-notifier`, `oh-my-openagent`,
+the 12 plugins previously carried in this environment's global config.
+Before removing a v1-only plugin, check whether its package ships a
+*native* v2 build under an alternate export subpath — `opencode-pty`
+does (`opencode-pty/v2`, confirmed via `npm view opencode-pty exports`:
+a real `./v2` entry exporting `Plugin.define({id, setup})`), so
+`"opencode-pty"` in config becomes `"opencode-pty/v2"`, no code
+required on our end. `npm view <pkg> exports` and `main` is the fast
+way to check — no `/v2`-shaped alternate export means there's nothing
+native to point at.
+
+Checked the same way for the rest: `opencode-notifier`, `oh-my-openagent`,
 `opencode-antigravity-auth`, `opencode-gemini-auth`,
-`opencode-openai-codex-auth`, `opencode-pty`, `opencode-shell-guard`,
-`opencode-supermemory`, `opencode-vibeguard`, `opencode-websearch-cited`,
-plus `opencode-worktree` (entrypoint not found, a packaging issue).
-Two load fine: `superpowers` (pin `@git+https://github.com/obra/superpowers.git`,
-its default branch already ships 2.x support) and `opencode-dcp`.
+`opencode-openai-codex-auth`, `opencode-shell-guard`,
+`opencode-supermemory`, `opencode-vibeguard`, `opencode-websearch-cited`
+— none ship anything beyond their single v1-shaped default export, so
+none can be fixed by pointing at a different entry point. Removed from
+config rather than left in erroring; a **hand-written compatibility
+shim** (translate v1 Hooks calls into v2 Context calls) was considered
+and deliberately not attempted here — three of those are auth plugins
+(`opencode-antigravity-auth`, `opencode-gemini-auth`,
+`opencode-openai-codex-auth`), and a shim bug in a credential flow is a
+much worse failure mode than the plugin simply not loading. `opencode-worktree`
+is additionally broken on the publisher's side regardless of API line:
+its own `package.json` declares `main: dist/server.js`, a file that
+does not exist in what actually got published (`dist/plugin/worktree.js`
+is the real entry, but it isn't exposed via the package's `exports`
+map either) — nothing to fix from a consumer's config.
+
+What's left after this pass: `superpowers` (pin
+`@git+https://github.com/obra/superpowers.git`, its default branch
+already ships 2.x support), `opencode-dcp`, and `opencode-pty/v2`.
 Don't assume a plugin "should" work on this line just because it's
-popular — check the actual load result.
+popular, and don't assume "fails to load" means "needs a shim" — check
+`npm view <pkg> exports` for a native build first.
 
 **"It worked on an older opencode 2.x, breaks on the newest one":** the
 `@opencode/plugin` SDK package (npm, pinned in `plugin/package.json`)
@@ -89,41 +112,52 @@ unfamiliar line came from here.
 
 ## Question dialog hangs after picking an option
 
-**Status: under investigation, not confirmed fixed.**
+**Status: fix applied 2026-09-20 (skip the reply for `multichoice`),
+pending final live confirmation on 2.0.11.**
 
-First hypothesis (wrong, reverted): that the plugin's own
-`ctx.permission.reply` for `multichoice` was racing the human's answer
-for the same `requestID`, so the plugin should never reply for
-multichoice. Tried that — it "fixed" the hang by skipping the auto-
-approval entirely, which just traded the hang for a mandatory manual
-Allow/Reject click before every question. That defeats the point of
-the gate (removing exactly that click), so it was reverted. Jev still
-approves the tool call for `multichoice` like any other kind; only
-`pick` (the recommended answer) is ever a log-only field, never
-submitted as the human's choice.
+Timeline of what was actually tried, in order, because the first two
+"fixes" were each reverted for a real reason and it's worth knowing why
+before touching this again:
 
-What's actually confirmed and fixed: `setup()` running more than once
-per opencode process (same `pid`, different `inst` in the log), causing
-duplicate Jev calls and a reply race — first claimant now wins via a
-marker claimed *before* calling Jev, so at most one instance evaluates
-and replies per `requestID`. This was verified on 2.0.6 to NOT be the
-whole story: with a single, clean, successful `jev-allow` reply (no
-race, confirmed via the log), the dialog still hung after picking an
-option. As of 2026-09-20 the environment moved to 2.0.11 (single
-install; see "Which opencode, which version" above) — the hang has not
-yet been re-tested on 2.0.11 specifically. Re-run the repro below
-before assuming it's still present or assuming it's fixed.
+1. **Auto-approve `multichoice` like any other kind** (original
+   design). Hangs after picking an option.
+2. **Hypothesis: cross-instance reply race.** `setup()` runs more than
+   once per opencode process (same `pid`, different `inst` in the
+   log) — confirmed real, was causing duplicate Jev calls. Fixed by
+   claiming the requestID *before* calling Jev, not just before
+   replying (see ADR in ARCHITECTURE.md). Genuine improvement, but
+   verified on 2.0.6 to NOT be the cause of the hang: with a single,
+   clean, race-free `jev-allow` reply, the dialog still hung.
+3. **Skip the reply for `multichoice` entirely** — tried once, reverted
+   because it seemed to trade the hang for a mandatory manual
+   Allow/Reject click that wasn't there before, defeating the point of
+   the gate.
+4. **Live evidence on 2.0.11 (this environment) showed step 3's
+   objection didn't hold:** even with the cross-instance race fixed
+   and a clean single Jev evaluation, the reply to a `multichoice`
+   permission consistently arrives ~750-900ms after the request —
+   and the client has *already* shown its own "Permission required"
+   screen by then, so the reply lands as `"Permission request not
+   found"` every time. The manual click was happening anyway,
+   regardless of what the plugin did. Then, clicking Allow manually
+   and picking an option *still hung* — proving the attempted-and-failed
+   reply call itself (not a race, not the approval path) was
+   corrupting the follow-up pick step. With the plugin fully disabled
+   (no reply attempted at all), picking works.
+5. **Current fix:** skip the reply for `multichoice` again, now backed
+   by that evidence rather than a guess. Jev's `pick` stays a logged
+   recommendation. This costs nothing the user didn't already have —
+   the manual click was unavoidable for this tool either way — and
+   removes the attempted-reply side effect that broke picking.
 
 If you hit the hang again after this fix: capture
 `tail -5 ~/.local/share/opencode/jev-decisions.jsonl` (or your
-configured `JEV_GATE_LOG`) right after it happens, and check
-`grep -o '"inst":"[a-z0-9]*"' <log> | sort -u` for more than one value
-sharing a `pid` — that would mean the cross-instance claim isn't
-covering your setup and is worth reporting with the log line attached.
-If the log shows a single clean `jev-allow` with no `reply-failed`
-follow-up and it still hangs, the cause is elsewhere (likely opencode
-v2's own dialog handling after an async, non-instant permission
-approval) and needs a report upstream, not another change here.
+configured `JEV_GATE_LOG`) right after it happens. A `"tool":"question"`
+line should show `reason:"jev-allow"` or similar with **no**
+`reply-failed` follow-up for that `requestID` — if there's still a
+reply attempt logged for `kind:"multichoice"`, the running plugin isn't
+picking up this fix (stale service, wrong `gateDir`, etc.), not a new
+instance of the original bug.
 
 **Repro:** `permission: "ask"` (required, see above), plugin enabled,
 API key loaded in the service's own environment. Close any running

@@ -79,12 +79,21 @@ bug.
 3. **Policy changes need a golden case.** Anything touching
    `decision.py`'s combine logic or `kindFor` needs a new entry in
    `tests/golden.json`.
-4. **Jev approves the tool call for `multichoice` too — never make it a
-   manual click.** The whole point of the gate is removing the
-   Allow/Reject click; exempting the tool that asks it most defeats
-   that (tried it, reverted, see `CHANGELOG.md` 2026-09-20). `pick` is
-   log-only and must never be submitted as the human's actual answer —
-   v2 `reply` has no field for it anyway.
+4. **`multichoice` never calls `ctx.permission.reply`, on purpose.**
+   Tried making it auto-approve like every other kind (twice, on two
+   opencode versions) — reverted both times. Confirmed empirically: for
+   this specific tool the client commits to its own confirmation UI
+   faster than Jev's round-trip (~750-900ms) can land, so the reply
+   always arrives too late ("Permission request not found") and the
+   human ends up clicking Allow manually regardless of what the plugin
+   does — replying costs nothing to skip. Worse, the *attempt* itself
+   (even though it fails) leaves something broken for the follow-up
+   step where the human picks an option: plugin disabled → picking
+   works; plugin enabled and attempting-and-failing this reply →
+   picking hangs, every time, on both 2.0.6 and 2.0.11. `pick` stays a
+   log-only recommendation either way — `reply()` has no option field,
+   it was never going to answer for the human. Don't re-add this reply
+   without new evidence the client-side race has actually changed.
 5. **`setup()` runs more than once per opencode process.** Confirmed in
    production logs (same `pid`, different `inst`). Any new code path
    that evaluates or replies to a `permission.asked` event must claim
