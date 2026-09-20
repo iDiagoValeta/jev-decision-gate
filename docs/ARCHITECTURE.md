@@ -35,15 +35,18 @@ permission.asked (opencode v2)
 - **Two writers, one schema.** Plugin and CLI each log (the CLI sees
   the Jev internals, the plugin sees session/request IDs). Schema v2
   unifies field names so `measure.py` reads both.
-- **Jev approves the tool call for multichoice too, but never picks the
-  answer.** The gate exists to remove the manual Allow/Reject click —
-  exempting multichoice from that would defeat the point for the one
-  tool that asks it most (the `question` tool). `pick` is only a logged
-  recommendation because v2 `reply` has no option field to carry it;
-  once Jev approves the call, the human still answers in the tool's own
-  dialog. A hang after picking an option was reported and is under
-  investigation — see `docs/TROUBLESHOOTING.md` for the current state
-  and what's ruled out so far.
+- **`multichoice` never replies, even though that's normally the whole
+  point of the gate.** Tried auto-approving it like every other kind,
+  twice, on two opencode versions — reverted both times. Confirmed
+  empirically: for this tool the client commits to its own confirmation
+  UI faster than Jev's round-trip can land, so the reply always arrives
+  too late and the human clicks Allow manually regardless — and the
+  *attempt* to reply, even though it fails, breaks the follow-up step
+  where the human picks an option (plugin disabled → picking works;
+  plugin enabled, reply attempted and failed → picking hangs, every
+  time). `pick` stays a logged recommendation only — `reply()` has no
+  option field, it was never going to answer for the human. See
+  `docs/TROUBLESHOOTING.md` for the evidence and repro.
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail.

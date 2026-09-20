@@ -587,13 +587,20 @@ async function handleOne(
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
     })
     let repliedOk = true
-    // Jev approves the tool call itself, same as any other kind — that's
-    // the point of the gate, it removes the manual Allow/Reject click.
-    // For multichoice, `pick` is still only a logged recommendation:
-    // reply() has no option field, so it never selects an answer on the
-    // human's behalf. The human still picks in the tool's own dialog
-    // once the call is approved.
-    if (decision.action === "allow" || decision.action === "deny") {
+    // Multichoice never replies, even though that's normally the whole
+    // point of the gate (skip the manual click). Confirmed empirically
+    // on both 2.0.6 and 2.0.11: for this specific tool, the client
+    // commits to its own confirmation UI faster than Jev's round-trip
+    // (~750-900ms) can land, so the reply always arrives too late
+    // ("Permission request not found") and the human ends up clicking
+    // Allow manually regardless — replying costs nothing to skip. Worse,
+    // the *attempt* itself (even though it fails) leaves something
+    // broken for the follow-up step where the human picks an option:
+    // with the plugin fully disabled, picking works; with it enabled
+    // and attempting-and-failing this reply, picking hangs every time.
+    // `pick` stays a log-only recommendation either way — reply() has
+    // no option field, it was never going to answer for the human.
+    if (kind !== "multichoice" && (decision.action === "allow" || decision.action === "deny")) {
       try {
         await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
       } catch (err) {
@@ -601,7 +608,7 @@ async function handleOne(
         repliedOk = false
       }
     }
-    // ask-human: no reply, the human prompt appears.
+    // ask-human, or multichoice: no reply, the human prompt appears.
     return { decision: String(decision.action), repliedOk }
   } catch (err) {
     if (err instanceof SessionEndedError || endedSessions.has(sessionID)) {
