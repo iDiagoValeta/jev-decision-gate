@@ -6,19 +6,20 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed (2026-09-20, question-tool hang: root cause confirmed)
-- `multichoice` permission replies removed again, this time backed by
-  live evidence rather than a guess: even with the cross-instance race
-  fixed (one clean Jev evaluation, no duplicate), the reply to a
+### Changed (2026-09-20, multichoice reply removed — did NOT fix the hang)
+- `multichoice` permission replies removed again: the reply to a
   `multichoice` permission consistently arrives after opencode's client
   has already committed to its own confirmation UI, so it always lands
-  as `"Permission request not found"` — the manual Allow click was
-  happening regardless of what the plugin did. The *attempted* reply,
-  even failing, was additionally corrupting the follow-up step where
-  the human picks an option (confirmed: plugin disabled → picking
-  works; plugin enabled, reply attempted-and-failed → picking hangs,
-  every time, on 2.0.6 and 2.0.11 both). Skipping the reply costs
-  nothing the user didn't already have and removes that side effect.
+  as `"Permission request not found"` regardless — the manual Allow
+  click is unavoidable for this tool either way, so skipping the reply
+  costs nothing. This was tried expecting it to also fix the hang after
+  picking an option (a prior test seemed to show the reply attempt
+  itself was the corrupting factor) — **verified live on 2.0.11 that it
+  does not fix it.** Picking still hangs with the plugin enabled, even
+  with zero reply attempted. Root cause still unknown; see
+  `docs/TROUBLESHOOTING.md` "Question dialog hangs" for the full
+  timeline and what's actually been ruled out before trying a fourth
+  fix.
 - Environment config: found and applied `opencode-pty`'s own native v2
   build (`opencode-pty/v2` — a real `./v2` export, no shim needed).
   Removed the 9 other community plugins and `opencode-worktree` from
