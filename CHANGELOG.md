@@ -17,6 +17,14 @@ versioning follows [SemVer](https://semver.org/).
 - Single-writer log: only the plugin writes when it spawns the gate.
 - `measure.py`: blocks = catastrophic-pattern + jev-deny.
 
+### Fixed (2026-09-20, live-fire)
+- Multichoice without parseable options no longer 400s Jev
+  (`Choice question must have at least one choice`): the `pick`
+  question is only sent when options exist; otherwise the
+  allow/deny verdict flows with `pick: null`.
+- Fail-open now carries `error` (stdout) → `error_class` (plugin
+  log), so Jev-side failures stay visible under single-writer.
+
 ### Added
 - Unified v2 decision log (`sessionID`, `requestID`, `kind`, `detail_sha256`, `elapsedMs`).
 - Curated Jev brief + secret redaction before send and log.

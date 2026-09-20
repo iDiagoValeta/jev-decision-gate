@@ -41,7 +41,7 @@ def decide_event(event, evaluate_fn, _error_box=None):
             halt.get("kind", "write"),
         )
         pick = None
-        if halt.get("kind") == "multichoice" and combined["action"] == "allow":
+        if halt.get("kind") == "multichoice" and combined["action"] == "allow" and (halt.get("options") or []):
             options = halt.get("options") or []
             choice = None
             try:
@@ -57,6 +57,7 @@ def decide_event(event, evaluate_fn, _error_box=None):
                     "pick": None,
                     "confidence": 0.0,
                     "model": None,
+                    "error": "bad-response",
                 }
             pick = choice
         out = {
@@ -78,6 +79,7 @@ def decide_event(event, evaluate_fn, _error_box=None):
             "pick": None,
             "confidence": 0.0,
             "model": None,
+            "error": _classify_error(exc),
         }
 
 

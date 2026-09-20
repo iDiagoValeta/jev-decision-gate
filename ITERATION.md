@@ -47,6 +47,7 @@ Objetivo: repo público instalable, estándares modernos, producto curado para J
 | R51 | Jev manda sin umbrales (argmax puro) | ✅ | main | pedido por Jev-humano: decision gana a cualquier confianza |
 | R52 | dedupe por requestID (1 eval, 1 reply) | ✅ | main | el servidor re-emite eventos: 4 evals → 1 |
 | R53 | log single-writer (solo plugin) | ✅ | main | JEV_GATE_CLI_LOG=0 en spawn |
+| R54 | multichoice sin opciones no rompe Jev (400) + error visible | ✅ | main | pick solo con opciones; fail-open trae error |
 
 ## Decisiones de diseño (vivas)
 - Fail-open siempre a ask-human; jamás allow silencioso en error.
