@@ -1,8 +1,12 @@
 {
   "name": "jev-decision-gate-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "type": "module",
   "dependencies": {
     "@opencode/plugin": "latest"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
   }
 }

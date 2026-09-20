@@ -52,7 +52,6 @@ def main():
             uniq.append(p)
     rows, corrupt = load(uniq)
     actions = Counter((r.get("gateAction") or r.get("action") or "?") for r in rows)
-    reasons = Counter(r.get("reason", "?") for r in rows)
     errcls = Counter(r.get("error_class", "-") for r in rows if r.get("reason") == FAIL_OPEN)
     total = len(rows)
     traps = sum(1 for r in rows if r.get("reason") in TRAP_REASONS)

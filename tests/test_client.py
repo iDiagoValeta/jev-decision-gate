@@ -19,6 +19,7 @@ def test_evaluate_normalizes_answers():
 
 def test_evaluate_raises_on_transport_error():
     import pytest
+
     from jev_gate.client import JevCallError, evaluate
 
     def bad_transport(state, questions, model):
