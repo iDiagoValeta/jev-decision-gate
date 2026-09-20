@@ -49,10 +49,22 @@ Objetivo: repo público instalable, estándares modernos, producto curado para J
 | R53 | log single-writer (solo plugin) | ✅ | main | JEV_GATE_CLI_LOG=0 en spawn |
 | R54 | multichoice sin opciones no rompe Jev (400) + error visible | ✅ | main | pick solo con opciones; fail-open trae error |
 | R55 | claim único de reply entre instancias + traza inst/pid/resKinds | ✅ | main | setup() corre >1 vez: marker exclusivo |
-| R56 | reply-failed visible en log | pendiente | | diagnosticar cuelgue question |
+| R56 | reply-failed visible en log | ✅ | main | causa real: setup() corre 2x por proceso (mismo pid, distinto inst), cada instancia evalúa y responde el mismo requestID |
+| R57 | claim cruzado antes de llamar a Jev, no antes de responder | ✅ | main | evita 2 llamadas a Jev por la misma pregunta; probé también quitar el auto-reply en multichoice, revertido: convertía cada pregunta en un clic manual, contradice el objetivo del gate |
+| R58 | doctor.py detecta `opencode-v2` además de `opencode` | ✅ | main | el binario v2 puede tener otro nombre mientras es beta |
+| R59 | objectiveFor: contexto multi-turno (usuario+asistente) acotado por budget configurable, no solo últimos 3 mensajes de usuario ≤500ch | ✅ | main | schemas.py cap 500→8000 para no re-truncar |
+| R60 | AGENTS.md | ✅ | main | |
+| R61 | consolidar entorno opencode a una sola instalación (2.0.11) | ✅ | main | limpieza de instalaciones redundantes acumuladas |
+| R62 | confirmar `permission.ask` muerto en @opencode-ai/plugin desde v1.3.0 | ✅ | main | issues/PR de anomalyco/opencode citados en TROUBLESHOOTING |
+| R63 | confirmar `permission: allow` no dispara `permission.asked` en 2.0.11 | ✅ | main | config global/proyecto pasa a `ask` |
+| R64 | probar los 12 plugins v1 contra 2.0.11 | ✅ | main | 10 rotos, 2 funcionan (superpowers, opencode-dcp) |
 
 ## Decisiones de diseño (vivas)
 - Fail-open siempre a ask-human; jamás allow silencioso en error.
 - Log JSONL sin secretos; incluye sessionID, requestID, elapsedMs, model.
 - v2-only: en 1.x el gate duerme sin molestar.
-- Multichoice: Jev recomienda (pick) pero el humano elige; reply v2 no lleva opción.
+- Multichoice: Jev recomienda (pick) pero el humano elige; el plugin
+  nunca llama a `permission.reply` para multichoice (v2 `reply` no
+  lleva opción y ese reply competía con la respuesta del humano).
+- `setup()` puede correr más de una vez por proceso; todo evaluar/responder
+  debe reclamar el requestID antes de tocar Jev, no asumir que es el único.

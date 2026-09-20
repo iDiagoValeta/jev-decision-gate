@@ -6,6 +6,52 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (2026-09-20, environment consolidation)
+- Removed every redundant/stale opencode install accumulated across
+  sessions on the dev machine (a hand-copied `opencode-v2` binary, a
+  pnpm-global `opencode-ai@1.18.25`, a stale `~/.opencode/bin/opencode`,
+  the desktop app) — one `opencode` install now, 2.0.11.
+- Confirmed `@opencode-ai/plugin`'s `permission.ask` hook is dead code
+  since v1.3.0 (upstream issue/PR links in TROUBLESHOOTING) — this gate
+  cannot target that line today; it stays on `@opencode/plugin`.
+- Confirmed `"permission": "allow"` makes opencode 2.0.11 skip emitting
+  `permission.asked` entirely. Global/project config now uses
+  `"permission": "ask"` — required for the gate to do anything.
+- Tested the 12 community plugins previously in the global config
+  against 2.0.11: 10 fail to load (wrong Hooks shape for this API
+  line), 2 work (`superpowers`, `opencode-dcp`). See TROUBLESHOOTING
+  for the full list.
+- `doctor.py`'s opencode-version check already handled a single-binary
+  environment correctly; no code change needed there.
+
+### Fixed (2026-09-20, duplicate Jev calls; question-hang still open)
+- Tried making `multichoice` never auto-reply, on the theory that the
+  plugin's own reply was racing the human's answer for the same
+  requestID. Reverted: it just replaced the hang with a mandatory
+  manual Allow/Reject click before every question, which defeats the
+  point of the gate. Jev still approves the tool call for multichoice
+  like any other kind; `pick` stays log-only, never submitted as the
+  human's answer. The dialog-hang report is still open — see
+  `docs/TROUBLESHOOTING.md`.
+- Cross-instance claim moved before the Jev call, not just before the
+  reply: `setup()` runs more than once per opencode process (confirmed
+  in production logs: same `pid`, different `inst`), so every
+  permission request was being evaluated 2-3x and racing to reply. The
+  losing instance now skips entirely — no Jev call, no reply attempt —
+  instead of evaluating anyway and discovering the loss only at reply
+  time.
+- `doctor.py` checks both `opencode-v2` and `opencode` binary names
+  (v2 is often installed under a different command than `opencode`
+  while beta) instead of assuming `opencode --version` reflects v2.
+- `objectiveFor` sends a bounded multi-turn transcript (both user and
+  assistant text, default 4000 chars, `options.objectiveChars` /
+  `JEV_GATE_OBJECTIVE_CHARS`) instead of just the last 3 user messages
+  capped at 500 chars — Jev can now see recent agent actions, not only
+  the human's asks, when judging alignment. `schemas.py`'s own cap
+  raised from 500 to 8000 so it no longer silently re-truncates the
+  plugin's wider budget.
+- Added `AGENTS.md`.
+
 ### Fixed (2026-09-20, issues #2 #3 + config hygiene)
 - Pin `@opencode/plugin` to `2.0.11` (was `latest`).
 - Session-end detection: track `session.deleted`, check

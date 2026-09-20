@@ -40,8 +40,13 @@ def sha256_hex(text):
 
 
 def build_objective_block(objective, halt, risk_hints=""):
-    """Curated brief Jev actually reads. Caps length, redacts secrets."""
-    obj = redact_secrets((objective or "").strip())[-500:]
+    """Curated brief Jev actually reads. Caps length, redacts secrets.
+
+    The plugin already trims OBJECTIVE to its own configurable budget
+    (default 4000 chars) before it reaches here; this cap is a safety
+    net against a misconfigured or future caller, not the active limit.
+    """
+    obj = redact_secrets((objective or "").strip())[-8000:]
     if not obj:
         obj = "Complete the assigned coding task [objective-missing]"
     kind = halt.get("kind", "write")

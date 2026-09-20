@@ -158,6 +158,18 @@ function timeoutMsOf(options: Record<string, unknown>): number {
   return Math.min(30000, Math.max(1000, n))
 }
 
+// How much recent conversation (chars, both roles) to send as OBJECTIVE.
+// Default is generous (well past the old 500-char/user-only window) but
+// still bounded: an unbounded full transcript would make every single
+// permission check's cost and latency scale with session length.
+// Override per-project via options.objectiveChars or JEV_GATE_OBJECTIVE_CHARS.
+function objectiveBudgetOf(options: Record<string, unknown>): number {
+  const raw = (options.objectiveChars as unknown) ?? process.env.JEV_GATE_OBJECTIVE_CHARS
+  const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10)
+  if (!Number.isFinite(n)) return 4000
+  return Math.min(20000, Math.max(200, n))
+}
+
 function logFileOf(options: Record<string, unknown>): string {
   if (typeof options.logFile === "string" && options.logFile) return options.logFile
   if (process.env.JEV_GATE_LOG) return process.env.JEV_GATE_LOG
@@ -177,16 +189,18 @@ function logLine(options: Record<string, unknown>, entry: Record<string, unknown
   }
 }
 
-// Cross-instance reply claim: setup() may run more than once per
+// Cross-instance request claim: setup() may run more than once per
 // process (and several processes may share a gateDir), so in-memory
-// maps alone cannot guarantee a single reply. First claimant wins via
-// an exclusive marker file; losers skip the reply.
+// maps alone cannot guarantee a single evaluation/reply. First
+// claimant wins via an exclusive marker file, claimed before the Jev
+// call; losers skip evaluating entirely.
 function repliedDirOf(options: Record<string, unknown>): string {
   return path.join(repoRoot(options), ".jev-gate-replied")
 }
 
-// Returns "won" (reply now), "lost" (someone else owns it) or "error"
-// (marker unusable — reply anyway, never suppress on FS trouble).
+// Returns "won" (evaluate and reply now), "lost" (someone else owns
+// it) or "error" (marker unusable — evaluate anyway, never suppress on
+// FS trouble).
 function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
   const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
   try {
@@ -197,15 +211,6 @@ function claimReply(options: Record<string, unknown>, requestID: string, inst: s
     const code = (err as { code?: unknown }).code
     if (code === "EEXIST") return "lost"
     return "error"
-  }
-}
-
-function releaseReply(options: Record<string, unknown>, requestID: string): void {
-  const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
-  try {
-    fs.unlinkSync(path.join(repliedDirOf(options), name))
-  } catch {
-    // Best effort: a stale marker only risks one extra reply attempt.
   }
 }
 
@@ -296,19 +301,30 @@ function runGate(options: Record<string, unknown>, event: Record<string, unknown
   })
 }
 
-function textOfMessage(message: unknown): string | null {
+type ConversationTurn = { role: "user" | "assistant"; text: string }
+
+function textOfMessage(message: unknown): ConversationTurn | null {
   if (!message || typeof message !== "object") return null
   const msg = message as { type?: unknown; role?: unknown; text?: unknown; parts?: unknown }
-  // v2 shape: { type: "user", text: "..." }. Legacy shape: { role: "user", parts: [{ text }] }.
-  if (msg.type !== "user" && msg.role !== "user") return null
-  if (typeof msg.text === "string" && msg.text.trim()) return msg.text
+  // v2 shape: { type: "user"|"assistant", text: "..." }. Legacy shape:
+  // { role: "user"|"assistant", parts: [{ text }] }.
+  const role = msg.type === "user" || msg.role === "user"
+    ? "user"
+    : msg.type === "assistant" || msg.role === "assistant"
+      ? "assistant"
+      : null
+  if (role === null) return null
+  if (typeof msg.text === "string" && msg.text.trim()) return { role, text: msg.text }
   if (Array.isArray(msg.parts)) {
+    // Only plain text parts (thinking/response). Tool-call parts have no
+    // `.text` field and are skipped, keeping this cheap even for turns
+    // with large tool output.
     const text = msg.parts
       .filter((p): p is { text?: unknown } => !!p && typeof p === "object")
       .filter((p) => typeof p.text === "string")
       .map((p) => p.text as string)
       .join("\n")
-    if (text.trim()) return text
+    if (text.trim()) return { role, text }
   }
   return null
 }
@@ -355,16 +371,26 @@ async function objectiveFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   ended: Set<string>,
+  budgetChars: number,
 ): Promise<string> {
   try {
     const messages = await ctx.session.context({ sessionID })
     const list = Array.isArray(messages) ? messages : []
-    const userTexts = list
-      .map(textOfMessage)
-      .filter((t): t is string => t !== null)
-    const last = userTexts.slice(-3).join("\n").slice(-500)
-    const redacted = redactSecrets(last)
-    return redacted || "Complete the assigned coding task"
+    const turns = list.map(textOfMessage).filter((t): t is ConversationTurn => t !== null)
+    // Recent conversation, both roles, newest last: lets Jev judge
+    // whether a halt matches what the human asked AND what the agent
+    // has been doing, not just the human's last message. Walk backward
+    // so a budget cut drops the oldest turns first; each turn is also
+    // capped so one huge message can't eat the whole budget.
+    const lines: string[] = []
+    let total = 0
+    for (let i = turns.length - 1; i >= 0 && total < budgetChars; i--) {
+      const line = `${turns[i].role === "user" ? "User" : "Assistant"}: ${turns[i].text}`.slice(0, 1000)
+      lines.unshift(line)
+      total += line.length + 1
+    }
+    const transcript = redactSecrets(lines.join("\n")).slice(-budgetChars)
+    return transcript || "Complete the assigned coding task"
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     if (/not\s*found|unknown session|no such session|deleted|archived/i.test(msg)) {
@@ -488,22 +514,30 @@ async function handleOne(
   resources: string[],
   endedSessions: Set<string>,
 ): Promise<{ decision: string; repliedOk: boolean }> {
+  // Claim the whole request (evaluation + reply) before calling Jev, not
+  // just before replying. setup() runs more than once per opencode
+  // process (confirmed in production logs: same pid, different inst),
+  // so without this, every instance independently evaluates and races
+  // to reply to the same permission — 2-3x Jev calls and, for the
+  // interactive question tool, a reply race against the human's own
+  // answer. First claimant wins via an exclusive marker file; losers
+  // never touch Jev at all.
+  const claim = claimReply(options, requestID, inst)
+  if (claim === "lost") {
+    log({ sessionID, requestID, tool: action, gateAction: "ask-human", reason: "duplicate-suppressed" })
+    return { decision: "ask-human", repliedOk: true }
+  }
+
   const joined = resources.join("\n")
   const resKinds = resourceKinds(resources)
   if (isCatastrophic(joined)) {
     log({ sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
-    let repliedOk = false
-    const claim = claimReply(options, requestID, inst)
-    if (claim !== "lost") {
-      try {
-        await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
-        repliedOk = true
-      } catch {
-        if (claim === "won") releaseReply(options, requestID)
-        // Fall through to the human prompt.
-      }
-    } else {
-      repliedOk = true
+    let repliedOk = true
+    try {
+      await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+    } catch (err) {
+      log({ sessionID, requestID, tool: action, gateAction: "reject", reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
+      repliedOk = false
     }
     return { decision: "deny", repliedOk }
   }
@@ -512,7 +546,7 @@ async function handleOne(
   if (kind === null) return { decision: "ask-human", repliedOk: true }
 
   try {
-    const objective = await objectiveFor(ctx, sessionID, endedSessions)
+    const objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))
     const rawDetail = joined.slice(0, 4000)
     const detail = redactSecrets(rawDetail)
     const riskHints = DESTRUCTIVE_HINT.test(joined) ? "matches destructive-hint" : ""
@@ -553,16 +587,16 @@ async function handleOne(
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
     })
     let repliedOk = true
+    // Jev approves the tool call itself, same as any other kind — that's
+    // the point of the gate, it removes the manual Allow/Reject click.
+    // For multichoice, `pick` is still only a logged recommendation:
+    // reply() has no option field, so it never selects an answer on the
+    // human's behalf. The human still picks in the tool's own dialog
+    // once the call is approved.
     if (decision.action === "allow" || decision.action === "deny") {
-      const claim = claimReply(options, requestID, inst)
-      if (claim === "lost") {
-        log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "duplicate-suppressed" })
-        return { decision: String(decision.action), repliedOk: true }
-      }
       try {
         await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
       } catch (err) {
-        if (claim === "won") releaseReply(options, requestID)
         log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
         repliedOk = false
       }

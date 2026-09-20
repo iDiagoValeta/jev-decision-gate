@@ -21,13 +21,30 @@ def main():
     ok_all &= check("jev_gate.cli importable", importlib.util.find_spec("jev_gate.cli") is not None,
                     "pip install -e . (run from repo root)")
     ok_all &= check("node present", shutil.which("node") is not None, "install nodejs")
-    try:
-        out = subprocess.run(["opencode", "--version"], capture_output=True, text=True, timeout=10)
-        ver = (out.stdout + out.stderr).strip().splitlines()[0] if (out.stdout + out.stderr).strip() else "unknown"
+    # v2 is often installed under a different command name than stable
+    # (e.g. `opencode-v2` alongside a v1 `opencode`) while it is beta.
+    # Check both; report whichever one is actually v2, since the gate
+    # only fires under v2's `permission.asked` event.
+    found_v2 = False
+    seen = []
+    for cmd in ("opencode-v2", "opencode"):
+        path = shutil.which(cmd)
+        if not path:
+            continue
+        try:
+            out = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=10)
+            raw = (out.stdout + out.stderr).strip()
+            ver = raw.splitlines()[0] if raw else "unknown"
+        except Exception:
+            ver = "unknown"
         is_v2 = ver.startswith("2") or "v2" in ver
-        ok_all &= check(f"opencode v2 (got: {ver})", is_v2, "gate sleeps on stable 1.x by design")
-    except Exception:
-        ok_all &= check("opencode on PATH", False, "install opencode v2")
+        seen.append(f"{cmd}={ver}{' (v2)' if is_v2 else ''}")
+        found_v2 = found_v2 or is_v2
+    if seen:
+        ok_all &= check(f"opencode v2 present ({', '.join(seen)})", found_v2,
+                        "gate sleeps on stable 1.x by design; a v1 `opencode` alongside v2 is fine")
+    else:
+        ok_all &= check("opencode on PATH", False, "install opencode v2 (try `opencode-v2` or `opencode`)")
     key = os.environ.get("TYPESAFE_API_KEY", "")
     ok_all &= check("TYPESAFE_API_KEY set", bool(key), "export TYPESAFE_API_KEY=... (value never printed)")
     log = os.environ.get("JEV_GATE_LOG", "decisions-plugin.jsonl")
