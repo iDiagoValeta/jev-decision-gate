@@ -1,6 +1,12 @@
 # src/jev_gate/client.py
+"""Thin wrapper around the TypeSafe SDK with error mapping."""
+
+
 class JevCallError(Exception):
     pass
+
+
+ALLOWED_MODELS = ("jev-latest", "jev-1.13.0")
 
 
 def _real_transport(state, questions, api_key, model):
@@ -29,7 +35,18 @@ def _real_transport(state, questions, api_key, model):
                 return data
 
             norm = {k: norm_answer(v) for k, v in answers.items()}
-            return {"model": model_name, "answers": norm}
+            out = {"model": model_name, "answers": norm}
+            usage = getattr(result, "usage", None)
+            if usage is None and isinstance(result, dict):
+                usage = result.get("usage")
+            if usage is not None:
+                try:
+                    tokens = usage.get("input_tokens") if isinstance(usage, dict) else getattr(usage, "input_tokens", None)
+                    if tokens is not None:
+                        out["usage"] = {"input_tokens": int(tokens)}
+                except Exception:
+                    pass
+            return out
     except Exception as exc:
         raise JevCallError(str(exc)) from exc
 
@@ -37,6 +54,8 @@ def _real_transport(state, questions, api_key, model):
 def evaluate(state, questions, api_key, model="jev-latest", transport=None):
     if not api_key:
         raise JevCallError("missing-api-key")
+    if model not in ALLOWED_MODELS and model != "jev-latest":
+        pass  # allow future models, record as-is
     raw = None
     if transport is not None:
         try:
@@ -61,6 +80,8 @@ def evaluate(state, questions, api_key, model="jev-latest", transport=None):
         }
         if "pick" in answers:
             out["pick"] = {"choice": answers["pick"]["choice"]}
+        if "usage" in raw:
+            out["usage"] = raw["usage"]
         return out
     except Exception as exc:
         raise JevCallError(f"bad-response: {exc}") from exc

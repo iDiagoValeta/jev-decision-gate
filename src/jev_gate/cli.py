@@ -7,6 +7,8 @@ from . import client as client_mod
 from . import decision as decision_mod
 from . import schemas as schemas_mod
 
+LOG_SCHEMA_VERSION = 2
+
 
 def _classify_error(exc):
     name = type(exc).__name__
@@ -57,13 +59,16 @@ def decide_event(event, evaluate_fn, _error_box=None):
                     "model": None,
                 }
             pick = choice
-        return {
+        out = {
             "action": combined["action"],
             "reason": combined["reason"],
             "pick": pick,
             "confidence": float(result["decision"]["confidence"]),
             "model": result.get("model"),
         }
+        if result.get("usage") is not None:
+            out["usage"] = result["usage"]
+        return out
     except Exception as exc:
         if _error_box is not None:
             _error_box["error_class"] = _classify_error(exc)
@@ -74,6 +79,13 @@ def decide_event(event, evaluate_fn, _error_box=None):
             "confidence": 0.0,
             "model": None,
         }
+
+
+def _chmod_600(path):
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def main():
@@ -89,20 +101,35 @@ def main():
         return client_mod.evaluate(state, questions, api_key=api_key, model=model)
 
     error_box = {}
-    out = decide_event(event if event else {"objective": "", "halt": {"kind": "write"}}, real_evaluate, error_box)
-    log_path = os.environ.get("JEV_GATE_LOG", "decisions.jsonl")
+    if not event:
+        event = {"objective": "", "halt": {"kind": "write"}}
+    out = decide_event(event, real_evaluate, error_box)
+    log_path = os.environ.get("JEV_GATE_LOG", "decisions-plugin.jsonl")
     try:
+        halt = event.get("halt", {}) if isinstance(event, dict) else {}
+        context = event.get("context", {}) if isinstance(event, dict) else {}
         with open(log_path, "a", encoding="utf-8") as handle:
             entry = {
+                "v": LOG_SCHEMA_VERSION,
                 "at": datetime.now(timezone.utc).isoformat(),
+                "sessionID": context.get("sessionID"),
+                "requestID": context.get("requestID"),
+                "tool": halt.get("tool"),
+                "kind": halt.get("kind"),
+                "detail_sha256": schemas_mod.sha256_hex(halt.get("detail", "")),
                 "model": out.get("model"),
                 "action": out.get("action"),
+                "gateAction": out.get("action"),
                 "reason": out.get("reason"),
                 "confidence": out.get("confidence"),
+                "pick": out.get("pick"),
             }
+            if out.get("usage") is not None:
+                entry["usage"] = out["usage"]
             if out.get("reason") == "fail-open" and error_box.get("error_class"):
                 entry["error_class"] = error_box["error_class"]
             handle.write(json.dumps(entry) + "\n")
+        _chmod_600(log_path)
     except Exception:
         pass
     sys.stdout.write(json.dumps(out))

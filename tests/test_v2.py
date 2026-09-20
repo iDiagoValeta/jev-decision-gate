@@ -1,0 +1,63 @@
+def test_write_needs_own_threshold():
+    from jev_gate import decision
+    assert decision.WRITE_ALLOW == 0.6
+    low = decision.combine("allow", 0.55, 0.9, 0.1, "write")
+    assert low == {"action": "ask-human", "reason": "write-low-confidence"}
+
+
+def test_multichoice_has_higher_threshold():
+    from jev_gate import decision
+    assert decision.MULTICHOICE_ALLOW == 0.7
+    low = decision.combine("allow", 0.65, 0.9, 0.1, "multichoice")
+    assert low == {"action": "ask-human", "reason": "multichoice-low-confidence"}
+    ok = decision.combine("allow", 0.8, 0.9, 0.1, "multichoice")
+    assert ok == {"action": "allow", "reason": "jev-allow"}
+
+
+def test_redact_secrets():
+    from jev_gate.schemas import redact_secrets, build_objective_block
+    assert "[REDACTED" in redact_secrets("Bearer abcdefgh1234")
+    assert "[REDACTED" in redact_secrets("key=ghp_12345678901234567890")
+    assert "BEGIN RSA" not in redact_secrets("-----BEGIN RSA PRIVATE KEY-----")
+    brief = build_objective_block("Fix x with ghp_12345678901234567890",
+                                  {"kind": "read", "tool": "read", "detail": "Read f"})
+    assert "ghp_" not in brief
+    assert brief.startswith("OBJECTIVE:")
+
+
+def test_brief_state_has_hash():
+    from jev_gate.schemas import build_state, sha256_hex
+    st = build_state("Do x", {"kind": "write", "detail": "echo hi"}, {}, {})
+    assert "brief" in st and "OBJECTIVE:" in st["brief"]
+    assert st["detail_sha256"] == sha256_hex("echo hi")
+
+
+def test_cli_log_schema_v2(tmp_path, monkeypatch):
+    import json
+    from jev_gate.cli import decide_event, main
+    import jev_gate.cli as cli_mod
+
+    def fake(state, questions):
+        return {"decision": {"choice": "allow", "confidence": 0.9},
+                "safe": {"noul": 0.9}, "risk": {"score": 0.1, "confidence": 0.8},
+                "model": "m", "usage": {"input_tokens": 42}}
+
+    event = {"objective": "o", "halt": {"kind": "read", "tool": "read", "detail": "Read f"},
+             "context": {"sessionID": "s1", "requestID": "r1"}, "policy": {}}
+    out = decide_event(event, fake)
+    assert out["usage"] == {"input_tokens": 42}
+
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("JEV_GATE_LOG", str(log))
+    monkeypatch.setenv("TYPESAFE_API_KEY", "x")
+    monkeypatch.setattr(cli_mod.client_mod, "evaluate",
+                        lambda state, questions, api_key, model: fake(state, questions))
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    main()
+    row = json.loads(log.read_text().strip())
+    assert row["v"] == 2
+    assert row["sessionID"] == "s1" and row["requestID"] == "r1"
+    assert row["gateAction"] == "allow" and row["usage"] == {"input_tokens": 42}
+    assert "detail_sha256" in row and len(row["detail_sha256"]) == 64

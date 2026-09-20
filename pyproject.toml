@@ -1,11 +1,30 @@
 [project]
 name = "jev-decision-gate"
-version = "0.1.0"
+version = "0.2.0"
+description = "Jev (TypeSafe AI) as the permission gate for OpenCode"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "jev-decision-gate contributors" }]
 requires-python = ">=3.10"
 dependencies = ["typesafe-sdk"]
+keywords = ["opencode", "permissions", "ai-safety", "typesafe", "jev"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+test = ["pytest"]
+
+[project.scripts]
+jev-gate-doctor = "jev_gate.doctor:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.coverage.run]
+source = ["jev_gate"]
