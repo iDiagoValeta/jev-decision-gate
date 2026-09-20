@@ -313,7 +313,49 @@ function textOfMessage(message: unknown): string | null {
   return null
 }
 
-async function objectiveFor(ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } }, sessionID: string): Promise<string> {
+class SessionEndedError extends Error {
+  constructor(message = "session-ended") {
+    super(message)
+    this.name = "SessionEndedError"
+  }
+}
+
+function archivedAt(info: unknown): unknown {
+  if (!info || typeof info !== "object") return undefined
+  const time = (info as { time?: unknown }).time
+  if (!time || typeof time !== "object") return undefined
+  return (time as { archived?: unknown }).archived
+}
+
+async function sessionIsEnded(
+  ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+  ended: Set<string>,
+): Promise<boolean> {
+  if (ended.has(sessionID)) return true
+  if (typeof ctx.session.get !== "function") return false
+  try {
+    const info = await ctx.session.get({ sessionID })
+    if (archivedAt(info) != null) {
+      ended.add(sessionID)
+      return true
+    }
+    return false
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/not\s*found|unknown session|no such session|deleted|archived/i.test(msg)) {
+      ended.add(sessionID)
+      return true
+    }
+    return false
+  }
+}
+
+async function objectiveFor(
+  ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+  ended: Set<string>,
+): Promise<string> {
   try {
     const messages = await ctx.session.context({ sessionID })
     const list = Array.isArray(messages) ? messages : []
@@ -323,7 +365,12 @@ async function objectiveFor(ctx: { session: { context: (input: { sessionID: stri
     const last = userTexts.slice(-3).join("\n").slice(-500)
     const redacted = redactSecrets(last)
     return redacted || "Complete the assigned coding task"
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (/not\s*found|unknown session|no such session|deleted|archived/i.test(msg)) {
+      ended.add(sessionID)
+      throw new SessionEndedError(msg.slice(0, 120))
+    }
     return "Complete the assigned coding task"
   }
 }
@@ -339,6 +386,7 @@ export default Plugin.define({
     // reply without calling Jev again.
     const inFlight = new Map<string, Promise<Record<string, unknown>>>()
     const resolved = new Map<string, { decision: string; repliedOk: boolean }>()
+    const endedSessions = new Set<string>()
     const inst = Math.random().toString(36).slice(2, 8)
     const logEv = (entry: Record<string, unknown>): void =>
       logLine(options, { inst, pid: process.pid, ...entry })
@@ -348,6 +396,11 @@ export default Plugin.define({
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         const evt = event as { type?: string; data?: Record<string, unknown> }
+        if (evt.type === "session.deleted") {
+          const dead = String((evt.data ?? {}).sessionID ?? "")
+          if (dead) endedSessions.add(dead)
+          continue
+        }
         if (evt.type !== "permission.asked") continue
         const data = evt.data ?? {}
         const sessionID = String(data.sessionID ?? "")
@@ -356,7 +409,26 @@ export default Plugin.define({
         const resources = Array.isArray((data as { resources?: unknown }).resources)
           ? ((data as { resources: unknown[] }).resources.map(String))
           : []
-        if (!sessionID || !requestID) continue
+        if (!sessionID || !requestID) {
+          logEv({
+            sessionID: sessionID || null,
+            requestID: requestID || null,
+            tool: action || null,
+            gateAction: "ask-human",
+            reason: "missing-ids",
+          })
+          continue
+        }
+        if (await sessionIsEnded(ctx as Parameters<typeof sessionIsEnded>[0], sessionID, endedSessions)) {
+          logEv({
+            sessionID,
+            requestID,
+            tool: action,
+            gateAction: "ask-human",
+            reason: "session-ended",
+          })
+          continue
+        }
 
         const cached = resolved.get(requestID)
         if (cached) {
@@ -386,7 +458,7 @@ export default Plugin.define({
           continue
         }
 
-        const task = handleOne(ctx, logEv, inst, options, sessionID, requestID, action, resources)
+        const task = handleOne(ctx, logEv, inst, options, sessionID, requestID, action, resources, endedSessions)
         inFlight.set(requestID, task)
         try {
           const outcome = await task
@@ -406,7 +478,7 @@ export default Plugin.define({
 })
 
 async function handleOne(
-  ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
   log: (entry: Record<string, unknown>) => void,
   inst: string,
   options: Record<string, unknown>,
@@ -414,6 +486,7 @@ async function handleOne(
   requestID: string,
   action: string,
   resources: string[],
+  endedSessions: Set<string>,
 ): Promise<{ decision: string; repliedOk: boolean }> {
   const joined = resources.join("\n")
   const resKinds = resourceKinds(resources)
@@ -439,7 +512,7 @@ async function handleOne(
   if (kind === null) return { decision: "ask-human", repliedOk: true }
 
   try {
-    const objective = await objectiveFor(ctx, sessionID)
+    const objective = await objectiveFor(ctx, sessionID, endedSessions)
     const rawDetail = joined.slice(0, 4000)
     const detail = redactSecrets(rawDetail)
     const riskHints = DESTRUCTIVE_HINT.test(joined) ? "matches destructive-hint" : ""
@@ -497,6 +570,18 @@ async function handleOne(
     // ask-human: no reply, the human prompt appears.
     return { decision: String(decision.action), repliedOk }
   } catch (err) {
+    if (err instanceof SessionEndedError || endedSessions.has(sessionID)) {
+      log({
+        sessionID,
+        requestID,
+        tool: action,
+        kind,
+        gateAction: "ask-human",
+        reason: "session-ended",
+        error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      })
+      return { decision: "ask-human", repliedOk: true }
+    }
     log({
       sessionID,
       requestID,

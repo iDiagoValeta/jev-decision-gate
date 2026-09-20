@@ -24,6 +24,12 @@ Stable 1.x never fires `permission.asked`, so the gate sleeps without
 disturbing you. Run `opencode --version`: it must start with `2`.
 The 12 old plugins failing under v2 is expected — they are v1-only.
 
+Global `~/.config/opencode/opencode.json` may keep both keys on purpose:
+
+- `plugin` — v1 plugins for stable 1.x
+- `plugins` — v2 plugins (this gate). Put the API key in
+  `TYPESAFE_API_KEY` (e.g. `~/.config/opencode/secrets.env`), not in JSON.
+
 ## Which log file?
 
 Canonical: the path in `logFile` / `JEV_GATE_LOG`, default
