@@ -14,3 +14,4 @@ build/
 coverage/
 htmlcov/
 decisions*.jsonl
+.jev-gate-replied/
