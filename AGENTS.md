@@ -79,21 +79,19 @@ bug.
 3. **Policy changes need a golden case.** Anything touching
    `decision.py`'s combine logic or `kindFor` needs a new entry in
    `tests/golden.json`.
-4. **`multichoice` never calls `ctx.permission.reply`, on purpose.**
-   Tried making it auto-approve like every other kind (twice, on two
-   opencode versions) — reverted both times. Confirmed empirically: for
-   this specific tool the client commits to its own confirmation UI
-   faster than Jev's round-trip (~750-900ms) can land, so the reply
-   always arrives too late ("Permission request not found") and the
-   human ends up clicking Allow manually regardless of what the plugin
-   does — replying costs nothing to skip. Worse, the *attempt* itself
-   (even though it fails) leaves something broken for the follow-up
-   step where the human picks an option: plugin disabled → picking
-   works; plugin enabled and attempting-and-failing this reply →
-   picking hangs, every time, on both 2.0.6 and 2.0.11. `pick` stays a
-   log-only recommendation either way — `reply()` has no option field,
-   it was never going to answer for the human. Don't re-add this reply
-   without new evidence the client-side race has actually changed.
+4. **`multichoice` never calls `ctx.permission.reply` — but this does
+   NOT fix the question-tool hang, it's just a harmless simplification.**
+   The reply always arrives too late regardless ("Permission request
+   not found", confirmed) so skipping it costs nothing. It was *also*
+   tried as a fix for the hang after the human picks an option — ruled
+   out live on 2.0.11: picking still hangs even with zero reply
+   attempted. **The actual cause of the hang is still unknown.** Three
+   fix attempts failed (cross-instance race, skip-reply-once,
+   skip-reply-again-with-evidence) — do not attempt a fourth blind fix.
+   Read `docs/TROUBLESHOOTING.md` "Question dialog hangs" for what's
+   actually been ruled out (plugin disabled → works; plugin enabled in
+   any form tested so far → hangs) and the next diagnostic to actually
+   isolate it before changing more code.
 5. **`setup()` runs more than once per opencode process.** Confirmed in
    production logs (same `pid`, different `inst`). Any new code path
    that evaluates or replies to a `permission.asked` event must claim

@@ -35,16 +35,15 @@ permission.asked (opencode v2)
 - **Two writers, one schema.** Plugin and CLI each log (the CLI sees
   the Jev internals, the plugin sees session/request IDs). Schema v2
   unifies field names so `measure.py` reads both.
-- **`multichoice` never replies, even though that's normally the whole
-  point of the gate.** Tried auto-approving it like every other kind,
-  twice, on two opencode versions — reverted both times. Confirmed
-  empirically: for this tool the client commits to its own confirmation
-  UI faster than Jev's round-trip can land, so the reply always arrives
-  too late and the human clicks Allow manually regardless — and the
-  *attempt* to reply, even though it fails, breaks the follow-up step
-  where the human picks an option (plugin disabled → picking works;
-  plugin enabled, reply attempted and failed → picking hangs, every
-  time). `pick` stays a logged recommendation only — `reply()` has no
+- **`multichoice` never replies** — but this is a harmless
+  simplification, not a fix. The reply always arrives too late for
+  this tool regardless (client commits to its own confirmation UI
+  before Jev's round-trip can land), so skipping it costs nothing.
+  **It does NOT fix the question-tool hang after the human picks an
+  option** — ruled out live: hangs the same with or without the reply
+  attempted. Root cause still unknown; three fix attempts have failed.
+  See `docs/TROUBLESHOOTING.md` "Question dialog hangs" before trying a
+  fourth. `pick` stays a logged recommendation only — `reply()` has no
   option field, it was never going to answer for the human. See
   `docs/TROUBLESHOOTING.md` for the evidence and repro.
 - **Redact before send.** Secrets never leave the box: redaction

@@ -112,52 +112,67 @@ unfamiliar line came from here.
 
 ## Question dialog hangs after picking an option
 
-**Status: fix applied 2026-09-20 (skip the reply for `multichoice`),
-pending final live confirmation on 2.0.11.**
+**Status: NOT fixed. Three different fixes tried, all failed to
+resolve it. Stop and rethink before trying a fourth — see "What we
+actually know" below.**
 
-Timeline of what was actually tried, in order, because the first two
-"fixes" were each reverted for a real reason and it's worth knowing why
-before touching this again:
+Timeline, in order, because each "fix" was reverted or disproven for a
+specific reason and it's worth knowing why before touching this again:
 
 1. **Auto-approve `multichoice` like any other kind** (original
    design). Hangs after picking an option.
-2. **Hypothesis: cross-instance reply race.** `setup()` runs more than
-   once per opencode process (same `pid`, different `inst` in the
-   log) — confirmed real, was causing duplicate Jev calls. Fixed by
-   claiming the requestID *before* calling Jev, not just before
-   replying (see ADR in ARCHITECTURE.md). Genuine improvement, but
-   verified on 2.0.6 to NOT be the cause of the hang: with a single,
-   clean, race-free `jev-allow` reply, the dialog still hung.
+2. **Fix: claim the requestID before calling Jev, not just before
+   replying**, to close a real cross-instance race (`setup()` runs more
+   than once per opencode process — confirmed, was causing duplicate
+   Jev calls). Genuine improvement (removed real duplicate work), but
+   verified on 2.0.6 to NOT be the cause of the hang: a single, clean,
+   race-free `jev-allow` reply still hung after picking.
 3. **Skip the reply for `multichoice` entirely** — tried once, reverted
    because it seemed to trade the hang for a mandatory manual
-   Allow/Reject click that wasn't there before, defeating the point of
-   the gate.
-4. **Live evidence on 2.0.11 (this environment) showed step 3's
-   objection didn't hold:** even with the cross-instance race fixed
-   and a clean single Jev evaluation, the reply to a `multichoice`
-   permission consistently arrives ~750-900ms after the request —
-   and the client has *already* shown its own "Permission required"
-   screen by then, so the reply lands as `"Permission request not
-   found"` every time. The manual click was happening anyway,
-   regardless of what the plugin did. Then, clicking Allow manually
-   and picking an option *still hung* — proving the attempted-and-failed
-   reply call itself (not a race, not the approval path) was
-   corrupting the follow-up pick step. With the plugin fully disabled
-   (no reply attempted at all), picking works.
-5. **Current fix:** skip the reply for `multichoice` again, now backed
-   by that evidence rather than a guess. Jev's `pick` stays a logged
-   recommendation. This costs nothing the user didn't already have —
-   the manual click was unavoidable for this tool either way — and
-   removes the attempted-reply side effect that broke picking.
+   Allow/Reject click that wasn't there before.
+4. Live testing on 2.0.11 showed step 3's objection didn't hold: the
+   reply to a `multichoice` permission consistently arrives ~750-900ms
+   after the request, after the client has already shown its own
+   "Permission required" screen, so it always lands as `"Permission
+   request not found"` — the manual click was happening regardless of
+   what the plugin did. And with the plugin fully disabled (no reply
+   attempted, nothing subscribed at all), picking worked. That looked
+   like proof the attempted-and-failed reply call was the corrupting
+   factor.
+5. **Re-applied fix 3, verified live on 2.0.11 — still hangs.** Jev
+   evaluates and logs (`gateAction:"allow"`, no `reply-failed` follow-
+   up — confirmed via the log, the fix is genuinely active), the reply
+   is never attempted, and picking an option after approving still
+   hangs the same way. The "reply attempt corrupts the follow-up"
+   theory from step 4 is **wrong**, or at least incomplete.
 
-If you hit the hang again after this fix: capture
-`tail -5 ~/.local/share/opencode/jev-decisions.jsonl` (or your
-configured `JEV_GATE_LOG`) right after it happens. A `"tool":"question"`
-line should show `reason:"jev-allow"` or similar with **no**
-`reply-failed` follow-up for that `requestID` — if there's still a
-reply attempt logged for `kind:"multichoice"`, the running plugin isn't
-picking up this fix (stale service, wrong `gateDir`, etc.), not a new
-instance of the original bug.
+**What we actually know:**
+- Plugin fully disabled (`enabled: false`, zero event subscribers,
+  zero session reads, nothing touches this permission at all) →
+  picking works, confirmed twice.
+- Plugin enabled — even in its most passive form now (evaluates,
+  logs, never replies) — picking hangs, confirmed on both 2.0.6 and
+  2.0.11.
+- The one thing every "enabled" configuration shares, that "disabled"
+  doesn't, isn't just the reply attempt (ruled out) — it's `setup()`
+  subscribing to the event stream at all (confirmed still running
+  twice per process: the log always shows two `inst` values, one
+  `duplicate-suppressed`, one that actually evaluates) and calling
+  `ctx.session.context({sessionID})` for the same session while its
+  interactive tool call is still open. Neither has been isolated as
+  the actual cause yet — that's the next thing to test, not fix blind.
+
+**Do not attempt a fourth code change without isolating this first.**
+A clean next diagnostic (not yet run): make the plugin do *nothing at
+all* for `kind === "multichoice"` — no `objectiveFor`/`ctx.session.context`
+call, no Jev spawn, not even a log line, `return` immediately — while
+still leaving `ctx.event.subscribe` active (so the double-subscriber
+situation stays). If picking still hangs with that, the double
+subscription itself is implicated, not anything the handler does. If
+picking works, `ctx.session.context` mid-flight is the suspect. Either
+result points at something in opencode's own event/session handling
+during an interactive tool call, likely worth an upstream report rather
+than another patch here.
 
 **Repro:** `permission: "ask"` (required, see above), plugin enabled,
 API key loaded in the service's own environment. Close any running
