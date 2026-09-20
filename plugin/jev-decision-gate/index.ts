@@ -393,6 +393,7 @@ async function handleOne(
       objectiveChars: objective.length,
       detail_sha256: sha256Hex(joined),
       hasKey: apiKeyOf(options) !== "",
+      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
     })
     let repliedOk = true
     if (decision.action === "allow") {

@@ -134,7 +134,7 @@ def _risk_question():
 
 def build_questions(halt):
     questions = {"decision": _decision_question(), "safe": _safe_question(), "risk": _risk_question()}
-    if halt.get("kind") == "multichoice":
+    if halt.get("kind") == "multichoice" and halt.get("options"):
         options = halt.get("options", [])
         questions["pick"] = {
             "type": "choice",

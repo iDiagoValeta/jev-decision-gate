@@ -39,6 +39,7 @@ def test_decide_event_fail_open_on_error():
         "pick": None,
         "confidence": 0.0,
         "model": None,
+        "error": "exception",
     }
 
 

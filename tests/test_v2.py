@@ -6,6 +6,40 @@ def test_write_executes_on_jev_say_so():
     assert denied == {"action": "deny", "reason": "jev-deny"}
 
 
+def test_no_pick_question_without_options():
+    from jev_gate.schemas import build_questions
+    out = build_questions({"kind": "multichoice", "tool": "question", "detail": "x"})
+    assert "pick" not in out
+    out2 = build_questions({"kind": "multichoice", "tool": "question", "detail": "x", "options": ["a"]})
+    assert out2["pick"]["type"] == "choice"
+
+
+def test_multichoice_without_options_flows_through():
+    from jev_gate.cli import decide_event
+
+    def fake(state, questions):
+        assert "pick" not in questions
+        return {"decision": {"choice": "allow", "confidence": 0.8},
+                "safe": {"noul": 0.9}, "risk": {"score": 0.2, "confidence": 0.8},
+                "model": "m"}
+
+    event = {"objective": "o", "halt": {"kind": "multichoice", "tool": "question", "detail": "x"},
+             "context": {}, "policy": {}}
+    out = decide_event(event, fake)
+    assert out == {"action": "allow", "reason": "jev-allow", "pick": None,
+                   "confidence": 0.8, "model": "m"}
+
+
+def test_fail_open_carries_error():
+    from jev_gate.cli import decide_event
+
+    def bad(state, questions):
+        raise RuntimeError("down")
+
+    out = decide_event({"objective": "o", "halt": {"kind": "read"}}, bad)
+    assert out["reason"] == "fail-open" and out["error"] == "exception"
+
+
 def test_multichoice_pick_recorded_on_allow():
     from jev_gate.cli import decide_event
 
