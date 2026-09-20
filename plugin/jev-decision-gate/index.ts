@@ -488,8 +488,9 @@ async function handleOne(
       }
       try {
         await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
-      } catch {
+      } catch (err) {
         if (claim === "won") releaseReply(options, requestID)
+        log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
         repliedOk = false
       }
     }
