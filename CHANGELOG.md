@@ -6,6 +6,17 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (2026-09-20, live-fire fixes)
+- Jev decides with no confidence thresholds: the `decision` answer
+  wins at any confidence (allow/deny/ask-human). Safe/risk stay as
+  evidence. Unknown strings and errors still fail to ask-human;
+  catastrophic patterns still bypass Jev.
+- One evaluation per requestID: duplicate `permission.asked`
+  emissions share the in-flight promise; late ones log
+  `duplicate-suppressed` instead of re-calling Jev or double-replying.
+- Single-writer log: only the plugin writes when it spawns the gate.
+- `measure.py`: blocks = catastrophic-pattern + jev-deny.
+
 ### Added
 - Unified v2 decision log (`sessionID`, `requestID`, `kind`, `detail_sha256`, `elapsedMs`).
 - Curated Jev brief + secret redaction before send and log.

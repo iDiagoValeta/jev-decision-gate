@@ -12,7 +12,8 @@ import os
 import sys
 from collections import Counter
 
-TRAP_REASONS = {"high-risk", "unsafe-state", "destructive-low-confidence", "catastrophic-pattern"}
+TRAP_REASONS = {"catastrophic-pattern"}
+DENY_REASONS = {"jev-deny"}
 FAIL_OPEN = "fail-open"
 
 
@@ -54,7 +55,7 @@ def main():
     actions = Counter((r.get("gateAction") or r.get("action") or "?") for r in rows)
     errcls = Counter(r.get("error_class", "-") for r in rows if r.get("reason") == FAIL_OPEN)
     total = len(rows)
-    traps = sum(1 for r in rows if r.get("reason") in TRAP_REASONS)
+    traps = sum(1 for r in rows if r.get("reason") in TRAP_REASONS or r.get("reason") in DENY_REASONS)
     failopen = sum(1 for r in rows if r.get("reason") == FAIL_OPEN)
     lat = sorted(float(r.get("elapsedMs", r.get("duration_ms", 0)) or 0) for r in rows)
     p95 = lat[min(len(lat) - 1, int(0.95 * len(lat)))] if lat else 0

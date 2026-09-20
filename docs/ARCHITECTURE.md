@@ -33,9 +33,17 @@ permission.asked (opencode v2)
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail.
-- **Thresholds per kind, not per tool.** `read 0.6 / write 0.6 /
-  multichoice 0.7 / destructive 0.85`, floor `0.5`, `safe≥0.3`,
-  `risk<1.5`. Unknown kinds use the destructive bar.
+- **Jev decides, no thresholds.** The winning action is whatever
+  Jev's `decision` answer says, at any confidence. Safe/risk answers
+  are evidence, not vetoes. Unknown strings and errors still degrade
+  to ask-human; catastrophic patterns never reach Jev.
+- **One evaluation per request.** The server may emit the same
+  permission request several times while pending. The plugin dedupes
+  by requestID (in-flight sharing + resolved cache): one Jev call,
+  one reply, late duplicates logged as `duplicate-suppressed`.
+- **Single-writer log.** The plugin logs every decision; the Python
+  gate stays silent when spawned by the plugin (`JEV_GATE_CLI_LOG=0`)
+  and logs only in standalone use.
 
 ## Files
 

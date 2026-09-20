@@ -49,15 +49,16 @@ options table (`typesafeKey`, `logFile`, `gateDir`, `enabled`,
 
 ## Safety model
 
-| Threshold                 | Value |
-| ------------------------- | ----- |
-| Confidence floor          | 0.50  |
-| Read / write allow        | 0.60  |
-| Multichoice allow         | 0.70  |
-| Destructive / other allow | 0.85  |
+Jev decides — no confidence thresholds. Whatever Jev's `decision`
+answer says wins: allow executes, deny blocks, ask-human falls back
+to your manual prompt, at any confidence. The safe/risk answers are
+recorded evidence, not vetoes.
 
-Unknown decision strings and unknown halt kinds are treated as
-destructive. Every decision is appended to a JSONL log (v2 schema:
+What never executes: unknown decision strings (treated as ask-human),
+any error (fail-open to ask-human), and catastrophic shell patterns
+(rejected locally without calling Jev).
+
+Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
 `detail_sha256`) with no secrets, mode `0600`.

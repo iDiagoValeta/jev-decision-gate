@@ -1,17 +1,32 @@
-def test_write_needs_own_threshold():
+def test_write_executes_on_jev_say_so():
     from jev_gate import decision
-    assert decision.WRITE_ALLOW == 0.6
-    low = decision.combine("allow", 0.55, 0.9, 0.1, "write")
-    assert low == {"action": "ask-human", "reason": "write-low-confidence"}
+    low = decision.combine("allow", 0.15, 0.1, 1.9, "write")
+    assert low == {"action": "allow", "reason": "jev-allow"}
+    denied = decision.combine("deny", 0.9, 0.9, 0.1, "write")
+    assert denied == {"action": "deny", "reason": "jev-deny"}
 
 
-def test_multichoice_has_higher_threshold():
-    from jev_gate import decision
-    assert decision.MULTICHOICE_ALLOW == 0.7
-    low = decision.combine("allow", 0.65, 0.9, 0.1, "multichoice")
-    assert low == {"action": "ask-human", "reason": "multichoice-low-confidence"}
-    ok = decision.combine("allow", 0.8, 0.9, 0.1, "multichoice")
-    assert ok == {"action": "allow", "reason": "jev-allow"}
+def test_multichoice_pick_recorded_on_allow():
+    from jev_gate.cli import decide_event
+
+    def fake_evaluate(state, questions):
+        return {
+            "decision": {"choice": "allow", "confidence": 0.34},
+            "safe": {"noul": 0.2},
+            "risk": {"score": 1.9, "confidence": 0.9},
+            "pick": {"choice": "b"},
+            "model": "jev-1.13.0",
+        }
+
+    event = {
+        "objective": "Pick lib",
+        "halt": {"kind": "multichoice", "tool": "ask", "detail": "Which lib?", "options": ["a", "b"]},
+        "context": {},
+        "policy": {},
+    }
+    out = decide_event(event, fake_evaluate)
+    assert out["action"] == "allow"
+    assert out["pick"] == "b"
 
 
 def test_redact_secrets():

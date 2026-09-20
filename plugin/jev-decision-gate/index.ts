@@ -164,6 +164,7 @@ function minimalEnv(options: Record<string, unknown>): Record<string, string | u
     PYTHONPATH: process.env.PYTHONPATH,
     TYPESAFE_API_KEY: apiKeyOf(options),
     JEV_GATE_LOG: logFileOf(options),
+    JEV_GATE_CLI_LOG: "0",
     JEV_MODEL: process.env.JEV_MODEL,
     JEV_GATE_DIR: process.env.JEV_GATE_DIR,
   }
@@ -264,6 +265,12 @@ export default Plugin.define({
   async setup(ctx) {
     const options = ((ctx as { options?: unknown }).options ?? {}) as Record<string, unknown>
     if (!isEnabled(options)) return
+    // Dedupe: the server may emit the same permission request more than
+    // once while it is pending. Evaluate once per requestID; concurrent
+    // duplicates await the same promise, late duplicates reuse the cached
+    // reply without calling Jev again.
+    const inFlight = new Map<string, Promise<Record<string, unknown>>>()
+    const resolved = new Map<string, { decision: string; repliedOk: boolean }>()
     const controller = new AbortController()
     void (async () => {
       try {
@@ -279,74 +286,43 @@ export default Plugin.define({
           : []
         if (!sessionID || !requestID) continue
 
-        const joined = resources.join("\n")
-        if (isCatastrophic(joined)) {
-          logLine(options, { sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
+        const cached = resolved.get(requestID)
+        if (cached) {
+          if (!cached.repliedOk && cached.decision !== "ask-human") {
+            try {
+              await ctx.permission.reply({
+                sessionID,
+                requestID,
+                decision: cached.decision === "allow" ? "once" : "reject",
+              })
+              cached.repliedOk = true
+            } catch {
+              // Still pending or already resolved; nothing more to do.
+            }
+          } else {
+            logLine(options, { sessionID, requestID, tool: action, gateAction: cached.decision === "allow" ? "allow" : cached.decision === "deny" ? "deny" : "ask-human", reason: "duplicate-suppressed" })
+          }
+          continue
+        }
+        const ongoing = inFlight.get(requestID)
+        if (ongoing) {
           try {
-            await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+            await ongoing
           } catch {
-            // Fall through to the human prompt.
+            // First evaluation owns the outcome; duplicates just wait.
           }
           continue
         }
 
-        const kind = kindFor(action, resources)
-        if (kind === null) continue
-
+        const task = handleOne(ctx, options, sessionID, requestID, action, resources)
+        inFlight.set(requestID, task)
         try {
-          const objective = await objectiveFor(ctx, sessionID)
-          const rawDetail = joined.slice(0, 4000)
-          const detail = redactSecrets(rawDetail)
-          const riskHints = DESTRUCTIVE_HINT.test(joined) ? "matches destructive-hint" : ""
-          const halt: Record<string, unknown> = { kind, tool: action, detail }
-          if (kind === "multichoice") {
-            const opts = parseOptions(resources)
-            if (opts.length > 0) {
-              halt.options = opts
-              halt.numbered = numberedOptions(opts)
-            }
-          }
-          const gateEvent = {
-            objective,
-            halt,
-            context: { sessionID, requestID, risk_hints: riskHints },
-            policy: { default: "ask-human when unsure" },
-          }
-          const startedAt = Date.now()
-          const decision = await runGate(options, gateEvent)
-          const elapsedMs = Date.now() - startedAt
-          logLine(options, {
-            sessionID,
-            requestID,
-            tool: action,
-            kind,
-            gateAction: decision.action,
-            reason: decision.reason,
-            confidence: decision.confidence,
-            model: decision.model,
-            pick: decision.pick ?? null,
-            elapsedMs,
-            objectiveChars: objective.length,
-            detail_sha256: sha256Hex(joined),
-            hasKey: apiKeyOf(options) !== "",
-          })
-          if (decision.action === "allow") {
-            await ctx.permission.reply({ sessionID, requestID, decision: "once" })
-          } else if (decision.action === "deny") {
-            await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
-          }
-          // ask-human: no reply, the human prompt appears.
-        } catch (err) {
-          logLine(options, {
-            sessionID,
-            requestID,
-            tool: action,
-            kind,
-            gateAction: "ask-human",
-            reason: "fail-open",
-            error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
-          })
-          // Fail silent: the human prompt appears.
+          const outcome = await task
+          resolved.set(requestID, outcome)
+        } catch {
+          resolved.set(requestID, { decision: "ask-human", repliedOk: true })
+        } finally {
+          inFlight.delete(requestID)
         }
       }
       } catch {
@@ -356,3 +332,95 @@ export default Plugin.define({
     return () => controller.abort()
   },
 })
+
+async function handleOne(
+  ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  options: Record<string, unknown>,
+  sessionID: string,
+  requestID: string,
+  action: string,
+  resources: string[],
+): Promise<{ decision: string; repliedOk: boolean }> {
+  const joined = resources.join("\n")
+  if (isCatastrophic(joined)) {
+    logLine(options, { sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
+    let repliedOk = false
+    try {
+      await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+      repliedOk = true
+    } catch {
+      // Fall through to the human prompt.
+    }
+    return { decision: "deny", repliedOk }
+  }
+
+  const kind = kindFor(action, resources)
+  if (kind === null) return { decision: "ask-human", repliedOk: true }
+
+  try {
+    const objective = await objectiveFor(ctx, sessionID)
+    const rawDetail = joined.slice(0, 4000)
+    const detail = redactSecrets(rawDetail)
+    const riskHints = DESTRUCTIVE_HINT.test(joined) ? "matches destructive-hint" : ""
+    const halt: Record<string, unknown> = { kind, tool: action, detail }
+    if (kind === "multichoice") {
+      const opts = parseOptions(resources)
+      if (opts.length > 0) {
+        halt.options = opts
+        halt.numbered = numberedOptions(opts)
+      }
+    }
+    const gateEvent = {
+      objective,
+      halt,
+      context: { sessionID, requestID, risk_hints: riskHints },
+      policy: { default: "ask-human when unsure" },
+    }
+    const startedAt = Date.now()
+    const decision = await runGate(options, gateEvent)
+    const elapsedMs = Date.now() - startedAt
+    logLine(options, {
+      sessionID,
+      requestID,
+      tool: action,
+      kind,
+      gateAction: decision.action,
+      reason: decision.reason,
+      confidence: decision.confidence,
+      model: decision.model,
+      pick: decision.pick ?? null,
+      elapsedMs,
+      objectiveChars: objective.length,
+      detail_sha256: sha256Hex(joined),
+      hasKey: apiKeyOf(options) !== "",
+    })
+    let repliedOk = true
+    if (decision.action === "allow") {
+      try {
+        await ctx.permission.reply({ sessionID, requestID, decision: "once" })
+      } catch {
+        repliedOk = false
+      }
+    } else if (decision.action === "deny") {
+      try {
+        await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+      } catch {
+        repliedOk = false
+      }
+    }
+    // ask-human: no reply, the human prompt appears.
+    return { decision: String(decision.action), repliedOk }
+  } catch (err) {
+    logLine(options, {
+      sessionID,
+      requestID,
+      tool: action,
+      kind,
+      gateAction: "ask-human",
+      reason: "fail-open",
+      error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+    })
+    // Fail silent: the human prompt appears.
+    return { decision: "ask-human", repliedOk: true }
+  }
+}
