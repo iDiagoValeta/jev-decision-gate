@@ -123,6 +123,25 @@ end from scratch, as happened repeatedly in this repo's own history
 (the opencode-v2/opencode-ai confusion, the dead `permission.ask`
 hook, the `permission: allow` no-op) before it got written down.
 
+## Where development artifacts go
+
+Iteration logs, working plans, specs written for an agentic dev
+workflow (e.g. superpowers plans/specs), scratch notes — anything that
+records *how* the project got built rather than *what it currently is*
+— goes in `.dev/` at the repo root, which is gitignored. Never commit
+this kind of file under `docs/` or the repo root: `docs/` is what a
+contributor reads to understand the current system, and process notes
+mixed in there read as confusing clutter, not documentation (this repo
+shipped `docs/superpowers/plans/` and a root `ITERATION.md` publicly
+for a while before this was fixed).
+
+- Still being added to across sessions (e.g. an ongoing round/iteration
+  log) → keep it in `.dev/`, don't delete it.
+- Served its purpose and is superseded by real docs (e.g. an initial
+  design spec once `docs/ARCHITECTURE.md` covers the current design) →
+  delete it outright, don't archive it. `git log` already has the
+  history if anyone needs it.
+
 ## Before claiming a plugin-side fix works
 
 `index.ts` changes cannot be verified by `tsc` alone — it only proves

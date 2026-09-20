@@ -78,7 +78,7 @@ Every decision is appended to a JSONL log (v2 schema:
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps
 - `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2
-- `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md), plans & specs
+- `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
 ## Develop
 

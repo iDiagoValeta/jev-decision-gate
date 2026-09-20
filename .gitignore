@@ -15,3 +15,7 @@ coverage/
 htmlcov/
 decisions*.jsonl
 .jev-gate-replied/
+
+# Development-process artifacts (iteration logs, scratch plans/specs).
+# Never ship these; see AGENTS.md "Where development artifacts go".
+.dev/
