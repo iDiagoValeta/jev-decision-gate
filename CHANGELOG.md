@@ -6,6 +6,14 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (2026-09-20, issues #2 #3 + config hygiene)
+- Pin `@opencode/plugin` to `2.0.11` (was `latest`).
+- Session-end detection: track `session.deleted`, check
+  `session.get` for `time.archived`, and log
+  `reason: session-ended` (or `missing-ids`) instead of silent skip.
+- Prefer `TYPESAFE_API_KEY` env over cleartext `typesafeKey` in
+  global OpenCode config.
+
 ### Changed (2026-09-20, live-fire fixes)
 - Jev decides with no confidence thresholds: the `decision` answer
   wins at any confidence (allow/deny/ask-human). Safe/risk stay as
