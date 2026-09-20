@@ -44,6 +44,9 @@ Objetivo: repo público instalable, estándares modernos, producto curado para J
 | R36-40 | casos uso: triage questions, allowlist implícita (DESTRUCTIVE_HINT edit), read-only mode (kind read), delegación (deny/reject) | ✅ | main | documentado en README |
 | R41-45 | packaging: pyproject license/authors/scripts, plugin version, pins doc | ✅ | main | parcial: pin @opencode/plugin pendiente upstream |
 | R46-50 | E2E 3 subagentes + fixes + solo main | ✅ | main | 1 bug real + 1 fricción corregidos |
+| R51 | Jev manda sin umbrales (argmax puro) | ✅ | main | pedido por Jev-humano: decision gana a cualquier confianza |
+| R52 | dedupe por requestID (1 eval, 1 reply) | ✅ | main | el servidor re-emite eventos: 4 evals → 1 |
+| R53 | log single-writer (solo plugin) | ✅ | main | JEV_GATE_CLI_LOG=0 en spawn |
 
 ## Decisiones de diseño (vivas)
 - Fail-open siempre a ask-human; jamás allow silencioso en error.

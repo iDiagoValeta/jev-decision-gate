@@ -104,6 +104,12 @@ def main():
     if not event:
         event = {"objective": "", "halt": {"kind": "write"}}
     out = decide_event(event, real_evaluate, error_box)
+    if os.environ.get("JEV_GATE_CLI_LOG", "1") != "0":
+        _write_log_entry(event, out, error_box)
+    sys.stdout.write(json.dumps(out))
+
+
+def _write_log_entry(event, out, error_box):
     log_path = os.environ.get("JEV_GATE_LOG", "decisions-plugin.jsonl")
     try:
         halt = event.get("halt", {}) if isinstance(event, dict) else {}
@@ -132,7 +138,6 @@ def main():
         _chmod_600(log_path)
     except Exception:
         pass
-    sys.stdout.write(json.dumps(out))
 
 
 if __name__ == "__main__":

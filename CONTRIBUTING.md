@@ -20,7 +20,7 @@ python3 -m pytest -q
 
 1. Fail-open to `ask-human` on any error — never silent `allow`.
 2. No secrets in logs or Jev payloads (run `pytest -q` — redaction tests cover this).
-3. Threshold changes require a golden test in `tests/golden.json`.
+3. Policy changes require a golden test in `tests/golden.json`.
 
 ## Pull requests
 
