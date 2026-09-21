@@ -2,10 +2,14 @@
 
 Lets Jev answer permission prompts automatically. Allow goes through,
 deny blocks, anything uncertain falls back to your manual prompt.
-Agent questions to you are triaged too: Jev logs a numbered
-recommendation (`pick`), but the answer is always yours — the v2
-permission reply carries no option choice, so auto-answering is not
-possible.
+Agent questions are auto-answered too: the question tool's permission
+is passed through instantly (no Jev call), then OpenCode opens a
+**form** (`metadata.kind=question`) that the plugin polls for
+(`GET /api/form`) and answers on Jev's behalf via
+`POST /api/session/{sessionID}/form/{formID}/reply`. If Jev is unsure
+or the reply fails, you get a desktop alert and answer in the TUI —
+see the repo's `docs/ARCHITECTURE.md` and `docs/TROUBLESHOOTING.md`
+for the full two-phase flow and its known limits.
 
 Requires OpenCode on the `@opencode/plugin` line (`permission.asked`
 events — the more common `@opencode-ai/plugin` line does not fire it,
@@ -47,6 +51,7 @@ Options (all optional):
 | `enabled`     | `JEV_GATE_ENABLED`    | `true` (`false`, `0`, `off`, `no` disable) |
 | `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `15000` (clamped to 1000–30000)            |
 | `objectiveChars` | `JEV_GATE_OBJECTIVE_CHARS` | `4000` (clamped to 200–20000), how much recent conversation (both roles) Jev sees |
+| `pythonBin`   | `JEV_GATE_PYTHON`     | auto-detected: newest mise-managed Python under `~/.local/share/mise/installs/python/`, else `python3` |
 
 Precedence: `options > env > default`. Prefer env for the key so it
 never sits in cleartext JSON.
