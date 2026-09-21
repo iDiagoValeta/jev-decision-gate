@@ -10,7 +10,7 @@ dependencies = ["typesafe-sdk"]
 keywords = ["opencode", "permissions", "ai-safety", "typesafe", "jev"]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "bandit"]
 test = ["pytest"]
 
 [project.scripts]

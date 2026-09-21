@@ -21,6 +21,19 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install ruff
       - run: ruff check src tests scripts
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install bandit
+      # --severity-level medium: skips this codebase's known, reasoned LOW
+      # findings (try/except/pass fail-open pattern, doctor.py's fixed-
+      # argument subprocess calls with no shell=True, the doctor.py
+      # self-test assert) — same call already made for ruff's bandit
+      # rules in pyproject.toml. A real medium/high finding still fails.
+      - run: bandit -r src scripts --severity-level medium
   ts:
     runs-on: ubuntu-latest
     steps:
