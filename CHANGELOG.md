@@ -6,6 +6,21 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- Dependency audit: `pip-audit` against declared Python deps — clean,
+  no known vulnerabilities. `npm audit` (plugin) — 11 moderate
+  advisories, all the same root cause
+  ([GHSA-8988-4f7v-96qf](https://github.com/advisories/GHSA-8988-4f7v-96qf),
+  unbounded memory allocation in `@opentelemetry/core`'s W3C Baggage
+  propagation), pulled in transitively through `@opencode/plugin`
+  (our only runtime dependency, deliberately pinned to `2.0.11`). This
+  plugin never calls the OpenTelemetry API itself and doesn't process
+  external Baggage headers, so the advisory's trigger path isn't
+  reachable from our code; it's opencode's own telemetry surface, not
+  ours. `npm audit fix` can't resolve it without forcing a bump that
+  would break the `@opencode/plugin` pin — blocked on upstream
+  updating its own `@opentelemetry/*` deps, not actionable from here.
+
 ### Removed
 - Dead code found by an opencode subagent audit
   (`.dev/dead-code-audit.md`, not published — see `AGENTS.md`),
