@@ -3,7 +3,17 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { claimReply, isCatastrophic, kindFor, normalizeCommand, postApiReply, redactSecrets } from "./index.js"
+import {
+  capped,
+  claimReply,
+  isCatastrophic,
+  kindFor,
+  labelsFromFormField,
+  normalizeCommand,
+  postApiReply,
+  redactSecrets,
+  valueForPick,
+} from "./index.js"
 
 test("isCatastrophic: whole-filesystem / home wipes are caught", () => {
   for (const cmd of [
@@ -242,4 +252,43 @@ test("postApiReply: a missing opencode binary rejects with the raw spawn (ENOENT
     process.env.PATH = origPath
     fs.rmSync(emptyDir, { recursive: true, force: true })
   }
+})
+
+test("labelsFromFormField: caps each label's length and redacts secrets (confirming-review finding: option labels are attacker-reachable, unlike OBJECTIVE they went unfenced/uncapped)", () => {
+  const longLabel = "a".repeat(300)
+  const secretLabel = "token=abcd1234efgh5678"
+  const field = { options: [longLabel, secretLabel, "Option C"] }
+  const labels = labelsFromFormField(field)
+  assert.equal(labels[0].length, 200)
+  assert.equal(labels[0], "a".repeat(200))
+  assert.match(labels[1], /\[REDACTED\]/)
+  assert.equal(labels[2], "Option C")
+})
+
+test("valueForPick: round-trips a truncated/redacted label back to its real underlying value", () => {
+  const longLabel = "b".repeat(300)
+  const field = { options: [{ label: longLabel, value: "opt-real-value" }, "Option B"] }
+  const labels = labelsFromFormField(field)
+  assert.equal(labels[0].length, 200) // confirms this exercises the truncated path
+  assert.equal(valueForPick(field, labels[0]), "opt-real-value")
+  assert.equal(valueForPick(field, "Option B"), "Option B")
+})
+
+test("valueForPick: a pick that matches nothing offered falls back to the pick itself", () => {
+  const field = { options: ["a", "b"] }
+  assert.equal(valueForPick(field, "not-offered"), "not-offered")
+})
+
+test("capped: clears the collection once it reaches the size limit, otherwise leaves it alone (confirming-review finding: resolved/endedSessions/formSeen never evicted, unbounded over process lifetime)", () => {
+  const m = new Map<string, number>([["a", 1], ["b", 2]])
+  capped(m, 5).set("c", 3)
+  assert.deepEqual([...m.keys()], ["a", "b", "c"], "under the limit: untouched")
+
+  const full = new Map<string, number>([["a", 1], ["b", 2], ["c", 3]])
+  capped(full, 3).set("d", 4)
+  assert.deepEqual([...full.keys()], ["d"], "at the limit: cleared before the new insert lands")
+
+  const s = new Set<string>(["x", "y"])
+  capped(s, 2).add("z")
+  assert.deepEqual([...s], ["z"])
 })

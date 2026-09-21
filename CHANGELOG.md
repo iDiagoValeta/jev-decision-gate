@@ -6,6 +6,39 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Two findings from a confirming second adversarial review** (round
+  2, scoped to the multichoice/form flow and the event-loop dedup
+  logic — neither had a dedicated review before; round 1's kill-list/
+  redaction/injection fixes were out of scope and re-verified clean):
+  - Question-tool option labels (`labelsFromFormField`) reached Jev's
+    multichoice criteria with no length cap and no redaction, unlike
+    `OBJECTIVE`/`HALT.detail`. Not a bypass (the picked option must
+    still be one Jev was actually offered, checked independently on
+    both sides), but an unbounded, unfenced injection/cost surface.
+    Each label is now capped at 200 chars and redacted
+    (`normalizedLabel`); `valueForPick` re-derives the same
+    normalization at lookup time instead of assuming a positional
+    mapping between raw and shown labels, so a truncated/redacted pick
+    still round-trips correctly to its real underlying value.
+  - `resolved`/`endedSessions`/`formSeen` (the in-memory dedup maps in
+    the plugin's main event loop) are never evicted — confirmed by
+    review that no success path ever calls `.delete()`/removal on
+    them, so a long-lived process accumulates one entry per ever-seen
+    requestID/sessionID/formID for its whole uptime. Fixed with a
+    size-cap circuit breaker (`capped()`, 2000 entries) rather than
+    retrofitting per-entry timestamps through every function signature
+    that touches these maps — lower risk for the same practical
+    protection.
+  A third finding — the event-subscription loop is fully sequential,
+  so concurrent permissions queue behind each other under load — is
+  **not** fixed here; parallelizing it touches the exact dedup/claim
+  logic that caused issue #15/R52/R55/R57's duplicate-evaluation bugs,
+  so it's documented as a named, accepted limitation in
+  `docs/ARCHITECTURE.md` pending a dedicated, separately-reviewed
+  change rather than folded into this cycle.
+  23 TS tests now (was 19).
+
 ### Security
 - CI workflow actions pinned to a full commit SHA (with a version
   comment) instead of a mutable tag (`@v4`/`@v5`) — standard
