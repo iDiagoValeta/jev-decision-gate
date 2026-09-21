@@ -6,6 +6,19 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Tests for two CRITICAL gaps found by an opencode subagent test-coverage
+  audit (`.dev/test-coverage-audit.md`, gitignored dev artifact; the
+  audit also filed HIGH/MEDIUM/LOW findings not yet acted on):
+  `client.py`'s `evaluate()` now has tests proving a malformed Jev
+  payload (missing answer keys, non-numeric confidence) raises
+  `JevCallError("bad-response: ...")` instead of leaking a raw
+  `KeyError`/`ValueError`, plus a test for the empty-`api_key` guard.
+  `claimReply` (`index.ts`, the exclusive-marker dedup issue #15's fix
+  depends on) is now exported and has tests for its `won`/`lost`/`error`
+  branches, including that a path-unsafe `requestID` gets hashed rather
+  than used as a raw filename.
+
 ### Security
 - Dependency audit: `pip-audit` against declared Python deps — clean,
   no known vulnerabilities. `npm audit` (plugin) — 11 moderate
