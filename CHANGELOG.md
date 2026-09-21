@@ -7,6 +7,16 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- SAST: `bandit` runs in CI on `src`/`scripts` at `--severity-level
+  medium` (a new `sast` job). The threshold is intentional, not a
+  bypass: at the default `low` level bandit flags this codebase's
+  already-reasoned patterns (the fail-open `try/except/pass`, the
+  fixed-argument-list `subprocess.run` calls in `doctor.py` with no
+  `shell=True`, and a self-test `assert`), the same call already made
+  for ruff's own bandit-style rules (see `pyproject.toml`). A real
+  medium/high finding still fails CI.
+
+### Added
 - Tests for two CRITICAL gaps found by an opencode subagent test-coverage
   audit (`.dev/test-coverage-audit.md`, gitignored dev artifact; the
   audit also filed HIGH/MEDIUM/LOW findings not yet acted on):
