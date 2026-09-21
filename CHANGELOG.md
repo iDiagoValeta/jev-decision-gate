@@ -18,6 +18,32 @@ versioning follows [SemVer](https://semver.org/).
   depends on) is now exported and has tests for its `won`/`lost`/`error`
   branches, including that a path-unsafe `requestID` gets hashed rather
   than used as a raw filename.
+- All remaining HIGH/MEDIUM/LOW findings from that same audit now have
+  tests too (46 Python tests, up from 29; 14 TS tests, up from 7):
+  `client.py`'s `_real_transport` object-style SDK answers and
+  malformed-`usage` swallow; `cli.py`'s `_classify_error` (all four
+  branches), malformed-event fail-open, `bad-response` classification
+  from a `JevCallError`, non-dict `pick` handling, `pick` ignored on
+  `deny`, `_error_box["error_class"]` on a bad pick, `main()`'s
+  empty/invalid-stdin default and `JEV_GATE_CLI_LOG=0` skip,
+  `_write_log_entry`'s `error_class` emission on fail-open;
+  `decision.py`'s `None`/empty/case-variant inputs; `schemas.py`'s
+  `redact_secrets` non-string/empty passthrough and additional token
+  patterns (Basic/AKIA/`github_pat_`/`xox*`/`sk-`), and
+  `build_objective_block`'s empty-objective fallback, truncation caps,
+  and missing-`kind`/`tool` defaults. On the TS side: `normalizeCommand`
+  actually defeating quote/`${IFS}`/separator/`/bin/rm` obfuscation
+  (not just claimed in a comment), the remaining `CATASTROPHIC` list
+  entries, `kindFor`'s untested action/hint mappings, `redactSecrets`'
+  non-bearer token patterns, and `postApiReply` (now exported) rejecting
+  correctly on a non-zero exit and on a missing `opencode` binary.
+  Deliberately left uncovered: `postApiReply`'s 10s timeout branch (a
+  real-time test would slow the suite for one already-well-understood
+  path) and the in-flight/resolved request dedup in the plugin's main
+  event loop (embedded in the live subscription closure, not a pure
+  function — extracting it for testability would mean touching the
+  exact code that caused issue #15/R52/R55/R57's duplicate-eval bugs,
+  a job for its own reviewed change, not a test-coverage sweep).
 
 ### Security
 - Dependency audit: `pip-audit` against declared Python deps — clean,

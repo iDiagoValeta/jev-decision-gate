@@ -338,7 +338,7 @@ function listPendingForms(): Promise<Array<Record<string, unknown>>> {
  * was never a server-side expiry/TTL race, the SDK method itself is what's unreliable
  * here (plausibly related to setup() running more than once per process — see
  * claimReply). Shared by replyFormAnswer and replyPermission below. */
-function postApiReply(apiPath: string, body: Record<string, unknown>, errPrefix: string): Promise<void> {
+export function postApiReply(apiPath: string, body: Record<string, unknown>, errPrefix: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("opencode", ["api", "POST", apiPath, "-d", JSON.stringify(body)], {
       env: process.env,

@@ -69,6 +69,70 @@ def test_evaluate_wraps_non_numeric_confidence_as_bad_response():
         evaluate({"objective": "x"}, {"decision": {}}, api_key="k", transport=bad_confidence_transport)
 
 
+def test_real_transport_normalizes_object_style_sdk_answers():
+    from unittest.mock import MagicMock, patch
+
+    from jev_gate.client import _real_transport
+
+    class FakeAnswer:
+        def __init__(self, type_, **kw):
+            self.type = type_
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class FakeResult:
+        model = "jev-1.13.0"
+        usage = {"input_tokens": 42}
+        answers = {
+            "decision": FakeAnswer("choice", choice="allow", confidence=0.9),
+            "safe": FakeAnswer("noul", noul=0.95),
+            "risk": FakeAnswer("score", score=0.2, confidence=0.8),
+        }
+
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.__exit__.return_value = False
+    fake_client.system_one.return_value = FakeResult()
+
+    with patch("typesafe_sdk.TypeSafeClient", return_value=fake_client):
+        out = _real_transport({"objective": "x"}, {"decision": {}}, api_key="k", model="jev-latest")
+
+    assert out["answers"]["decision"] == {"type": "choice", "choice": "allow", "confidence": 0.9}
+    assert out["answers"]["safe"] == {"type": "noul", "noul": 0.95}
+    assert out["usage"] == {"input_tokens": 42}
+
+
+def test_real_transport_swallows_malformed_usage_without_raising():
+    from unittest.mock import MagicMock, patch
+
+    from jev_gate.client import _real_transport
+
+    class FakeAnswer:
+        def __init__(self, type_, **kw):
+            self.type = type_
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class FakeResult:
+        model = "jev-1.13.0"
+        usage = {"input_tokens": "not-a-number"}
+        answers = {
+            "decision": FakeAnswer("choice", choice="allow", confidence=0.9),
+            "safe": FakeAnswer("noul", noul=0.95),
+            "risk": FakeAnswer("score", score=0.2, confidence=0.8),
+        }
+
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.__exit__.return_value = False
+    fake_client.system_one.return_value = FakeResult()
+
+    with patch("typesafe_sdk.TypeSafeClient", return_value=fake_client):
+        out = _real_transport({"objective": "x"}, {"decision": {}}, api_key="k", model="jev-latest")
+
+    assert "usage" not in out
+
+
 def test_evaluate_returns_pick_when_present():
     from jev_gate.client import evaluate
 
