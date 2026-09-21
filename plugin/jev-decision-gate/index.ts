@@ -44,9 +44,12 @@ const COMMAND_SUBSTITUTION = /\$\(|`/
 const SECRET_PATTERNS: RegExp[] = [
   /bearer\s+[A-Za-z0-9\-._~+/=]{8,}/gi,
   /basic\s+[A-Za-z0-9+/=]{8,}/gi,
-  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\b(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9\-_]{8,}|xox[bpas]-[A-Za-z0-9\-_]{8,})\b/g,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/g,
+  // Raw JWT (no Bearer prefix): three base64url segments, starts "eyJ"
+  // (base64 of the JSON header's leading `{"`).
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
 ]
 
 export function normalizeCommand(text: string): string {
@@ -68,8 +71,14 @@ export function redactSecrets(text: string): string {
     re.lastIndex = 0
     out = out.replace(re, "[REDACTED]")
   }
+  // scheme://user:PASSWORD@host — redact only the password, keep the
+  // rest (host/port/path) visible for debugging context.
+  out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s/:@]+):([^\s/@]{1,})@/g, "$1:[REDACTED]@")
+  // Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
+  // not just stand alone (password=...) — the keyword can appear anywhere
+  // in the token, not only at its start.
   return out.replace(
-    /((?:typesafe[_-]?api[_-]?key|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*)([^\s"']{4,})/gi,
+    /(\b[a-z0-9_]*(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]*\s*[:=]\s*)([^\s"']{4,})/gi,
     "$1[REDACTED]",
   )
 }

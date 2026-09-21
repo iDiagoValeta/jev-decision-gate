@@ -12,10 +12,19 @@ import re
 _SECRET_PATTERNS = [
     re.compile(r"(?i)(bearer\s+[A-Za-z0-9\-._~+/=]{8,})"),
     re.compile(r"(?i)(basic\s+[A-Za-z0-9+/=]{8,})"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
     re.compile(r"\b(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9\-_]{8,}|xox[bpas]-[A-Za-z0-9\-_]{8,})\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)((?:typesafe[_-]?api[_-]?key|api[_-]?key|password|passwd|secret|token)\s*[:=]\s*)([^\s\"']{4,})"),
+    # Raw JWT (no Bearer prefix): three base64url segments, starts "eyJ"
+    # (base64 of the JSON header's leading `{"`).
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    # scheme://user:PASSWORD@host — redact only the password, keep the
+    # rest (host/port/path) visible for debugging context.
+    re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+):([^\s/@]{1,})@"),
+    # Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
+    # not just stand alone (password=...) — the keyword can appear anywhere
+    # in the token, not only at its start.
+    re.compile(r"(?i)(\b[a-z0-9_]*(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]*\s*[:=]\s*)([^\s\"']{4,})"),
 ]
 
 
@@ -29,7 +38,9 @@ def redact_secrets(text):
     out = _SECRET_PATTERNS[2].sub("[REDACTED-AWS-KEY]", out)
     out = _SECRET_PATTERNS[3].sub("[REDACTED-TOKEN]", out)
     out = _SECRET_PATTERNS[4].sub("[REDACTED-PRIVATE-KEY]", out)
-    out = _SECRET_PATTERNS[5].sub(r"\1[REDACTED]", out)
+    out = _SECRET_PATTERNS[5].sub("[REDACTED-JWT]", out)
+    out = _SECRET_PATTERNS[6].sub(r"\1:[REDACTED]@", out)
+    out = _SECRET_PATTERNS[7].sub(r"\1[REDACTED]", out)
     return out
 
 
