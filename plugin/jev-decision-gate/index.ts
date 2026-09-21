@@ -293,6 +293,17 @@ export function alertHuman(title: string, body: string): void {
       ],
       { stdio: "ignore", detached: true },
     )
+    // spawn() reports a missing binary (ENOENT) asynchronously via an
+    // 'error' event, not the synchronous throw the try/catch here
+    // catches — an unhandled 'error' event is fatal to the whole process
+    // (round 6 review, live-verified: on a host without notify-send,
+    // the very first alertHuman() call — the escalation path for nearly
+    // every fail-open/ask-human outcome — killed the entire opencode
+    // host process, not just this notification). Every other spawn() in
+    // this file already has this listener; these two were missed.
+    n.on("error", () => {
+      // Notification is best-effort.
+    })
     n.unref?.()
   } catch {
     // Notification is best-effort.
@@ -303,6 +314,9 @@ export function alertHuman(title: string, body: string): void {
       ["--warning", "--title", headline, "--width=420", "--text", text || "Jev needs your decision in OpenCode."],
       { stdio: "ignore", detached: true },
     )
+    z.on("error", () => {
+      // Dialog is best-effort; notify-send alone is enough on headless.
+    })
     z.unref?.()
   } catch {
     // Dialog is best-effort; notify-send alone is enough on headless.

@@ -1,9 +1,28 @@
 # src/jev_gate/client.py
 """Thin wrapper around the TypeSafe SDK with error mapping."""
 
+import math
+
 
 class JevCallError(Exception):
     pass
+
+
+def _finite_float(x):
+    """float(x), but reject NaN/Infinity too.
+
+    Round 6 review, live-verified: neither the SDK's pydantic models nor
+    Python's own float()/json.loads() reject a non-finite confidence —
+    json.dumps(float("nan")) emits a bare `NaN` token, which is invalid
+    JSON (RFC 8259) and breaks the TS side's JSON.parse of the gate's
+    stdout, turning a value decision.combine() doesn't even use for
+    branching (see decision.py, "no thresholds") into a crash-adjacent
+    failure downstream instead of a clean bad-response/ask-human.
+    """
+    v = float(x)
+    if not math.isfinite(v):
+        raise ValueError(f"non-finite value: {v!r}")
+    return v
 
 
 def _real_transport(state, questions, api_key, model):
@@ -64,12 +83,12 @@ def evaluate(state, questions, api_key, model="jev-latest", transport=None):
         out = {
             "decision": {
                 "choice": answers["decision"]["choice"],
-                "confidence": float(answers["decision"]["confidence"]),
+                "confidence": _finite_float(answers["decision"]["confidence"]),
             },
-            "safe": {"noul": float(answers["safe"]["noul"])},
+            "safe": {"noul": _finite_float(answers["safe"]["noul"])},
             "risk": {
-                "score": float(answers["risk"]["score"]),
-                "confidence": float(answers["risk"]["confidence"]),
+                "score": _finite_float(answers["risk"]["score"]),
+                "confidence": _finite_float(answers["risk"]["confidence"]),
             },
             "model": raw.get("model", model),
         }

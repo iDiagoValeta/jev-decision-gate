@@ -7,6 +7,52 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **CRITICAL: `alertHuman()` crashed the entire opencode host process on
+  any machine without `notify-send`/`zenity` installed.** Found by a
+  6th adversarial review round that drove the real `setup(ctx)` event
+  loop end to end (not just read the code) against a fake `ctx`.
+  `child_process.spawn()` reports a missing binary asynchronously via
+  an `'error'` event, not the synchronous throw the existing
+  `try/catch` around each `spawn()` call catches. Both `spawn()` calls
+  in `alertHuman` — the escalation path for nearly every fail-open/
+  ask-human outcome in the plugin — had no `.on("error", ...)`
+  listener, unlike every other `spawn()` call in the file. An
+  unhandled `'error'` event is fatal to the whole Node process: the
+  *first* time any permission needed a human alert on a headless
+  machine (the norm for CI/servers/containers — exactly this
+  project's own stated target for autonomous/headless use), the
+  entire host died, taking down permission gating for every session,
+  not just the one that triggered it — worse than a silent hang, a
+  full outage from a completely ordinary condition, no attacker
+  interaction required. Live-verified: reproduced the crash against
+  the real exported function with `PATH` pointed at a directory with
+  neither binary, confirmed the fix survives the same repro, confirmed
+  reverting the fix makes the new regression test fail (child process
+  exits 1) before restoring it. Fixed by adding the same
+  `.on("error", ...)` listener already used elsewhere in the file.
+- A non-finite `decision.confidence` (`NaN`/`Infinity`) from Jev's
+  response passed straight through `client.evaluate()`'s `float()`
+  calls uncaught — `float()` doesn't reject non-finite values,  and
+  `json.dumps` then emits an invalid bare `NaN` token that breaks the
+  TS side's `JSON.parse` of the gate's stdout, converting a field
+  `decision.combine()` doesn't even use for branching ("no
+  thresholds") into a downstream parse failure instead of a clean
+  `bad-response`/ask-human. New `_finite_float()` helper (`client.py`)
+  rejects non-finite values explicitly, caught by the existing
+  `bad-response` error-wrapping path.
+  30 TS tests now (was 29), 50 Python tests (was 49).
+
+### Verified clean (round 6, live-execution)
+- A `session.deleted` event racing an in-flight, un-awaited form
+  evaluation for the same session — no crash, no double-reply.
+- 7 constructed malformed/unusual `permission.asked` payload shapes
+  (missing fields, `data`/`properties` precedence, non-string
+  `resources`) — all handled gracefully.
+- The poll-based form-discovery path racing the event-subscription
+  path for the identical form ID — `claimReply`'s file lock correctly
+  allows exactly one evaluation.
+
+### Fixed
 - **Session-ended detection was over-broad enough to silently stop
   replying on a still-alive session — the one fail path in the plugin
   with no `alertHuman`.** Found by a 5th, final adversarial review
