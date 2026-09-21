@@ -137,7 +137,8 @@ npm --prefix plugin install           # TS deps
 
 python3 -m pytest -q                              # Python tests
 ruff check src tests scripts                       # lint (pyflakes+pycodestyle only, see pyproject.toml)
-npm --prefix plugin exec --no -- tsc --noEmit -p plugin/jev-decision-gate   # TS typecheck (no TS unit tests exist)
+npm --prefix plugin exec --no -- tsc --noEmit -p plugin/jev-decision-gate   # TS typecheck
+npm --prefix plugin test                          # TS unit tests (pure functions only: catastrophic, redact, kindFor)
 
 python3 -m jev_gate.doctor            # install/env diagnostics
 python3 scripts/measure.py            # read the decision log
@@ -149,11 +150,15 @@ The plugin auto-detects a mise-managed Python (`options.pythonBin` /
 and sets `PYTHONPATH=src` on the gate subprocess so `typesafe_sdk` resolves
 when the opencode service’s `/usr/bin/python3` lacks it.
 
-CI (`.github/workflows/ci.yml`) runs `pytest` on 3.10-3.12, `ruff`, and
-`tsc --noEmit`. There is no automated test for `index.ts` logic beyond
-the type check — the interactive permission/dialog flow can only be
-verified by hand (or `scripts/verify_autonomy.py`) against a live
-opencode v2 session (see `docs/TROUBLESHOOTING.md`).
+CI (`.github/workflows/ci.yml`) runs `pytest` on 3.10-3.12, `ruff`,
+`tsc --noEmit`, and `npm --prefix plugin test` (Node's built-in
+`node:test`, via `plugin/jev-decision-gate/index.test.ts`, compiled by
+`plugin/tsconfig.build.json` — covers the pure exported functions:
+`isCatastrophic`, `redactSecrets`, `kindFor`). There is no automated
+test for the stateful `setup()`/event-subscription/spawn logic — the
+interactive permission/dialog flow can only be verified by hand (or
+`scripts/verify_autonomy.py`) against a live opencode v2 session (see
+`docs/TROUBLESHOOTING.md`).
 
 ## Documentation is not optional
 
