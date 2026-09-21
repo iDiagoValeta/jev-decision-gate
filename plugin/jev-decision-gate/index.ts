@@ -8,6 +8,19 @@ import { fileURLToPath } from "node:url"
 // Catastrophic patterns: rejected instantly without calling Jev.
 // Checked against a NORMALIZED command string (lowercased, quotes/
 // separators collapsed) so trivial obfuscation does not bypass them.
+//
+// Known, accepted false-positive trade-off (present since quote-stripping
+// was added, widened by backslash-stripping): stripping quotes/backslashes
+// to defeat obfuscation also means descriptive text that merely MENTIONS a
+// dangerous command inside quotes can normalize into something that matches
+// — e.g. `echo "talk about rm -rf / here"` or `echo "rm -r\f / in docs"`
+// both normalize to a string containing `rm -rf /`. This fails closed (the
+// command is rejected, not silently allowed) so it's a usability cost, not
+// a security hole, and there is no narrower fix available: restricting
+// backslash-stripping to avoid this would reopen the r\m obfuscation bypass
+// it exists to close (confirmed — `r\m` has a backslash between two
+// letters, same shape as the false-positive case). A real shell parser
+// could tell prose from syntax; a regex-based kill-list can't.
 const CATASTROPHIC = [
   /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\/home\/[^/\s]+(?!\S)|\/root(?!\S)|\.(?!\S)|\.\/(?!\S)|\.\.(?!\S)|\.\.\/(?!\S))/,
   /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+.*--no-preserve-root/,
@@ -225,9 +238,16 @@ export function claimReply(options: Record<string, unknown>, requestID: string, 
 // entry per ever-seen requestID/sessionID/formID for its whole uptime.
 // A size cap, checked before each insert, is a simpler and lower-risk
 // circuit breaker than retrofitting per-entry timestamps through every
-// signature that touches these maps — clearing early in the rare case
-// this threshold is hit costs at most one redundant Jev call or
-// session-ended recheck, never a correctness issue.
+// signature that touches these maps. Confirmed by a second review: no
+// cross-request race (the event loop is sequential — see the ADR on that
+// in docs/ARCHITECTURE.md — and inFlight itself is never capped), but
+// clearing `resolved` early CAN drop the cached entry a late duplicate
+// permission.asked would have used to retry a previously-failed reply
+// (the issue #15 pattern) — that duplicate falls through to
+// duplicate-suppressed instead of retrying. Not a lost or silently-wrong
+// decision: alertHuman already fired synchronously when the original
+// reply failed, so the operator was notified either way. At most one
+// missed *automatic* self-heal on an already-rare, already-alerted path.
 const MAX_DEDUP_ENTRIES = 2000
 
 export function capped<T extends Map<string, unknown> | Set<string>>(collection: T, max: number = MAX_DEDUP_ENTRIES): T {
@@ -325,24 +345,33 @@ export function labelsFromFormField(field: unknown): string[] {
     .map(normalizedLabel)
 }
 
-export function valueForPick(field: unknown, pick: string): string {
+// Returns null when the pick is ambiguous: two different original options
+// normalized (redacted/truncated) to the same string, so which one Jev
+// "meant" can't be recovered — first-match-wins would silently apply a
+// different, still-valid option than the one actually intended, with no
+// signal anything went wrong (confirming-review finding). Callers must
+// treat null the same as "pick not offered": ask-human, don't guess.
+export function valueForPick(field: unknown, pick: string): string | null {
   if (!field || typeof field !== "object") return pick
   const opts = (field as { options?: unknown }).options
   if (!Array.isArray(opts)) return pick
+  const matches: string[] = []
   for (const item of opts) {
     if (typeof item === "string") {
-      if (normalizedLabel(item) === pick) return item
+      if (normalizedLabel(item) === pick) matches.push(item)
       continue
     }
     if (item && typeof item === "object") {
       const o = item as { label?: unknown; value?: unknown }
       const rawLabel = typeof o.label === "string" && o.label ? o.label : typeof o.value === "string" && o.value ? o.value : null
       if (rawLabel !== null && normalizedLabel(rawLabel) === pick) {
-        return typeof o.value === "string" && o.value ? o.value : pick
+        matches.push(typeof o.value === "string" && o.value ? o.value : pick)
       }
     }
   }
-  return pick
+  const distinct = new Set(matches)
+  if (distinct.size > 1) return null
+  return matches.length > 0 ? matches[0] : pick
 }
 
 /** List pending interactive forms (question tool uses kind=question forms on 2.0.x). */
@@ -905,8 +934,16 @@ async function handleFormAsked(
         alertHuman("Jev: opción inválida", `Jev eligió "${decision.pick}" fuera de la lista. Responde en OpenCode.`)
         return
       }
+      const value = valueForPick(field, decision.pick)
+      if (value === null) {
+        alertHuman(
+          "Jev: opción ambigua",
+          `Dos opciones distintas se ven igual tras redactar/truncar ("${decision.pick}"). Responde en OpenCode.`,
+        )
+        return
+      }
       picks.push(decision.pick)
-      answer[key] = valueForPick(field, decision.pick)
+      answer[key] = value
     }
 
     try {
