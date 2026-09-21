@@ -1,6 +1,9 @@
 import assert from "node:assert/strict"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { test } from "node:test"
-import { isCatastrophic, kindFor, redactSecrets } from "./index.js"
+import { claimReply, isCatastrophic, kindFor, redactSecrets } from "./index.js"
 
 test("isCatastrophic: whole-filesystem / home wipes are caught", () => {
   for (const cmd of [
@@ -60,4 +63,42 @@ test("kindFor: maps documented permission actions to a gate kind", () => {
   assert.equal(kindFor("glob", []), "read")
   assert.equal(kindFor("bash", ["git push --force origin main"]), "destructive")
   assert.equal(kindFor("bash", ["ls -la"]), "write")
+})
+
+test("claimReply: first claim wins, a second claim on the same requestID loses", () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
+  try {
+    assert.equal(claimReply({ gateDir }, "req-1", "instA"), "won")
+    assert.equal(claimReply({ gateDir }, "req-1", "instB"), "lost")
+    // A different requestID is a fresh claim, unaffected by req-1.
+    assert.equal(claimReply({ gateDir }, "req-2", "instB"), "won")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("claimReply: filesystem trouble that isn't EEXIST reports error, not lost (never silently suppress)", () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
+  try {
+    // .jev-gate-replied must be a directory; making gateDir itself a file where
+    // the marker directory would need to live forces mkdirSync to fail with
+    // ENOTDIR, not EEXIST.
+    const blockerFile = path.join(gateDir, "blocker")
+    fs.writeFileSync(blockerFile, "")
+    assert.equal(claimReply({ gateDir: blockerFile }, "req-1", "instA"), "error")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("claimReply: a requestID with path-unsafe characters is hashed, not used as a raw filename", () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
+  try {
+    assert.equal(claimReply({ gateDir }, "../../etc/passwd", "instA"), "won")
+    const files = fs.readdirSync(path.join(gateDir, ".jev-gate-replied"))
+    assert.equal(files.length, 1)
+    assert.match(files[0], /^[A-Za-z0-9_-]+$/, "marker filename must not contain raw path characters")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
 })

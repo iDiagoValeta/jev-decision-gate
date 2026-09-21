@@ -191,7 +191,7 @@ function repliedDirOf(options: Record<string, unknown>): string {
 // Returns "won" (evaluate and reply now), "lost" (someone else owns
 // it) or "error" (marker unusable — evaluate anyway, never suppress on
 // FS trouble).
-function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
+export function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
   const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
   try {
     fs.mkdirSync(repliedDirOf(options), { recursive: true })
