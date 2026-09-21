@@ -255,133 +255,77 @@ The human-pick hang case still needs a human at the keyboard; it
 cannot be scripted (the failure is about what happens after a real
 click).
 
-## Ordinary permission replies (`read`/`edit`/`bash`/...) can silently miss the window
+## Ordinary permission replies (`read`/`edit`/`bash`/...) failed with "Permission request not found" (RESOLVED — was never a timing race)
 
-**Status (2026-09-21, OpenCode 2.0.11):** mitigated, not closed —
-tracked in
+**Status (2026-09-21, OpenCode 2.0.11): fixed.** Was
 [issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15).
-This is the same family of problem as "Question dialog hangs" above,
-but on the plain `ctx.permission.reply()` path (`handleOne`), for
-ordinary `read`/`write`/`destructive` kinds — not the question/form
-flow.
 
-**Symptom in log:** `gateAction` matches Jev's real decision
+**Symptom in log:** `gateAction` matched Jev's real decision
 (`jev-allow` / `jev-deny` / `jev-asked-human`), immediately followed by
 a second line for the same `requestID`:
 `reason: "reply-failed", error_class: "Permission request not found: <id>"`.
-Jev decided correctly; the reply never reached the tool call. If
-nothing else resolves the permission (no human at the TUI, no
-`opencode run --auto`), **the tool call hangs indefinitely** — confirmed
-by driving a session through the raw API
-(`POST /api/session/{id}/prompt`, the same mechanism
-`scripts/verify_autonomy.py` uses) and watching a `read` tool call sit
-at `status: "running"` for 20+ seconds after the permission was
-already gone.
+Jev decided correctly; the reply never reached the tool call, and if
+nothing else resolved the permission the tool call hung indefinitely.
 
-**Reproduction and evidence:**
+**First theory (2026-09-21, earlier the same day — wrong, kept here so
+the dead end isn't rediscovered):** that `ctx.permission.reply()` was
+racing a short-lived server-side window (~800ms-1s) that Jev's real
+API latency sits at the edge of, and that this was unfixable from the
+plugin side without an upstream accommodation. A latency-reduction
+mitigation (spawning the gate subprocess before `objectiveFor`'s RPC
+instead of after) shipped on this theory and measurably reduced the
+failure rate, which looked like confirmation.
 
-- `elapsedMs` for the Jev round trip (`objectiveFor` RPC + spawn +
-  real TypeSafe API call) is consistently **~750-900ms** across dozens
-  of samples, for both `read` and `bash`/`write` kinds — not just the
-  ~750-900ms previously measured for multichoice.
-- A clean, Jev-independent probe (poll
-  `GET /api/session/{id}/permission` every 50ms right after sending a
-  prompt) measured a pending `read` permission going from present to
-  **gone at age 0.832s**, with no reply from the plugin logged yet at
-  that point — i.e., something removes the permission on its own,
-  independent of whatever the plugin does.
-- Reproduced identically via three different invocation methods:
-  `opencode run` (no flag — opencode's own client auto-rejects
-  near-instantly, before Jev even returns, so the tool fails
-  regardless of Jev's verdict), `opencode run --auto` (opencode's
-  client auto-approves near-instantly — the tool succeeds regardless
-  of Jev's verdict, which means **`--auto` defeats the gate's
-  protective function even though the plugin still logs a decision**;
-  don't mistake a clean-looking log for the gate having actually
-  mattered), and the raw session API (no client-side auto behavior at
-  all — the permission still vanished and the tool call hung).
-- **Not 100% reproducible on every run:** one batch of 5 consecutive
-  ordinary permissions (light load, freshly-restarted `opencode
-  service`) all replied successfully with **zero** `reply-failed`, at
-  similar `elapsedMs` (770-880ms) to an earlier batch that failed 5
-  for 5 under heavier concurrent load (several overlapping `opencode
-  api` calls / a polling script running at the same time). This looks
-  like a **race against a short-lived server-side window** (rough
-  order of magnitude: ~800ms-1s) that Jev's real network latency sits
-  right on the edge of — light load leaves enough margin to win it,
-  concurrent load on the single-threaded plugin process (or on the
-  service) does not. Not confirmed as the literal mechanism (no access
-  to the opencode server's own source); confirmed only that the
-  permission disappears server-side on a timescale independent of the
-  plugin's own log.
+**What actually falsified it:** live-testing found a permission whose
+reply had just failed with "not found" was **still listed as pending**
+via `GET /api/session/{id}/permission` *minutes* later — not garbage
+collected, not expired. A manual, raw
+`opencode api POST /api/session/{id}/permission/{requestID}/reply` on
+that exact still-pending `requestID` **succeeded immediately**. There
+is no server-side TTL being raced; the permission stays alive far
+longer than ~800ms-1s. The failure was specific to *how* the reply was
+sent, not *when*.
 
-**Why the question/form path (above) doesn't have this problem:** its
-*answer* goes through `POST /api/session/{id}/form/{formID}/reply`,
-not `ctx.permission.reply()` — a different endpoint that tolerates the
-same ~800ms Jev latency fine in every sample collected. The permission
-phase for questions only needs an instant passthrough reply (`decision:
-"once"`, no Jev call), so it never faces this race. Ordinary
-`read`/`write`/`bash` permissions have no such two-phase option: the
-only way to unlock or reject the tool call *is* `ctx.permission.reply()`,
-and that call structurally cannot beat the window on a loaded system.
+**Root cause:** `ctx.permission.reply()` (the `@opencode/plugin` SDK
+method, called in-process from the plugin) is unreliable in this
+environment in a way the equivalent raw HTTP call is not. The likely
+contributing factor is the already-documented "`setup()` runs more
+than once per opencode process" behavior (see `claimReply` above): two
+live plugin instances / event subscriptions exist, and something about
+the SDK method's internal binding to a specific instance/connection
+appears to make the reply fail even from the instance that legitimately
+won the exclusive-claim race and holds a valid `sessionID`+`requestID`.
+Not fully root-caused inside the SDK itself (closed source from this
+repo's vantage point) — root-caused enough to know the fix.
 
-**Mitigation shipped (2026-09-21):** two changes, neither of which
-closes the race (it can't be closed from this side — see below), both
-of which make it less bad:
+**Fix:** stop calling `ctx.permission.reply()` entirely. Reply via
+`opencode api POST /api/session/{sessionID}/permission/{requestID}/reply`
+instead — a subprocess call (`replyPermission` in `index.ts`), the
+exact same pattern `replyFormAnswer` already used successfully for form
+answers (which is why the form/question-answer path was never affected
+by this bug: it never used `ctx.permission.reply()` to begin with).
+Applied at all four call sites that used to call the SDK method: the
+catastrophic-reject path, the question-permission passthrough, the
+main allow/deny path, and the duplicate-event retry path.
 
-1. **Narrowed the window.** `objectiveFor`'s `session.context` RPC
-   used to run serially before spawning the Python gate; now the gate
-   subprocess is spawned first (`spawnGate`/`gate.send` in
-   `index.ts`), so its cold start (interpreter init, `typesafe_sdk`
-   import) overlaps with that RPC instead of adding to it. Checked the
-   `Permission.Reply` schema in `@opencode/schema` first
-   (`node_modules/@opencode/schema/dist/permission.d.ts`) for a
-   "pending"/"extend" reply option — there is none (`Reply` is exactly
-   `"once" | "always" | "reject"`, `Request` carries no TTL/duration
-   field), so there is no protocol-level way to ask for more time;
-   this is the only latency this plugin can give back.
-   **Re-measured after the change:** 9 sequential ordinary permissions
-   under light load and 6 under deliberately concurrent load (mimicking
-   the conditions that produced the original 5-for-5 failing batch) —
-   **0 `reply-failed` in 15 samples**, `elapsedMs` (now spans spawn →
-   decision, a strictly larger window than before, so not directly
-   comparable to the pre-fix numbers above) averaging ~790-836ms, one
-   outlier at 1037ms that still succeeded. This is evidence the
-   mitigation helps, not proof the race is gone — 15 samples doesn't
-   rule out a worse-loaded system still losing it, and the original
-   failing batch may have had heavier interference than either
-   re-test here.
-2. **Alert on `reply-failed`, not just a log line.** Previously, when
-   `ctx.permission.reply()` threw after Jev had already decided
-   (catastrophic-reject, question-permission-passthrough, or the main
-   allow/deny path), the plugin logged `reply-failed` and did nothing
-   else — the tool call could hang with **zero signal** to the
-   operator, which is a silent failure mode in spirit even though it
-   is not a silent *allow*. All three sites now also fire the same
-   `alertHuman()` desktop notification used for ask-human, so a
-   missed-window reply is at least as visible as any other case where
-   the gate needs a human. Also added `totalElapsedMs` (from
-   `permission.asked` received, not just from the Jev call) to the
-   `reply-failed` log line for future diagnosis.
+**Re-verified live after the fix:** two stress batches driving ordinary
+`read` permissions through concurrent load designed to reproduce the
+original failures (parallel session creation + a tight
+`GET /api/permission/request` polling loop running throughout) — **17
+consecutive successes, 0 `reply-failed`**, `elapsedMs` (Jev's own call
+time) ranging 743-1032ms, well past the ~832ms this session originally
+(wrongly) treated as a hard deadline. Also re-verified the
+question-permission passthrough (now also on `replyPermission`) via a
+full live multichoice round trip — passthrough, form-answer, and
+`question-answered` all logged correctly with `repliedOk: true`.
 
-**Still not attempted:** a fix that actually closes the race for good.
-The two-phase trick from the question path doesn't generalize safely
-to `write`/`destructive` kinds (there is no way to "provisionally
-unlock, then undo" a bash command that already ran). Closing it for
-real needs either an upstream accommodation (a way to extend a pending
-permission's lifetime while a plugin decides — confirmed not to exist
-in the current `Permission` schema) or a deliberate decision to accept
-the risk for read-only kinds specifically (auto-allow immediately,
-use Jev for async audit only) — a safety-model change, which is a
-product decision, not something to slip in as a side effect of a
-latency fix.
-
-**Repro:** fresh `opencode service`, `permission: "ask"`, key loaded.
-Drive a session via `opencode api POST /api/session/{id}/prompt`
-(not `opencode run` — see above for why that adds its own race) asking
-the agent to read a file; watch `JEV_GATE_LOG` for `reply-failed`, and
-`GET /api/session/{id}/message` for the tool call getting stuck at
-`status: "running"`.
+**What's still true from the abandoned mitigation:** the spawn-before-
+`objectiveFor` latency optimization and the alert-on-`reply-failed`
+desktop notification both shipped and are harmless, real improvements
+independent of the root cause being different than first thought —
+left in place. `reply-failed` should now be rare-to-never; if it
+recurs, re-open this investigation from "is the raw API call itself
+failing" rather than reassuming a timing race.
 
 ## Which log file?
 
