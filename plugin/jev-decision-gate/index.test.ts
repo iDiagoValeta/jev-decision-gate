@@ -279,6 +279,31 @@ test("valueForPick: a pick that matches nothing offered falls back to the pick i
   assert.equal(valueForPick(field, "not-offered"), "not-offered")
 })
 
+test("valueForPick: returns null (ambiguous) when two different options collide after redaction, rather than silently picking the first (2nd confirming-review finding)", () => {
+  const field = {
+    options: [
+      { label: "Use key sk-abc123def456ghijk", value: "account-A" },
+      { label: "Use key sk-xyz789ghi012jklmn", value: "account-B" },
+    ],
+  }
+  const labels = labelsFromFormField(field)
+  assert.equal(labels[0], labels[1], "both labels must collide after redaction for this test to be meaningful")
+  assert.equal(valueForPick(field, labels[0]), null)
+})
+
+test("valueForPick: returns null when two different labels collide only after the 200-char truncation", () => {
+  const prefix = "a".repeat(214)
+  const field = {
+    options: [
+      { label: `${prefix}/moduleA/file.ts`, value: "pick-moduleA" },
+      { label: `${prefix}/moduleB/file.ts`, value: "pick-moduleB" },
+    ],
+  }
+  const labels = labelsFromFormField(field)
+  assert.equal(labels[0], labels[1], "both labels must collide after truncation for this test to be meaningful")
+  assert.equal(valueForPick(field, labels[0]), null)
+})
+
 test("capped: clears the collection once it reaches the size limit, otherwise leaves it alone (confirming-review finding: resolved/endedSessions/formSeen never evicted, unbounded over process lifetime)", () => {
   const m = new Map<string, number>([["a", 1], ["b", 2]])
   capped(m, 5).set("c", 3)

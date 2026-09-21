@@ -7,6 +7,38 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`valueForPick` ambiguity: two different multichoice options that
+  collide after redaction/truncation now route to ask-human instead
+  of silently picking the first one.** Found by a third adversarial
+  review — this one specifically checking the earlier fixes in this
+  session for regressions they might have introduced. Two independent,
+  reproducible collisions confirmed: two option labels containing
+  different secrets that both redact to `"...[REDACTED]"`, and two
+  labels differing only past the 200-char truncation point. Before
+  this fix, `valueForPick` returned the first option whose normalized
+  label matched, silently applying a different (but still pre-offered,
+  still valid) choice than the one Jev actually meant — no error, no
+  log signal. Now returns `null` on ambiguity, treated the same as
+  "pick not offered": `alertHuman` fires, the form is not answered
+  automatically. 25 TS tests now (was 23).
+
+### Documented
+- **A known, pre-existing false-positive trade-off in the catastrophic
+  kill-list, made explicit.** The same review found that
+  `echo "talk about rm -rf / here"` (and similarly `"rm -r\f / in
+  docs"`) normalizes to text matching the catastrophic pattern and
+  gets instantly rejected — descriptive prose, not a real command.
+  Traced this to the existing quote-stripping step (present before
+  this session), which this session's backslash-stripping fix (closing
+  the `r\m` bypass) widened slightly. Confirmed there's no narrower fix
+  available: restricting backslash-stripping to avoid this reopens the
+  exact obfuscation bypass it exists to close, since `r\m` has the same
+  shape (backslash between two letters) as the false-positive case. It
+  fails closed (blocks work, never silently allows), so this is a
+  documented usability cost, not a security hole — see the comment
+  above the `CATASTROPHIC` array in `index.ts`.
+
+### Fixed
 - **Two findings from a confirming second adversarial review** (round
   2, scoped to the multichoice/form flow and the event-loop dedup
   logic — neither had a dedicated review before; round 1's kill-list/
