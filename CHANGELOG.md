@@ -7,6 +7,43 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Session-ended detection was over-broad enough to silently stop
+  replying on a still-alive session — the one fail path in the plugin
+  with no `alertHuman`.** Found by a 5th, final adversarial review
+  round (checking the whole plugin fresh, not just prior rounds'
+  fixes). `sessionIsEnded`/`objectiveFor` classified *any* error whose
+  message matched `/not\s*found|unknown session|.../i` as "this
+  session ended" — but the opencode SDK has a dozen unrelated
+  `*NotFoundError` types (`ProviderNotFoundError`,
+  `AgentNotFoundError`, `SkillNotFoundError`, `McpServerNotFoundError`,
+  `CommandNotFoundError`, `FileNotFoundError`, ...) whose messages
+  match the same bare regex — confirmed reachable: "Provider anthropic
+  not found" matched. A misclassification here permanently cached the
+  session as ended (no TTL) with no Jev call, no reply, and — unlike
+  every other error path in the file — no desktop alert either: the
+  tool call just silently hangs for the rest of the process's
+  lifetime. New `looksLikeSessionGone()` checks the SDK's own `_tag`
+  discriminant (`SessionNotFoundError`) first, precise when present,
+  and narrows the regex fallback to require "session" co-occurring
+  with the not-found-ish wording instead of either alone — closes the
+  cross-contamination with sibling `*NotFoundError` types while still
+  catching genuine session-ended phrasing.
+- The size-cap from an earlier round (`capped()`, meant to bound
+  `resolved`/`endedSessions`/`formSeen`) only actually covered
+  `endedSessions` on 1 of its 4 write sites — the 3 inside
+  `sessionIsEnded`/`objectiveFor`, its most frequently hit path, used
+  a bare `.add()` that bypassed the cap. Now all 4 go through
+  `capped()`.
+- `labelsFromFormField` crashed (uncaught `TypeError`) on a
+  `null`/`undefined` entry in a question field's `options` array — a
+  legal JSON shape, and one `valueForPick` already guarded against.
+  The crash was contained (caught by `handleFormAsked`'s outer
+  try/catch, fails open to `ask-human`) but took the whole form's
+  auto-answer down over one bad field entry. Now skips the bad entry
+  like every other malformed one.
+  29 TS tests now (was 25).
+
+### Fixed
 - **`valueForPick` ambiguity: two different multichoice options that
   collide after redaction/truncation now route to ask-human instead
   of silently picking the first one.** Found by a third adversarial
