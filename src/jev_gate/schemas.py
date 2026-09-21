@@ -48,7 +48,16 @@ def redact_secrets(text):
 def sha256_hex(text):
     if not isinstance(text, str):
         text = str(text)
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # errors="replace", not the default strict codec: a lone UTF-16
+    # surrogate reaches here in ordinary (non-adversarial) use whenever an
+    # emoji/non-BMP character lands on one of index.ts's plain .slice(0, N)
+    # truncation boundaries (JS slices UTF-16 code units, not code points).
+    # Strict encoding raised UnicodeEncodeError, which build_state() caught
+    # as a generic "exception" (fails open, but loses the real cause) and
+    # which _write_log_entry()'s blanket except silently swallowed —
+    # dropping that entire log line with no trace (round 7 review,
+    # live-verified: 0-byte log file for an event that did happen).
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def build_objective_block(objective, halt, risk_hints=""):

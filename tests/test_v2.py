@@ -114,6 +114,56 @@ def test_brief_state_has_hash():
     assert st["detail_sha256"] == sha256_hex("echo hi")
 
 
+def test_sha256_hex_survives_a_lone_utf16_surrogate():
+    # Round 7 review: index.ts truncates untrusted text with plain
+    # .slice(0, N) at several fixed boundaries. JS slices UTF-16 code
+    # units, not code points, so an emoji (or any non-BMP character)
+    # landing across one of those cuts leaves a lone surrogate in
+    # ordinary, non-adversarial text. The default strict "utf-8" codec
+    # raised UnicodeEncodeError here, which build_state() surfaced only
+    # as a generic fail-open "exception" and which _write_log_entry's
+    # blanket except silently swallowed — dropping that log line with
+    # zero trace. Must not raise.
+    from jev_gate.schemas import sha256_hex
+    lone_surrogate = "x" * 10 + "\ud83d"  # high surrogate with no low pair
+    digest = sha256_hex(lone_surrogate)
+    assert len(digest) == 64
+    # Deterministic: the same input always hashes the same way.
+    assert digest == sha256_hex(lone_surrogate)
+
+
+def test_decide_event_and_log_entry_survive_a_lone_surrogate_in_detail(tmp_path, monkeypatch):
+    import json
+
+    from jev_gate.cli import _write_log_entry, decide_event
+
+    lone_surrogate = "x" * 10 + "\ud83d"
+    event = {
+        "objective": "o",
+        "halt": {"kind": "read", "tool": "read", "detail": lone_surrogate},
+        "context": {},
+        "policy": {},
+    }
+
+    def fake_evaluate(state, questions):
+        return {"decision": {"choice": "allow", "confidence": 0.9},
+                "safe": {"noul": 0.9}, "risk": {"score": 0.1, "confidence": 0.8}, "model": "m"}
+
+    error_box = {}
+    out = decide_event(event, fake_evaluate, error_box)
+    # The real Jev decision must come through — not a spurious fail-open
+    # caused by the hash blowing up before Jev is even called.
+    assert out["action"] == "allow" and out["reason"] == "jev-allow"
+    assert error_box == {}
+
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("JEV_GATE_LOG", str(log))
+    _write_log_entry(event, out, error_box)
+    # The line must actually get written, not silently dropped.
+    row = json.loads(log.read_text().strip())
+    assert row["gateAction"] == "allow"
+
+
 def test_main_defaults_to_write_kind_on_empty_stdin(tmp_path, monkeypatch):
     import io
     import json
