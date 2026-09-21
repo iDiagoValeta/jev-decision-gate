@@ -143,6 +143,43 @@ Live autonomy check (non-interactive, against a running service):
   "Accepted risk: prompt injection into Jev's brief" for the full,
   explicitly-stated trade-off (found by an adversarial security
   review; previously an undocumented, implicit assumption).
+- **Option labels are capped and redacted too, not just OBJECTIVE/
+  detail.** A second adversarial pass found that `labelsFromFormField`
+  (`index.ts`, question-tool multichoice options) fed Jev's `"pick"`
+  criteria with attacker-reachable label text that had no length cap
+  and no redaction, unlike `OBJECTIVE`/`HALT.detail`. Not a bypass —
+  whatever Jev picks must still be one of the attacker's own
+  pre-supplied options, checked independently on both the TS
+  (`labels.includes`) and Python (`choice not in options`) sides — but
+  an unbounded, unfenced injection/cost surface all the same. Each
+  label is now redacted and capped at 200 chars (`normalizedLabel`);
+  `valueForPick` re-derives the same normalization at lookup time
+  (rather than assuming a positional mapping) so a truncated/redacted
+  pick still round-trips to its real underlying value.
+- **The event-subscription loop is sequential, by construction, not
+  by oversight — documented as an accepted limitation, not fixed.**
+  The same review traced `for await (const event of ctx.event.
+  subscribe(...))` (`index.ts`) against `@opencode/plugin`'s actual
+  iterator implementation and confirmed it's a plain pull-based async
+  iterator: `await handleOne(...)` for one permission blocks the loop
+  from even starting the next event (of any kind) until that gate
+  round-trip finishes (up to `timeoutMs`, 15s default/30s max). Under
+  concurrent load — the exact scenario this plugin's autonomy design
+  targets — later simultaneous permissions queue behind earlier ones,
+  each additionally exposed to the reply-window pressure issue #15
+  was fixed for. This also means `inFlight`'s "concurrent duplicates
+  await the same promise" branch is currently unreachable (only one
+  requestID can occupy it at a time by construction) — not incorrect,
+  just dead code a future maintainer could misread as live concurrency
+  protection. Parallelizing event dispatch would touch the exact
+  dedup/claim logic that caused issue #15/R52/R55/R57's duplicate-
+  evaluation bugs, so it's being left as a known, named limitation for
+  a dedicated change with its own review, not folded into this cycle's
+  fixes. The unbounded growth of `resolved`/`endedSessions`/`formSeen`
+  that the same review flagged *was* fixed here — a size cap
+  (`capped()`, 2000 entries, clears rather than tracking per-entry
+  age) — since that one was low-risk and additive, unlike parallelizing
+  the loop.
 - **Jev decides, no thresholds.** The winning action is whatever
   Jev's `decision` answer says, at any confidence. Safe/risk answers
   are evidence, not vetoes. Unknown strings and errors still degrade

@@ -219,6 +219,22 @@ export function claimReply(options: Record<string, unknown>, requestID: string, 
   }
 }
 
+// The in-memory dedup collections (resolved/endedSessions/formSeen) have
+// no eviction otherwise: confirmed by review that nothing ever calls
+// .delete() on the success path, so a long-lived process accumulates one
+// entry per ever-seen requestID/sessionID/formID for its whole uptime.
+// A size cap, checked before each insert, is a simpler and lower-risk
+// circuit breaker than retrofitting per-entry timestamps through every
+// signature that touches these maps — clearing early in the rare case
+// this threshold is hit costs at most one redundant Jev call or
+// session-ended recheck, never a correctness issue.
+const MAX_DEDUP_ENTRIES = 2000
+
+export function capped<T extends Map<string, unknown> | Set<string>>(collection: T, max: number = MAX_DEDUP_ENTRIES): T {
+  if (collection.size >= max) collection.clear()
+  return collection
+}
+
 function pruneReplied(options: Record<string, unknown>, maxAgeMs = 3600000): void {
   try {
     const dir = repliedDirOf(options)
@@ -273,7 +289,26 @@ export function alertHuman(title: string, body: string): void {
   }
 }
 
-function labelsFromFormField(field: unknown): string[] {
+// Option labels come from the agent's own tool call (question fields), so
+// they're attacker-reachable the same way OBJECTIVE/HALT.detail are —
+// capped per-label (build_objective_block caps OBJECTIVE/detail too) and
+// redacted before they become Jev's multichoice criteria (see
+// build_questions in schemas.py). Not fenced like OBJECTIVE/detail: the
+// pre-supplied "must be one of these options" check bounds what a
+// resulting pick can do, so the goal here is capping cost/exposure, not
+// closing a bypass — see SECURITY.md.
+const LABEL_MAX_CHARS = 200
+
+// Same normalization applied on both the way out (labelsFromFormField,
+// what Jev sees) and the way back (valueForPick, matching Jev's pick to
+// the original option): deterministic, so re-deriving it at lookup time
+// stays correct even though filter/slice can shift indices, without
+// needing a positional mapping between raw options and shown labels.
+export function normalizedLabel(text: string): string {
+  return redactSecrets(text).slice(0, LABEL_MAX_CHARS)
+}
+
+export function labelsFromFormField(field: unknown): string[] {
   if (!field || typeof field !== "object") return []
   const opts = (field as { options?: unknown }).options
   if (!Array.isArray(opts)) return []
@@ -287,17 +322,22 @@ function labelsFromFormField(field: unknown): string[] {
     })
     .filter((label): label is string => typeof label === "string" && label.length > 0)
     .slice(0, 10)
+    .map(normalizedLabel)
 }
 
-function valueForPick(field: unknown, pick: string): string {
+export function valueForPick(field: unknown, pick: string): string {
   if (!field || typeof field !== "object") return pick
   const opts = (field as { options?: unknown }).options
   if (!Array.isArray(opts)) return pick
   for (const item of opts) {
-    if (typeof item === "string" && item === pick) return pick
+    if (typeof item === "string") {
+      if (normalizedLabel(item) === pick) return item
+      continue
+    }
     if (item && typeof item === "object") {
       const o = item as { label?: unknown; value?: unknown }
-      if (o.label === pick || o.value === pick) {
+      const rawLabel = typeof o.label === "string" && o.label ? o.label : typeof o.value === "string" && o.value ? o.value : null
+      if (rawLabel !== null && normalizedLabel(rawLabel) === pick) {
         return typeof o.value === "string" && o.value ? o.value : pick
       }
     }
@@ -657,7 +697,7 @@ export default Plugin.define({
           const id = String(item.id ?? "")
           if (!id || formSeen.has(id)) continue
           // Answer question-kind forms; other forms also get Jev if they have options.
-          formSeen.add(id)
+          capped(formSeen).add(id)
           try {
             await handleFormAsked(ctx as Parameters<typeof handleFormAsked>[0], logEv, inst, options, item, endedSessions)
           } catch {
@@ -673,7 +713,7 @@ export default Plugin.define({
         const evt = event as { type?: string; data?: Record<string, unknown>; properties?: Record<string, unknown> }
         if (evt.type === "session.deleted") {
           const dead = String((evt.data ?? evt.properties ?? {}).sessionID ?? "")
-          if (dead) endedSessions.add(dead)
+          if (dead) capped(endedSessions).add(dead)
           continue
         }
         // Forms (question tool on 2.0.x) and legacy question events.
@@ -687,7 +727,7 @@ export default Plugin.define({
             ? (payload.form as Record<string, unknown>)
             : payload) as Record<string, unknown>
           const fid = String(form.id ?? payload.id ?? "")
-          if (fid) formSeen.add(fid)
+          if (fid) capped(formSeen).add(fid)
           const task = handleFormAsked(ctx, logEv, inst, options, form, endedSessions)
           void task.catch(() => {
             // Failures are logged inside the handler.
@@ -751,9 +791,9 @@ export default Plugin.define({
         inFlight.set(requestID, task)
         try {
           const outcome = await task
-          resolved.set(requestID, outcome)
+          capped(resolved).set(requestID, outcome)
         } catch {
-          resolved.set(requestID, { decision: "ask-human", repliedOk: true })
+          capped(resolved).set(requestID, { decision: "ask-human", repliedOk: true })
         } finally {
           inFlight.delete(requestID)
         }
