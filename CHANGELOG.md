@@ -18,26 +18,37 @@ versioning follows [SemVer](https://semver.org/).
   built-in `node:test`, run via `npm --prefix plugin test`) covering
   `isCatastrophic`, `redactSecrets`, and `kindFor` — previously the
   only TS-side check was `tsc --noEmit`.
-- **Issue #15, mitigated (not closed).** Ordinary `read`/`write`/`bash`
-  permission replies race a short-lived, non-configurable server-side
-  window that Jev's real API latency sits at the edge of; missing it
-  leaves the tool call hanging. `handleOne` now spawns the Python gate
-  before `objectiveFor`'s RPC instead of after (cold start overlaps
-  the RPC instead of adding to it — re-measured: 0/15 `reply-failed`
-  across light and deliberately concurrent load, vs the earlier 5/5
-  failing batch, though 15 samples doesn't prove the race is gone).
-  Every `reply-failed` now also fires the desktop alert
-  (`notify-send`/`zenity`) instead of only a log line, so a missed
-  window is never silent. Confirmed via `@opencode/schema`'s
-  `Permission.Reply` type (`"once" | "always" | "reject"`, no
-  TTL/duration field) that there is no protocol-level way to extend
-  the window — closing this for good needs an upstream accommodation
-  or a deliberate safety-model decision, not a plugin-side patch.
+- **Issue #15, fixed.** Ordinary `read`/`write`/`bash` permission
+  replies intermittently failed with `reply-failed: Permission request
+  not found`, leaving the tool call hanging. First diagnosed (wrongly)
+  as a race against a short server-side window, and a latency
+  mitigation shipped on that theory; falsified hours later when a
+  permission a reply had just failed on was found still pending
+  server-side *minutes* later, and a raw `opencode api POST
+  .../permission/{id}/reply` on it succeeded immediately. Root cause:
+  `ctx.permission.reply()` (the `@opencode/plugin` SDK method) is
+  itself unreliable in this environment — never a timing issue. Fixed
+  by no longer calling it: `replyPermission` in `index.ts` now shells
+  out to `opencode api POST .../permission/{id}/reply` at all four
+  call sites that used it, the same pattern `replyFormAnswer` already
+  used reliably for form answers. Re-verified live: 17/17 successes
+  under concurrent load that reliably reproduced the original failures
+  (elapsedMs up to 1032ms, well past the previously-suspected ~832ms
+  "deadline" — there never was one). See `docs/TROUBLESHOOTING.md` for
+  the full story, including the abandoned first theory, kept so the
+  dead end isn't rediscovered.
+- Golden eval expanded from 6 to 13 cases (`tests/golden.json`), and
+  `tests/test_golden.py` now checks every case against an explicit
+  `expected_action`, not just the `must_not_allow` traps — half the
+  cases previously loaded but were never asserted against anything.
+  New cases cover an unknown `decision.choice` degrading to
+  ask-human, a multichoice pick outside `options`, multichoice with no
+  `options` at all (protects the R54 fix), confidence having zero
+  effect on the outcome in both directions (protects the "no
+  thresholds" design), a positive `write` case, and a `doom_loop`
+  destructive case.
 
 ### Known limitations
-- Issue #15 (above) is mitigated, not closed: under enough concurrent
-  load, an ordinary permission reply can still miss the server-side
-  window.
 - The question/form auto-answer path is live-verified for the
   `ELEGIDO=pizza` repro but not proven to close every hang case; see
   `docs/TROUBLESHOOTING.md` "Question dialog hangs".

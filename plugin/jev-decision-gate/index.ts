@@ -384,6 +384,48 @@ function replyFormAnswer(sessionID: string, formID: string, answer: Record<strin
   })
 }
 
+// Reply to a permission via `opencode api POST`, not ctx.permission.reply().
+// Root cause of issue #15: live testing found a permission the SDK method
+// reported "Permission request not found" for was STILL listed as pending
+// via GET /api/session/{id}/permission minutes later, and a raw
+// `opencode api POST .../reply` on that exact requestID succeeded
+// immediately — this was never a server-side expiry/TTL race, the SDK
+// method itself is what's unreliable here (plausibly related to setup()
+// running more than once per process — see claimReply). Mirrors
+// replyFormAnswer below, which uses the same CLI path and has never shown
+// this failure.
+function replyPermission(sessionID: string, requestID: string, decision: "once" | "reject"): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ decision })
+    const child = spawn(
+      "opencode",
+      ["api", "POST", `/api/session/${sessionID}/permission/${requestID}/reply`, "-d", body],
+      { env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+    )
+    let stderr = ""
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGTERM")
+      } catch {
+        // ignore
+      }
+      reject(new Error("permission-reply timeout"))
+    }, 10000)
+    child.stderr?.on("data", (c) => {
+      if (stderr.length < 4000) stderr += String(c)
+    })
+    child.on("error", (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      if (code === 0) resolve()
+      else reject(new Error(`permission-reply exit ${code}: ${stderr.slice(0, 200)}`))
+    })
+  })
+}
+
 function pythonBin(options: Record<string, unknown>): string {
   if (typeof options.pythonBin === "string" && options.pythonBin) return options.pythonBin
   if (process.env.JEV_GATE_PYTHON) return process.env.JEV_GATE_PYTHON
@@ -721,11 +763,7 @@ export default Plugin.define({
         if (cached) {
           if (!cached.repliedOk && cached.decision !== "ask-human") {
             try {
-              await ctx.permission.reply({
-                sessionID,
-                requestID,
-                decision: cached.decision === "allow" ? "once" : "reject",
-              })
+              await replyPermission(sessionID, requestID, cached.decision === "allow" ? "once" : "reject")
               cached.repliedOk = true
             } catch {
               // Still pending or already resolved; nothing more to do.
@@ -904,7 +942,7 @@ async function handleFormAsked(
 }
 
 async function handleOne(
-  ctx: { permission: { reply: (input: { sessionID: string; requestID: string; decision: "once" | "reject" }) => Promise<unknown> }; session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
+  ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
   log: (entry: Record<string, unknown>) => void,
   inst: string,
   options: Record<string, unknown>,
@@ -938,7 +976,7 @@ async function handleOne(
     log({ sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
     let repliedOk = true
     try {
-      await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
+      await replyPermission(sessionID, requestID, "reject")
     } catch (err) {
       log({ sessionID, requestID, tool: action, gateAction: "reject", reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception", totalElapsedMs: Date.now() - receivedAt })
       repliedOk = false
@@ -956,7 +994,7 @@ async function handleOne(
   if (action === "question") {
     let repliedOk = true
     try {
-      await ctx.permission.reply({ sessionID, requestID, decision: "once" })
+      await replyPermission(sessionID, requestID, "once")
     } catch (err) {
       log({
         sessionID,
@@ -1048,7 +1086,7 @@ async function handleOne(
     let repliedOk = true
     if (decision.action === "allow" || decision.action === "deny") {
       try {
-        await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
+        await replyPermission(sessionID, requestID, decision.action === "allow" ? "once" : "reject")
       } catch (err) {
         log({
           sessionID,

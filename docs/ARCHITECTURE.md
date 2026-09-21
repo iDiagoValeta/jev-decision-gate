@@ -59,24 +59,20 @@ Live autonomy check (non-interactive, against a running service):
 
 ## Key decisions (ADRs, short)
 
-- **Known gap: `ctx.permission.reply()` races a short server-side
-  window.** Ordinary (non-question) replies land ~800ms+ after the
-  halt (Jev's real API latency); under load that can miss whatever
-  window opencode keeps a pending permission open for, and the reply
-  fails (`reply-failed`) with the tool call left hanging rather than
-  denied. The question/form path avoids this (a different endpoint,
-  `POST .../form/{formID}/reply`, tolerates the same latency fine).
-  Mitigated, not closed: `handleOne` now spawns the Python gate
-  (`spawnGate`) before `objectiveFor`'s RPC instead of after, so the
-  subprocess cold-starts in parallel with it instead of serially
-  after it, and every `reply-failed` also fires the desktop alert
-  (previously silent beyond a log line). The `Permission` schema has
-  no TTL/duration field and `Reply` is exactly `"once" | "always" |
-  "reject"` — there's no protocol-level way to ask for more time, so
-  the race itself isn't closeable from the plugin side. See
-  `docs/TROUBLESHOOTING.md` "Ordinary permission replies can silently
-  miss the window" (issue #15) for the measurements and what a real
-  fix would require.
+- **Reply to permissions via `opencode api POST`, never
+  `ctx.permission.reply()`.** The SDK method was intermittently
+  unreliable (`reply-failed: Permission request not found`) on
+  permissions that were, live-verified, still pending server-side
+  minutes later — never a timing race, despite an earlier same-day
+  theory that it was (see `docs/TROUBLESHOOTING.md`, issue #15, for the
+  full story of how that theory got falsified). `replyPermission` in
+  `index.ts` shells out to `opencode api POST
+  /api/session/{sessionID}/permission/{requestID}/reply`, mirroring
+  `replyFormAnswer`'s already-reliable pattern for form answers, at all
+  four sites that used to call the SDK method (catastrophic-reject,
+  question-permission passthrough, main allow/deny, duplicate-event
+  retry). Re-verified live: 17/17 successes under deliberately
+  concurrent load that reliably reproduced the original failures.
 - **Fail-open, never silent allow.** Every `except` maps to
   `ask-human/fail-open` with an `error_class`. Rationale: a broken
   gate must cost a prompt, not a breach. Ask-human (and fail-open)
