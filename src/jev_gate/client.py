@@ -6,9 +6,6 @@ class JevCallError(Exception):
     pass
 
 
-ALLOWED_MODELS = ("jev-latest", "jev-1.13.0")
-
-
 def _real_transport(state, questions, api_key, model):
     try:
         from typesafe_sdk import TypeSafeClient
@@ -54,8 +51,6 @@ def _real_transport(state, questions, api_key, model):
 def evaluate(state, questions, api_key, model="jev-latest", transport=None):
     if not api_key:
         raise JevCallError("missing-api-key")
-    if model not in ALLOWED_MODELS and model != "jev-latest":
-        pass  # allow future models, record as-is
     raw = None
     if transport is not None:
         try:

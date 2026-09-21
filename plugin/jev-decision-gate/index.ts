@@ -89,34 +89,13 @@ const READ_ACTIONS = new Set([
   "skill",
   "todowrite",
 ])
-const WRITE_ACTIONS = new Set(["edit", "bash", "write", "apply_patch", "task", "webfetch", "websearch"])
-
-export function kindFor(action: string, resources: string[]): string | null {
+export function kindFor(action: string, resources: string[]): string {
   if (action === "question") return "multichoice"
   if (action === "doom_loop") return "destructive"
   if (READ_ACTIONS.has(action)) return "read"
   const text = resources.join("\n")
   if (DESTRUCTIVE_HINT.test(text)) return "destructive"
-  if (WRITE_ACTIONS.has(action)) return "write"
   return "write"
-}
-
-function parseOptions(resources: string[]): string[] {
-  for (const resource of resources) {
-    try {
-      const parsed: unknown = JSON.parse(resource)
-      const list = Array.isArray(parsed) ? parsed : (parsed as { options?: unknown }).options
-      if (Array.isArray(list)) {
-        const labels = list
-          .map((item) => (typeof item === "string" ? item : (item as { label?: unknown }).label))
-          .filter((label): label is string => typeof label === "string" && label.length > 0)
-        if (labels.length > 0) return labels.slice(0, 10)
-      }
-    } catch {
-      continue
-    }
-  }
-  return []
 }
 
 function numberedOptions(options: string[]): string {
@@ -351,15 +330,20 @@ function listPendingForms(): Promise<Array<Record<string, unknown>>> {
   })
 }
 
-/** Submit answers to a pending OpenCode form (question tool on 2.0.x). */
-function replyFormAnswer(sessionID: string, formID: string, answer: Record<string, string>): Promise<void> {
+/** POST a reply to an OpenCode API endpoint via the CLI (`opencode api POST`), never
+ * `ctx.permission.reply()`. Root cause of issue #15: live testing found a permission
+ * the SDK method reported "Permission request not found" for was STILL listed as
+ * pending via GET /api/session/{id}/permission minutes later, and a raw
+ * `opencode api POST .../reply` on that exact requestID succeeded immediately — this
+ * was never a server-side expiry/TTL race, the SDK method itself is what's unreliable
+ * here (plausibly related to setup() running more than once per process — see
+ * claimReply). Shared by replyFormAnswer and replyPermission below. */
+function postApiReply(apiPath: string, body: Record<string, unknown>, errPrefix: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ answer })
-    const child = spawn(
-      "opencode",
-      ["api", "POST", `/api/session/${sessionID}/form/${formID}/reply`, "-d", body],
-      { env: process.env, stdio: ["ignore", "pipe", "pipe"] },
-    )
+    const child = spawn("opencode", ["api", "POST", apiPath, "-d", JSON.stringify(body)], {
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
     let stderr = ""
     const timer = setTimeout(() => {
       try {
@@ -367,7 +351,7 @@ function replyFormAnswer(sessionID: string, formID: string, answer: Record<strin
       } catch {
         // ignore
       }
-      reject(new Error("form-reply timeout"))
+      reject(new Error(`${errPrefix} timeout`))
     }, 10000)
     child.stderr?.on("data", (c) => {
       if (stderr.length < 4000) stderr += String(c)
@@ -379,51 +363,18 @@ function replyFormAnswer(sessionID: string, formID: string, answer: Record<strin
     child.on("close", (code) => {
       clearTimeout(timer)
       if (code === 0) resolve()
-      else reject(new Error(`form-reply exit ${code}: ${stderr.slice(0, 200)}`))
+      else reject(new Error(`${errPrefix} exit ${code}: ${stderr.slice(0, 200)}`))
     })
   })
 }
 
-// Reply to a permission via `opencode api POST`, not ctx.permission.reply().
-// Root cause of issue #15: live testing found a permission the SDK method
-// reported "Permission request not found" for was STILL listed as pending
-// via GET /api/session/{id}/permission minutes later, and a raw
-// `opencode api POST .../reply` on that exact requestID succeeded
-// immediately — this was never a server-side expiry/TTL race, the SDK
-// method itself is what's unreliable here (plausibly related to setup()
-// running more than once per process — see claimReply). Mirrors
-// replyFormAnswer below, which uses the same CLI path and has never shown
-// this failure.
+/** Submit answers to a pending OpenCode form (question tool on 2.0.x). */
+function replyFormAnswer(sessionID: string, formID: string, answer: Record<string, string>): Promise<void> {
+  return postApiReply(`/api/session/${sessionID}/form/${formID}/reply`, { answer }, "form-reply")
+}
+
 function replyPermission(sessionID: string, requestID: string, decision: "once" | "reject"): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ decision })
-    const child = spawn(
-      "opencode",
-      ["api", "POST", `/api/session/${sessionID}/permission/${requestID}/reply`, "-d", body],
-      { env: process.env, stdio: ["ignore", "pipe", "pipe"] },
-    )
-    let stderr = ""
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM")
-      } catch {
-        // ignore
-      }
-      reject(new Error("permission-reply timeout"))
-    }, 10000)
-    child.stderr?.on("data", (c) => {
-      if (stderr.length < 4000) stderr += String(c)
-    })
-    child.on("error", (err) => {
-      clearTimeout(timer)
-      reject(err)
-    })
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      if (code === 0) resolve()
-      else reject(new Error(`permission-reply exit ${code}: ${stderr.slice(0, 200)}`))
-    })
-  })
+  return postApiReply(`/api/session/${sessionID}/permission/${requestID}/reply`, { decision }, "permission-reply")
 }
 
 function pythonBin(options: Record<string, unknown>): string {
@@ -690,7 +641,6 @@ export default Plugin.define({
         for (const item of pending) {
           const id = String(item.id ?? "")
           if (!id || formSeen.has(id)) continue
-          const meta = (item.metadata ?? {}) as Record<string, unknown>
           // Answer question-kind forms; other forms also get Jev if they have options.
           formSeen.add(id)
           try {
@@ -698,7 +648,6 @@ export default Plugin.define({
           } catch {
             formSeen.delete(id)
           }
-          void meta
         }
       })()
     }, pollMs)
@@ -1024,10 +973,6 @@ async function handleOne(
   }
 
   const kind = kindFor(action, resources)
-  if (kind === null) {
-    alertHuman("Jev: permiso desconocido", `Acción no clasificada: ${action}. Decide en OpenCode.`)
-    return { decision: "ask-human", repliedOk: true }
-  }
 
   // Spawn the gate subprocess before objectiveFor's session.context RPC
   // resolves, not after: its cold start (interpreter init, typesafe_sdk
