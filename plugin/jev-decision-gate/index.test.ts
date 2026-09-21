@@ -9,6 +9,7 @@ import {
   isCatastrophic,
   kindFor,
   labelsFromFormField,
+  looksLikeSessionGone,
   normalizeCommand,
   postApiReply,
   redactSecrets,
@@ -316,4 +317,38 @@ test("capped: clears the collection once it reaches the size limit, otherwise le
   const s = new Set<string>(["x", "y"])
   capped(s, 2).add("z")
   assert.deepEqual([...s], ["z"])
+})
+
+test("labelsFromFormField: a null/undefined entry in options is skipped, not a crash (5th confirming-review round)", () => {
+  const field = { options: [null, "foo", undefined, "bar"] }
+  assert.deepEqual(labelsFromFormField(field), ["foo", "bar"])
+})
+
+test("looksLikeSessionGone: an SDK _tag of SessionNotFoundError is trusted directly", () => {
+  assert.equal(looksLikeSessionGone({ _tag: "SessionNotFoundError", message: "whatever" }), true)
+})
+
+test("looksLikeSessionGone: unrelated *NotFoundError-shaped messages are NOT misclassified as the session ending (5th confirming-review round: bare /not found/i used to match all of these)", () => {
+  for (const msg of [
+    "Provider anthropic not found",
+    "Agent foo not found",
+    "MCP server bar not found",
+    "Skill baz not found",
+    "Command qux not found",
+    "File /tmp/x not found",
+  ]) {
+    assert.equal(looksLikeSessionGone(new Error(msg)), false, `should NOT match: ${msg}`)
+  }
+})
+
+test("looksLikeSessionGone: genuine session-gone phrasing still matches", () => {
+  for (const msg of [
+    "Session ses_abc123 not found",
+    "unknown session",
+    "no such session",
+    "session deleted",
+    "session archived",
+  ]) {
+    assert.equal(looksLikeSessionGone(new Error(msg)), true, `should match: ${msg}`)
+  }
 })

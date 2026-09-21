@@ -335,6 +335,11 @@ export function labelsFromFormField(field: unknown): string[] {
   return opts
     .map((item) => {
       if (typeof item === "string") return item
+      // A JSON array can legally hold null/undefined entries; valueForPick
+      // already guards this (`item &&`) but this map didn't (4th
+      // confirming-review round: crashed the whole form's auto-answer on
+      // one bad entry instead of just skipping it).
+      if (!item || typeof item !== "object") return null
       const o = item as { label?: unknown; value?: unknown }
       if (typeof o.label === "string" && o.label) return o.label
       if (typeof o.value === "string" && o.value) return o.value
@@ -639,6 +644,34 @@ function archivedAt(info: unknown): unknown {
   return (time as { archived?: unknown }).archived
 }
 
+// The opencode SDK's error surface for "this session is gone" overlaps in
+// wording with a dozen unrelated *NotFoundError types (ProviderNotFoundError,
+// AgentNotFoundError, SkillNotFoundError, McpServerNotFoundError,
+// CommandNotFoundError, FileNotFoundError, ...) — confirmed reachable: a
+// bare /not found/i (as this used to be) matches "Provider anthropic not
+// found" just as readily as an actual session error. Misclassifying one of
+// those as "session ended" is worse than it sounds: the session gets
+// permanently cached as ended (5th confirming-review round found this is
+// the ONE fail path in the file with no alertHuman — every other error
+// path degrades to ask-human with an alert; this one just silently stops
+// replying for that session, forever, violating SECURITY.md's "never
+// silently allows" guarantee in spirit even though it denies rather than
+// allows). Checking the SDK's own `_tag` first (Effect's TaggedStruct
+// discriminant — SessionNotFoundError is the real one) is precise when
+// present; the regex fallback now requires "session" to co-occur with the
+// not-found-ish wording instead of either alone, closing the cross-
+// contamination with sibling *NotFoundError types. Deliberately not adding
+// alertHuman here too: fixing the false-positive source is the real fix,
+// and a genuinely-ended session has nothing left for a human to act on —
+// alerting on every correct classification would just be noise for the
+// common case this was actually built to handle.
+export function looksLikeSessionGone(err: unknown): boolean {
+  const tag = (err as { _tag?: unknown } | null | undefined)?._tag
+  if (tag === "SessionNotFoundError") return true
+  const msg = err instanceof Error ? err.message : String(err)
+  return /\bsession\b/i.test(msg) && /not\s*found|unknown|no such|deleted|archived/i.test(msg)
+}
+
 async function sessionIsEnded(
   ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
@@ -649,14 +682,13 @@ async function sessionIsEnded(
   try {
     const info = await ctx.session.get({ sessionID })
     if (archivedAt(info) != null) {
-      ended.add(sessionID)
+      capped(ended).add(sessionID)
       return true
     }
     return false
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (/not\s*found|unknown session|no such session|deleted|archived/i.test(msg)) {
-      ended.add(sessionID)
+    if (looksLikeSessionGone(err)) {
+      capped(ended).add(sessionID)
       return true
     }
     return false
@@ -688,9 +720,9 @@ async function objectiveFor(
     const transcript = redactSecrets(lines.join("\n")).slice(-budgetChars)
     return transcript || "Complete the assigned coding task"
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (/not\s*found|unknown session|no such session|deleted|archived/i.test(msg)) {
-      ended.add(sessionID)
+    if (looksLikeSessionGone(err)) {
+      capped(ended).add(sessionID)
+      const msg = err instanceof Error ? err.message : String(err)
       throw new SessionEndedError(msg.slice(0, 120))
     }
     return "Complete the assigned coding task"
