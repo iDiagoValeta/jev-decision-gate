@@ -59,6 +59,22 @@ Live autonomy check (non-interactive, against a running service):
 
 ## Key decisions (ADRs, short)
 
+- **`opencode run --auto` is out of scope — it bypasses the gate
+  entirely, by design.** `--auto` is a client-side "auto-approve
+  permissions not explicitly denied" behavior in opencode's own CLI; it
+  does not wait for `permission.asked` subscribers, so it typically
+  resolves a request before this plugin's reply (always at least one
+  subprocess spawn plus an HTTP round trip) can land — including
+  defeating the catastrophic-pattern kill-list, which replies in
+  ~100ms with no network call and still loses. Confirmed live with a
+  zero-risk repro (`terraform destroy`, `terraform` not installed):
+  executed under `--auto`, correctly blocked (`executed: false`) via
+  the raw session API with no `--auto`. No fix is possible from inside
+  this plugin — there is no hook that fires before `--auto` commits.
+  See `docs/TROUBLESHOOTING.md` and issue #21. Headless/autonomous
+  sessions that need the gate's protection must go through the raw
+  session API (`POST /api/session`, `POST /api/session/{id}/prompt`,
+  poll `GET /api/session/{id}/message`) instead of `--auto`.
 - **Reply to permissions via `opencode api POST`, never
   `ctx.permission.reply()`.** The SDK method was intermittently
   unreliable (`reply-failed: Permission request not found`) on

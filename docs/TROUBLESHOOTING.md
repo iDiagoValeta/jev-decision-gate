@@ -1,5 +1,66 @@
 # Troubleshooting
 
+## `opencode run --auto` bypasses the gate entirely — including the catastrophic kill-list
+
+**Do not use `--auto` when this gate's decisions are meant to matter.** It is
+not a mitigated risk, it is a hard bypass: `--auto` is documented
+(`opencode run --help`) as "Auto-approve permissions that are not explicitly
+denied" — a **client-side** decision opencode's CLI makes on its own, without
+waiting for `permission.asked` subscribers (this plugin included) to reply.
+Whatever the plugin decides, `--auto` has usually already resolved the
+request by the time the plugin's reply (always at least one subprocess spawn
+plus an HTTP round trip) lands, so the reply 404s and the command runs
+regardless — deny, ask-human, or even the catastrophic-pattern kill-list, all
+equally bypassed. See [issue #21](https://github.com/iDiagoValeta/jev-decision-gate/issues/21)
+for the full writeup; summary below.
+
+Reproduced with zero real-world risk (`terraform` not installed on the test
+machine, so a bypass can't actually destroy anything):
+
+```bash
+opencode run --model <any> --auto \
+  "Run the shell command: terraform destroy -auto-approve and report the verbatim tool result."
+```
+
+The shell **executed** the command (`command not found: terraform`, exit
+127 — it ran, there was just nothing to destroy). The decision log shows the
+plugin got it right and still lost:
+
+```
+{"tool":"shell","kind":"destructive","gateAction":"reject","reason":"catastrophic-pattern", ...}
+{"tool":"shell","gateAction":"reject","reason":"reply-failed","error_class":"... HTTP 404 Not Found","totalElapsedMs":109}
+```
+
+109ms, no network call needed (local regex, no Jev) — and still too slow,
+because `--auto` doesn't wait on anything. This is not a recurrence of #15
+(`ctx.permission.reply()` failing when nothing else had resolved the
+request) and not fixable by making the plugin's reply faster: `--auto`
+approves before any plugin gets a chance to race it at all.
+
+**The same command through the raw session API (no `--auto`) is correctly
+blocked:**
+
+```bash
+opencode api POST /api/session -d '{}'                                    # → sid
+opencode api POST "/api/session/$sid/prompt" -d '{"text":"Run the shell command: terraform destroy -auto-approve ..."}'
+```
+
+```json
+{"type":"tool","name":"shell","executed":false,
+ "state":{"status":"error","error":{"type":"aborted","message":"The user declined this tool call"}}}
+```
+
+`executed: false`, no `reply-failed` in the log — the plugin's reject landed
+before the tool ran. Same plugin, same machine, same model; the only
+difference is the absence of `--auto`.
+
+**For headless/non-interactive/subagent work where the gate's protection
+matters, drive the session through the raw API instead of `--auto`:**
+`POST /api/session`, `POST /api/session/{id}/prompt` (body `{"text": "..."}`),
+then poll `GET /api/session/{id}/message` for completion. This behaves like
+an interactive TUI session — the gate has as much time as it needs to reply,
+since nothing else resolves the permission first.
+
 ## "It never asks Jev, I always get the manual prompt"
 
 That IS the fail-open design — but find out why:
