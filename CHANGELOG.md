@@ -6,6 +6,21 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+- Dead code found by an opencode subagent audit
+  (`.dev/dead-code-audit.md`, not published — see `AGENTS.md`),
+  verified independently before removal: `parseOptions()` in
+  `index.ts` (zero callers, superseded by `labelsFromFormField`), the
+  unreachable `kind === null` branch in `handleOne` (`kindFor` never
+  actually returns `null` despite its old type signature), the
+  `WRITE_ACTIONS` no-op membership check (both branches returned
+  `"write"`), a dead `meta` extraction in the form-poll loop, and
+  Python's `ALLOWED_MODELS` no-op guard (`if ...: pass`) in
+  `client.py`. Also collapsed `replyFormAnswer` and `replyPermission`
+  (`index.ts`) onto one shared `postApiReply` helper — they duplicated
+  ~25 lines of spawn/timeout/stderr handling, which is exactly the
+  reply logic issue #15 needed fixed in two places at once.
+
 ### Fixed
 - Catastrophic-pattern regex no longer flags ordinary subpath deletes
   as whole-filesystem wipes: `rm -rf ./build`, `rm -rf ~/some/subdir`,
