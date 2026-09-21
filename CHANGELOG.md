@@ -7,6 +7,45 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **A lone UTF-16 surrogate in `HALT.detail` silently dropped the entire
+  log line for that event, with no error anywhere.** Found by a 7th
+  live-execution review round (following round 6's method: run real
+  code against adversarial input, don't just read it). `sha256_hex`
+  (`schemas.py`) used the default strict `"utf-8"` codec, which raises
+  `UnicodeEncodeError` on a lone surrogate. Reachable in *ordinary*
+  use, no attacker needed: `index.ts` truncates untrusted text with
+  plain `.slice(0, N)` at several fixed boundaries (`joined.slice(0,
+  4000)`, per-turn `.slice(0, 1000)` in `objectiveFor`, etc.), and JS
+  `.slice()` cuts UTF-16 code units, not code points — any emoji or
+  other non-BMP character landing exactly on one of those cuts leaves
+  a lone surrogate. Two consequences from the one root cause,
+  live-verified end to end: `build_state()` (called before Jev is
+  invoked) raised, so the gate never even asked Jev and fell open to a
+  generic `ask-human`/`"exception"` — safe, but wrong reason and a
+  real decision Jev could have made correctly; separately,
+  `_write_log_entry()`'s blanket `except: pass` swallowed the same
+  exception, so **that log line was never written at all** — a
+  0-byte-file-shaped silent gap in the audit trail, not a malformed
+  line someone would notice. Fixed with `errors="replace"` instead of
+  the strict codec — this function only ever hashes text for logging/
+  dedup, not for anything requiring exact byte fidelity. Verified the
+  new regression tests actually catch this (reverted the fix, watched
+  both fail with the real `ask-human`/`UnicodeEncodeError`-adjacent
+  symptoms, restored it).
+  52 Python tests now (was 50).
+
+### Verified clean (round 7, live-execution)
+- Every `spawn()` call site in `index.ts` (re-counted from scratch:
+  exactly 5, matching round 6) — all have a working `.on("error",
+  ...)` listener; live-ran the three not covered by round 6's fix
+  (`listPendingForms`, `postApiReply`, `spawnGate`) against an empty
+  `PATH`, no crashes.
+- The logging path otherwise: very long strings, embedded
+  `\n`/`\r\n`/`\t`, unicode not at a truncation boundary, and deep
+  (500-level) nesting all round-trip through `_write_log_entry`/
+  `logLine` and pass strict JSON parsing.
+
+### Fixed
 - **CRITICAL: `alertHuman()` crashed the entire opencode host process on
   any machine without `notify-send`/`zenity` installed.** Found by a
   6th adversarial review round that drove the real `setup(ctx)` event
