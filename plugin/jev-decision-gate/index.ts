@@ -220,10 +220,32 @@ function repliedDirOf(options: Record<string, unknown>): string {
 // it) or "error" (marker unusable — evaluate anyway, never suppress on
 // FS trouble).
 export function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
-  const name = /^[A-Za-z0-9_-]+$/.test(requestID) ? requestID : sha256Hex(requestID)
+  // Length-bound the fast path too, not just the charset: an all-alnum
+  // requestID over Linux's 255-byte NAME_MAX hits ENAMETOOLONG on the
+  // write below, which used to land in the shared catch as generic
+  // "error" for BOTH racing claimants — silently reopening the exact
+  // double-evaluation race this function exists to close (round 8
+  // review, live-verified: two calls for an identical 5000-char ID both
+  // returned "error"). sha256Hex's fixed 64-char output is always safe.
+  const name = /^[A-Za-z0-9_-]+$/.test(requestID) && requestID.length <= 200 ? requestID : sha256Hex(requestID)
+  const dir = repliedDirOf(options)
   try {
-    fs.mkdirSync(repliedDirOf(options), { recursive: true })
-    fs.writeFileSync(path.join(repliedDirOf(options), name), inst, { flag: "wx" })
+    fs.mkdirSync(dir, { recursive: true })
+  } catch {
+    // The marker directory path itself is unusable (round 8 review,
+    // live-verified: e.g. a plain file sitting where the directory
+    // should be) — a broken marker mechanism, never a legitimate claim
+    // conflict. Must not be reported as "lost" (which means "someone
+    // else owns it" and, applied here, would permanently ask-human
+    // every single permission/form forever, logged as the misleading
+    // "duplicate-suppressed" — implying a race with a live second
+    // instance, not a broken path — with no self-healing since
+    // pruneReplied's own readdirSync on the same broken path also fails
+    // silently). "error" correctly means "evaluate anyway" instead.
+    return "error"
+  }
+  try {
+    fs.writeFileSync(path.join(dir, name), inst, { flag: "wx" })
     return "won"
   } catch (err) {
     const code = (err as { code?: unknown }).code
