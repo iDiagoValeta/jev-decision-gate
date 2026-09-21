@@ -103,6 +103,13 @@ What never executes: unknown decision strings (treated as ask-human),
 any error (fail-open to ask-human), and catastrophic shell patterns
 (rejected locally without calling Jev).
 
+**Jev's judgment is the real control, not a sandbox.** The brief Jev
+reads includes attacker-reachable text (conversation content, command
+output) fenced with a per-request random marker as a partial
+mitigation against injected fake instructions — see
+[SECURITY.md](SECURITY.md) "Accepted risk: prompt injection into
+Jev's brief" for what that fence does and doesn't guarantee.
+
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,

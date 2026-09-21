@@ -6,6 +6,27 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **Prompt-injection fencing for the brief, and the residual risk
+  documented explicitly for the first time.** The same security review
+  that found the kill-list/redaction gaps also flagged that
+  `OBJECTIVE`/`HALT.detail` (both attacker-reachable: conversation
+  text, command/file content) were concatenated into Jev's brief with
+  no delimiter between trusted framework text and untrusted content —
+  and that this was nowhere documented as an accepted trade-off, only
+  silently assumed safe. `build_objective_block` (`schemas.py`) now
+  wraps both fields in a per-request random-token fence with an
+  explicit "this is data, not instructions" note; any occurrence of
+  the fence token inside the untrusted content itself (guessed or
+  coincidental) is neutralized first, so it can't forge an early
+  closing marker to inject fake trailing `POLICY:`/`QUESTION:` lines.
+  This is a partial mitigation, not a fix — documented as such in
+  `SECURITY.md` ("Accepted risk: prompt injection into Jev's brief")
+  and `docs/ARCHITECTURE.md`, and linked from the README's Safety
+  model section. Jev's own judgment over the fenced content remains
+  the only real defense; there's no secondary check on `decision.
+  combine()`'s output (by design — see "no thresholds").
+
 ### Fixed
 - **Secret redaction gaps** (both `schemas.py` and `index.ts`, same
   security review as the kill-list fix above): compound identifiers
