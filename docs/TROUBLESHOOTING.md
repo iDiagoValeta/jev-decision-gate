@@ -255,6 +255,97 @@ The human-pick hang case still needs a human at the keyboard; it
 cannot be scripted (the failure is about what happens after a real
 click).
 
+## Ordinary permission replies (`read`/`edit`/`bash`/...) can silently miss the window
+
+**Status (2026-09-21, OpenCode 2.0.11):** reproduced, not fixed —
+tracked in
+[issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15).
+This is the same family of problem as "Question dialog hangs" above,
+but on the plain `ctx.permission.reply()` path (`handleOne`), for
+ordinary `read`/`write`/`destructive` kinds — not the question/form
+flow.
+
+**Symptom in log:** `gateAction` matches Jev's real decision
+(`jev-allow` / `jev-deny` / `jev-asked-human`), immediately followed by
+a second line for the same `requestID`:
+`reason: "reply-failed", error_class: "Permission request not found: <id>"`.
+Jev decided correctly; the reply never reached the tool call. If
+nothing else resolves the permission (no human at the TUI, no
+`opencode run --auto`), **the tool call hangs indefinitely** — confirmed
+by driving a session through the raw API
+(`POST /api/session/{id}/prompt`, the same mechanism
+`scripts/verify_autonomy.py` uses) and watching a `read` tool call sit
+at `status: "running"` for 20+ seconds after the permission was
+already gone.
+
+**Reproduction and evidence:**
+
+- `elapsedMs` for the Jev round trip (`objectiveFor` RPC + spawn +
+  real TypeSafe API call) is consistently **~750-900ms** across dozens
+  of samples, for both `read` and `bash`/`write` kinds — not just the
+  ~750-900ms previously measured for multichoice.
+- A clean, Jev-independent probe (poll
+  `GET /api/session/{id}/permission` every 50ms right after sending a
+  prompt) measured a pending `read` permission going from present to
+  **gone at age 0.832s**, with no reply from the plugin logged yet at
+  that point — i.e., something removes the permission on its own,
+  independent of whatever the plugin does.
+- Reproduced identically via three different invocation methods:
+  `opencode run` (no flag — opencode's own client auto-rejects
+  near-instantly, before Jev even returns, so the tool fails
+  regardless of Jev's verdict), `opencode run --auto` (opencode's
+  client auto-approves near-instantly — the tool succeeds regardless
+  of Jev's verdict, which means **`--auto` defeats the gate's
+  protective function even though the plugin still logs a decision**;
+  don't mistake a clean-looking log for the gate having actually
+  mattered), and the raw session API (no client-side auto behavior at
+  all — the permission still vanished and the tool call hung).
+- **Not 100% reproducible on every run:** one batch of 5 consecutive
+  ordinary permissions (light load, freshly-restarted `opencode
+  service`) all replied successfully with **zero** `reply-failed`, at
+  similar `elapsedMs` (770-880ms) to an earlier batch that failed 5
+  for 5 under heavier concurrent load (several overlapping `opencode
+  api` calls / a polling script running at the same time). This looks
+  like a **race against a short-lived server-side window** (rough
+  order of magnitude: ~800ms-1s) that Jev's real network latency sits
+  right on the edge of — light load leaves enough margin to win it,
+  concurrent load on the single-threaded plugin process (or on the
+  service) does not. Not confirmed as the literal mechanism (no access
+  to the opencode server's own source); confirmed only that the
+  permission disappears server-side on a timescale independent of the
+  plugin's own log.
+
+**Why the question/form path (above) doesn't have this problem:** its
+*answer* goes through `POST /api/session/{id}/form/{formID}/reply`,
+not `ctx.permission.reply()` — a different endpoint that tolerates the
+same ~800ms Jev latency fine in every sample collected. The permission
+phase for questions only needs an instant passthrough reply (`decision:
+"once"`, no Jev call), so it never faces this race. Ordinary
+`read`/`write`/`bash` permissions have no such two-phase option: the
+only way to unlock or reject the tool call *is* `ctx.permission.reply()`,
+and that call structurally cannot beat the window on a loaded system.
+
+**Not attempted here:** a code fix. Cutting the round trip (skipping
+`objectiveFor`'s `session.context` call, keeping a warm Python process
+instead of spawning one per request, etc.) might buy back 100-200ms,
+but Jev's own API latency is the dominant cost and isn't something this
+plugin controls; the margin is too tight to call any such change a
+confirmed fix without re-measuring under load the way this section did.
+The two-phase trick from the question path doesn't generalize safely to
+`write`/`destructive` kinds (there is no way to "provisionally unlock,
+then undo" a bash command). Needs either an upstream accommodation
+(a way to extend a pending permission's lifetime while a plugin
+decides) or a deliberate decision to accept the risk for read-only
+kinds specifically — a safety-model change, not a bug fix, and not
+this session's call to make.
+
+**Repro:** fresh `opencode service`, `permission: "ask"`, key loaded.
+Drive a session via `opencode api POST /api/session/{id}/prompt`
+(not `opencode run` — see above for why that adds its own race) asking
+the agent to read a file; watch `JEV_GATE_LOG` for `reply-failed`, and
+`GET /api/session/{id}/message` for the tool call getting stuck at
+`status: "running"`.
+
 ## Which log file?
 
 Canonical: the path in `logFile` / `JEV_GATE_LOG`, default

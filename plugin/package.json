@@ -3,6 +3,9 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "tsc -p tsconfig.build.json && node --test dist/index.test.js"
+  },
   "dependencies": {
     "@opencode/plugin": "2.0.11"
   },

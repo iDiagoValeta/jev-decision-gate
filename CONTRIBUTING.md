@@ -25,5 +25,6 @@ python3 -m pytest -q
 ## Pull requests
 
 - Fill the PR template, link `Closes #<n>`.
-- `pytest -q` green, `tsc --noEmit` green for plugin changes.
+- `pytest -q` green; for plugin changes, `tsc --noEmit` and
+  `npm --prefix plugin test` green too.
 - Update `CHANGELOG.md` under `[Unreleased]`.

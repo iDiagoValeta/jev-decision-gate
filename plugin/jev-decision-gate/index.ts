@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url"
 // Checked against a NORMALIZED command string (lowercased, quotes/
 // separators collapsed) so trivial obfuscation does not bypass them.
 const CATASTROPHIC = [
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/|\$home(\/\S*)?|\${home}[^\s]*|\/home(?!\S)|\.(\/\S*)?)/,
+  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\.(?!\S)|\.\/(?!\S))/,
   /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+.*--no-preserve-root/,
   /\bmkfs\b/,
   /\bdd\b\s+.*\bof=\/dev\//,

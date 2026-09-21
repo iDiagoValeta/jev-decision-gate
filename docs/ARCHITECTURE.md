@@ -59,6 +59,15 @@ Live autonomy check (non-interactive, against a running service):
 
 ## Key decisions (ADRs, short)
 
+- **Known gap: `ctx.permission.reply()` races a short server-side
+  window.** Ordinary (non-question) replies land ~750-900ms after the
+  halt (Jev's real API latency); under load that can miss whatever
+  window opencode keeps a pending permission open for, and the reply
+  fails (`reply-failed`) with the tool call left hanging rather than
+  denied. The question/form path avoids this (a different endpoint,
+  `POST .../form/{formID}/reply`, tolerates the same latency fine).
+  Not fixed; see `docs/TROUBLESHOOTING.md` "Ordinary permission
+  replies can silently miss the window".
 - **Fail-open, never silent allow.** Every `except` maps to
   `ask-human/fail-open` with an `error_class`. Rationale: a broken
   gate must cost a prompt, not a breach. Ask-human (and fail-open)
