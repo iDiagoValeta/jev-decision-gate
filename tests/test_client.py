@@ -69,6 +69,35 @@ def test_evaluate_wraps_non_numeric_confidence_as_bad_response():
         evaluate({"objective": "x"}, {"decision": {}}, api_key="k", transport=bad_confidence_transport)
 
 
+def test_evaluate_wraps_non_finite_confidence_as_bad_response():
+    # Round 6 review: float(x) silently accepts NaN/Infinity, but
+    # json.dumps(float("nan")) emits a bare NaN token, which breaks the
+    # TS side's JSON.parse of the gate's stdout. Must fail here, not there.
+    import math
+
+    import pytest
+
+    from jev_gate.client import JevCallError, evaluate
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+
+        def bad_transport(state, questions, model, bad=bad):
+            return {
+                "model": "jev-1.13.0",
+                "answers": {
+                    "decision": {"choice": "allow", "confidence": bad},
+                    "safe": {"noul": 0.95},
+                    "risk": {"score": 0.2, "confidence": 0.8},
+                },
+            }
+
+        with pytest.raises(JevCallError, match="bad-response"):
+            evaluate({"objective": "x"}, {"decision": {}}, api_key="k", transport=bad_transport)
+
+    # Sanity: a genuinely finite, ordinary confidence still passes through.
+    assert math.isfinite(0.9)
+
+
 def test_real_transport_normalizes_object_style_sdk_answers():
     from unittest.mock import MagicMock, patch
 

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict"
+import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import {
+  alertHuman,
   capped,
   claimReply,
   isCatastrophic,
@@ -351,4 +353,24 @@ test("looksLikeSessionGone: genuine session-gone phrasing still matches", () => 
   ]) {
     assert.equal(looksLikeSessionGone(new Error(msg)), true, `should match: ${msg}`)
   }
+})
+
+test("alertHuman: does not crash the host process when notify-send/zenity are missing (round 6 finding: spawn()'s async ENOENT is only reported via an 'error' event, which is fatal to the whole process when unhandled — this is the escalation path for nearly every fail-open/ask-human outcome, so the whole opencode host used to die on the first alert on a headless machine)", () => {
+  // Must run in a real child process: if the bug regressed, calling
+  // alertHuman() in-process would crash this entire test file, not just
+  // fail one assertion.
+  const emptyBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-no-notify-bin-"))
+  const nodeDir = path.dirname(process.execPath)
+  const script = `
+    const mod = await import(${JSON.stringify(path.join(import.meta.dirname, "index.js"))});
+    mod.alertHuman("t", "b");
+    await new Promise((r) => setTimeout(r, 300));
+    process.exit(0);
+  `
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, PATH: `${nodeDir}${path.delimiter}${emptyBinDir}` },
+    timeout: 5000,
+  })
+  fs.rmSync(emptyBinDir, { recursive: true, force: true })
+  assert.equal(result.status, 0, `child process should exit 0, got status=${result.status}, stderr=${result.stderr}`)
 })
