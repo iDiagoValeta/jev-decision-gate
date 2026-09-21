@@ -40,17 +40,21 @@ continued (`ELEGIDO=pizza`, idle succeeded) — not a claim that every
 hang case is fixed; see
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-**Known reliability gap:** ordinary `read`/`write`/`bash` replies race
-a short-lived server-side window (roughly ~800ms-1s) that Jev's real
-API latency sits right at the edge of. Under light load the reply
-lands fine; under concurrent load it can miss the window
-(`reply-failed: Permission request not found` in the log) and, if
-nothing else answers the permission, the tool call hangs. Not yet
-fixed — tracked in
+**Known reliability gap (mitigated, not closed):** ordinary
+`read`/`write`/`bash` replies race a short-lived server-side window
+(roughly ~800ms-1s, not configurable — OpenCode's `Permission.Reply`
+protocol has no "give me more time" option) that Jev's real API
+latency sits right at the edge of. The gate now spawns its subprocess
+earlier to shave real latency off that race, and always alerts you
+(`notify-send`/`zenity`) if a reply still misses the window instead of
+failing silently — but the race itself isn't closed, and under enough
+concurrent load a reply can still miss it
+(`reply-failed: Permission request not found` in the log), leaving the
+tool call hanging. Tracked in
 [issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15);
 see "Ordinary permission replies can silently miss the window" in
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the
-reproduction and what's been ruled out.
+reproduction, the mitigation, and what's still open.
 
 ## Requirements
 

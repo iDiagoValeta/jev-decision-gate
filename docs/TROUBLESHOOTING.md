@@ -257,7 +257,7 @@ click).
 
 ## Ordinary permission replies (`read`/`edit`/`bash`/...) can silently miss the window
 
-**Status (2026-09-21, OpenCode 2.0.11):** reproduced, not fixed —
+**Status (2026-09-21, OpenCode 2.0.11):** mitigated, not closed —
 tracked in
 [issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15).
 This is the same family of problem as "Question dialog hangs" above,
@@ -325,19 +325,56 @@ phase for questions only needs an instant passthrough reply (`decision:
 only way to unlock or reject the tool call *is* `ctx.permission.reply()`,
 and that call structurally cannot beat the window on a loaded system.
 
-**Not attempted here:** a code fix. Cutting the round trip (skipping
-`objectiveFor`'s `session.context` call, keeping a warm Python process
-instead of spawning one per request, etc.) might buy back 100-200ms,
-but Jev's own API latency is the dominant cost and isn't something this
-plugin controls; the margin is too tight to call any such change a
-confirmed fix without re-measuring under load the way this section did.
-The two-phase trick from the question path doesn't generalize safely to
-`write`/`destructive` kinds (there is no way to "provisionally unlock,
-then undo" a bash command). Needs either an upstream accommodation
-(a way to extend a pending permission's lifetime while a plugin
-decides) or a deliberate decision to accept the risk for read-only
-kinds specifically — a safety-model change, not a bug fix, and not
-this session's call to make.
+**Mitigation shipped (2026-09-21):** two changes, neither of which
+closes the race (it can't be closed from this side — see below), both
+of which make it less bad:
+
+1. **Narrowed the window.** `objectiveFor`'s `session.context` RPC
+   used to run serially before spawning the Python gate; now the gate
+   subprocess is spawned first (`spawnGate`/`gate.send` in
+   `index.ts`), so its cold start (interpreter init, `typesafe_sdk`
+   import) overlaps with that RPC instead of adding to it. Checked the
+   `Permission.Reply` schema in `@opencode/schema` first
+   (`node_modules/@opencode/schema/dist/permission.d.ts`) for a
+   "pending"/"extend" reply option — there is none (`Reply` is exactly
+   `"once" | "always" | "reject"`, `Request` carries no TTL/duration
+   field), so there is no protocol-level way to ask for more time;
+   this is the only latency this plugin can give back.
+   **Re-measured after the change:** 9 sequential ordinary permissions
+   under light load and 6 under deliberately concurrent load (mimicking
+   the conditions that produced the original 5-for-5 failing batch) —
+   **0 `reply-failed` in 15 samples**, `elapsedMs` (now spans spawn →
+   decision, a strictly larger window than before, so not directly
+   comparable to the pre-fix numbers above) averaging ~790-836ms, one
+   outlier at 1037ms that still succeeded. This is evidence the
+   mitigation helps, not proof the race is gone — 15 samples doesn't
+   rule out a worse-loaded system still losing it, and the original
+   failing batch may have had heavier interference than either
+   re-test here.
+2. **Alert on `reply-failed`, not just a log line.** Previously, when
+   `ctx.permission.reply()` threw after Jev had already decided
+   (catastrophic-reject, question-permission-passthrough, or the main
+   allow/deny path), the plugin logged `reply-failed` and did nothing
+   else — the tool call could hang with **zero signal** to the
+   operator, which is a silent failure mode in spirit even though it
+   is not a silent *allow*. All three sites now also fire the same
+   `alertHuman()` desktop notification used for ask-human, so a
+   missed-window reply is at least as visible as any other case where
+   the gate needs a human. Also added `totalElapsedMs` (from
+   `permission.asked` received, not just from the Jev call) to the
+   `reply-failed` log line for future diagnosis.
+
+**Still not attempted:** a fix that actually closes the race for good.
+The two-phase trick from the question path doesn't generalize safely
+to `write`/`destructive` kinds (there is no way to "provisionally
+unlock, then undo" a bash command that already ran). Closing it for
+real needs either an upstream accommodation (a way to extend a pending
+permission's lifetime while a plugin decides — confirmed not to exist
+in the current `Permission` schema) or a deliberate decision to accept
+the risk for read-only kinds specifically (auto-allow immediately,
+use Jev for async audit only) — a safety-model change, which is a
+product decision, not something to slip in as a side effect of a
+latency fix.
 
 **Repro:** fresh `opencode service`, `permission: "ask"`, key loaded.
 Drive a session via `opencode api POST /api/session/{id}/prompt`
