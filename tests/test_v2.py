@@ -76,6 +76,26 @@ def test_redact_secrets_covers_token_and_key_value_variants_beyond_ghp():
     assert "[REDACTED]" in redact_secrets("token=abcd1234")
 
 
+def test_redact_secrets_closes_security_review_gaps():
+    from jev_gate.schemas import redact_secrets
+    # Keyword embedded in a longer identifier, not just standing alone.
+    assert redact_secrets("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY") == \
+        "AWS_SECRET_ACCESS_KEY=[REDACTED]"
+    # AWS temporary/STS credentials (ASIA prefix), not just long-term AKIA.
+    assert redact_secrets("ASIAIOSFODNN7EXAMPLE") == "[REDACTED-AWS-KEY]"
+    # Raw JWT with no Bearer prefix.
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PYE0Kr8VF5Nk"
+    assert redact_secrets(jwt) == "[REDACTED-JWT]"
+    # Credentials embedded in a connection-string URL — password redacted,
+    # scheme/user/host/port/path kept visible for debugging context.
+    assert redact_secrets("postgresql://admin:hunter2VerySecret@db.internal:5432/prod") == \
+        "postgresql://admin:[REDACTED]@db.internal:5432/prod"
+    # No prefix before the keyword must still work (regression check for the
+    # widened "keyword embedded in a longer identifier" pattern).
+    assert "[REDACTED]" in redact_secrets("password: hunter2345")
+    assert "[REDACTED]" in redact_secrets("token=abcd1234")
+
+
 def test_redact_secrets():
     from jev_gate.schemas import build_objective_block, redact_secrets
     assert "[REDACTED" in redact_secrets("Bearer abcdefgh1234")

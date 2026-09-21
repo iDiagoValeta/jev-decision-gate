@@ -129,6 +129,23 @@ test("redactSecrets: covers token and key=value variants beyond bearer/ghp_", ()
   assert.match(redactSecrets("secret=s3cr3tvalue"), /secret=\[REDACTED\]/)
 })
 
+test("redactSecrets: closes security-review gaps (compound key=value identifiers, ASIA, raw JWT, URL creds)", () => {
+  assert.equal(redactSecrets("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"), "AWS_SECRET_ACCESS_KEY=[REDACTED]")
+  assert.equal(redactSecrets("ASIAIOSFODNN7EXAMPLE"), "[REDACTED]")
+  assert.equal(
+    redactSecrets("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PYE0Kr8VF5Nk"),
+    "[REDACTED]",
+  )
+  assert.equal(
+    redactSecrets("postgresql://admin:hunter2VerySecret@db.internal:5432/prod"),
+    "postgresql://admin:[REDACTED]@db.internal:5432/prod",
+  )
+  // No prefix before the keyword must still work (regression check for the
+  // widened "keyword embedded in a longer identifier" pattern).
+  assert.match(redactSecrets("password: hunter2345"), /password:\s*\[REDACTED\]/)
+  assert.match(redactSecrets("token=abcd1234"), /token=\[REDACTED\]/)
+})
+
 test("kindFor: maps documented permission actions to a gate kind", () => {
   assert.equal(kindFor("question", []), "multichoice")
   assert.equal(kindFor("doom_loop", []), "destructive")

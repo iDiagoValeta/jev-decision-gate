@@ -7,6 +7,26 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Secret redaction gaps** (both `schemas.py` and `index.ts`, same
+  security review as the kill-list fix above): compound identifiers
+  like `AWS_SECRET_ACCESS_KEY=...` slipped through because the
+  keyword-match pattern required `password`/`secret`/`token`/etc. to
+  sit immediately before `=`/`:`, not just appear anywhere in a longer
+  identifier — widened so the keyword can be embedded, verified
+  against the same 6 existing cases (`password:`, `TYPESAFE_API_KEY=`,
+  ...) to confirm no regression. Also added: AWS *temporary* credentials
+  (`ASIA` prefix, alongside the existing `AKIA`), raw JWTs with no
+  `Bearer` prefix, and credentials embedded in connection-string URLs
+  (`scheme://user:PASSWORD@host` — redacts only the password, keeps
+  host/port/path visible for debugging). Found live: while building
+  the fix, my own first version of the widened keyword pattern
+  regressed the existing `password: ...`/`secret=...` cases (a
+  `\b[a-z]` mandatory-leading-character bug) — caught by running the
+  full existing test suite before shipping, not after.
+  **Scope, stated precisely:** this closes exposure to Jev's external
+  API (the brief sent over the network); it does not change what's
+  logged locally, since `decisions-plugin.jsonl` only ever stores
+  `detail_sha256`, never the raw or redacted detail text.
 - **Catastrophic kill-list: three real bypasses found and fixed by an
   adversarial security review (opencode subagent attempt got stuck
   in a re-orientation loop without producing a report — a model
