@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url"
 // Checked against a NORMALIZED command string (lowercased, quotes/
 // separators collapsed) so trivial obfuscation does not bypass them.
 const CATASTROPHIC = [
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\.(?!\S)|\.\/(?!\S))/,
+  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\/home\/[^/\s]+(?!\S)|\/root(?!\S)|\.(?!\S)|\.\/(?!\S)|\.\.(?!\S)|\.\.\/(?!\S))/,
   /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+.*--no-preserve-root/,
   /\bmkfs\b/,
   /\bdd\b\s+.*\bof=\/dev\//,
@@ -36,6 +36,11 @@ const CATASTROPHIC = [
 
 const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database)|curl|wget|docker\s+(rm|system)|aws\s+s3)/i
 
+// Command substitution ($(...) or `...`) can hide a command's real effect
+// from both the kill-list and normalizeCommand (neither evaluates it) —
+// not blockable by regex, so it's surfaced to Jev as a hint instead.
+const COMMAND_SUBSTITUTION = /\$\(|`/
+
 const SECRET_PATTERNS: RegExp[] = [
   /bearer\s+[A-Za-z0-9\-._~+/=]{8,}/gi,
   /basic\s+[A-Za-z0-9+/=]{8,}/gi,
@@ -47,8 +52,9 @@ const SECRET_PATTERNS: RegExp[] = [
 export function normalizeCommand(text: string): string {
   return text
     .toLowerCase()
-    .replace(/["'`]/g, "")
+    .replace(/["'`\\]/g, "")
     .replace(/\$\{ifs\}/g, " ")
+    .replace(/\$ifs\b/g, " ")
     .replace(/[;&|]+/g, " ")
     .replace(/\/bin\/rm\b/g, "rm")
     .replace(/\/usr\/bin\/rm\b/g, "rm")
@@ -991,12 +997,11 @@ async function handleOne(
     }
     const rawDetail = joined.slice(0, 4000)
     const detail = redactSecrets(rawDetail)
-    const riskHints =
-      action === "doom_loop"
-        ? "doom_loop: identical tool call repeated"
-        : DESTRUCTIVE_HINT.test(joined)
-          ? "matches destructive-hint"
-          : ""
+    const hintParts: string[] = []
+    if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated")
+    if (DESTRUCTIVE_HINT.test(joined)) hintParts.push("matches destructive-hint")
+    if (COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined")
+    const riskHints = hintParts.join("; ")
     const halt: Record<string, unknown> = { kind, tool: action, detail }
     const gateEvent = {
       objective,

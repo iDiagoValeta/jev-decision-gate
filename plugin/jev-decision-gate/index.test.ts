@@ -3,7 +3,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import { claimReply, isCatastrophic, kindFor, postApiReply, redactSecrets } from "./index.js"
+import { claimReply, isCatastrophic, kindFor, normalizeCommand, postApiReply, redactSecrets } from "./index.js"
 
 test("isCatastrophic: whole-filesystem / home wipes are caught", () => {
   for (const cmd of [
@@ -61,6 +61,35 @@ test("isCatastrophic: normalization defeats trivial obfuscation (quotes, IFS, se
   ]) {
     assert.equal(isCatastrophic(cmd), true, `expected catastrophic after normalization: ${cmd}`)
   }
+})
+
+test("isCatastrophic: bare $IFS (no braces) and backslash-split obfuscation are caught (regression: security-review finding)", () => {
+  for (const cmd of ["rm$IFS-rf$IFS/", "r\\m -rf /", "rm -r\\f /", "rm\\ -rf\\ /"]) {
+    assert.equal(isCatastrophic(cmd), true, `expected catastrophic: ${cmd}`)
+  }
+})
+
+test("isCatastrophic: exact /home/<user>, /root, and bare .. are caught (regression: security-review finding)", () => {
+  for (const cmd of ["rm -rf /home/idiaval", "rm -rf /home/root", "rm -rf /root", "rm -rf ..", "rm -rf ../"]) {
+    assert.equal(isCatastrophic(cmd), true, `expected catastrophic: ${cmd}`)
+  }
+})
+
+test("isCatastrophic: subpath deletes under /home/<user> or .. stay NOT caught (no new false positive)", () => {
+  for (const cmd of [
+    "rm -rf /home/idiaval/proyectos/viejo",
+    "rm -rf /home/idiaval/tmp",
+    "rm -rf ../build",
+    "rm -rf ../../somedir/particular-file",
+  ]) {
+    assert.equal(isCatastrophic(cmd), false, `expected NOT catastrophic: ${cmd}`)
+  }
+})
+
+test("normalizeCommand: strips backslashes and expands bare $IFS", () => {
+  assert.equal(normalizeCommand("r\\m -rf /"), "rm -rf /")
+  assert.equal(normalizeCommand("rm$IFS-rf$IFS/"), "rm -rf /")
+  assert.equal(normalizeCommand("rm${IFS}-rf${IFS}/"), "rm -rf /")
 })
 
 test("isCatastrophic: ordinary subpath deletes are NOT caught (regression: false positive on rm -rf ./x, ~/x, $HOME/x)", () => {

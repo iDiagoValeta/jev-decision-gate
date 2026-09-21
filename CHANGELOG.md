@@ -6,6 +6,37 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Catastrophic kill-list: three real bypasses found and fixed by an
+  adversarial security review (opencode subagent attempt got stuck
+  in a re-orientation loop without producing a report — a model
+  limitation on this specific "reason without new tool calls" task,
+  not a gate issue; escalated to a Claude Sonnet subagent, which
+  delivered a verified, well-evidenced report; every finding
+  independently re-reproduced before fixing).** `normalizeCommand`
+  (`index.ts`) only handled the braced `${IFS}` form and never
+  stripped backslashes, so `rm$IFS-rf$IFS/` (bare `$IFS`, standard
+  bash word-splitting) and `r\m -rf /` (backslash-before-ordinary-char
+  removal, standard bash) both reached Jev as ordinary text instead of
+  being rejected locally — fixed by also handling bare `$IFS` and
+  stripping backslashes. Separately, the `CATASTROPHIC` target list
+  covered bare `$HOME`/`~`/`/home` but not the *resolved* home path
+  (`rm -rf /home/idiaval`) or `/root`, and covered bare `.` but not
+  bare `..` (`rm -rf ..`, deletes the parent directory) — fixed by
+  adding `/home/<exact-one-segment>`, `/root`, and bare `..`/`../` to
+  the target alternation, written narrowly enough that ordinary
+  subpath deletes (`rm -rf /home/idiaval/proyectos/viejo`,
+  `rm -rf ../build`) still correctly pass through, unchanged from the
+  R65/#16 false-positive fix.
+  Command substitution (`` $(...) ``/backticks) is a fourth,
+  *unfixable-by-regex* bypass — resolving it would require actually
+  evaluating the substituted command, which the kill-list correctly
+  never does. Rather than a false sense of coverage, it's now
+  surfaced to Jev as an explicit risk hint
+  (`contains command substitution ... — real effect cannot be
+  statically determined`) so the LLM judgment step at least knows to
+  be suspicious of it, instead of silently missing it entirely.
+
 ### Added
 - SAST: `bandit` runs in CI on `src`/`scripts` at `--severity-level
   medium` (a new `sast` job). The threshold is intentional, not a
