@@ -1,9 +1,27 @@
 # jev-decision-gate
 
+[![CI](https://github.com/iDiagoValeta/jev-decision-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/iDiagoValeta/jev-decision-gate/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
+[![Node 20+](https://img.shields.io/badge/node-20%2B-339933.svg)](plugin/package.json)
+
 Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
 calls get approved automatically, anything Jev calls risky or
 uncertain falls back to your manual prompt — with a desktop popup
 (`notify-send` + `zenity`) so you notice when the gate delegates.
+
+> [!WARNING]
+> This plugin lets an LLM auto-approve OpenCode's tool-permission
+> prompts on your behalf. Read [Safety model](#safety-model) before
+> pointing it at anything you care about. Defaults fail open to your
+> manual prompt, never to silent allow: no API key, any gate error, or
+> an unrecognized decision all fall back to asking you, and a local
+> kill-list rejects catastrophic shell commands before Jev is ever
+> asked. You remain responsible for what gets approved.
+
+**Contents:** [Requirements](#requirements) ·
+[Quickstart](#quickstart) · [Safety model](#safety-model) ·
+[Layout](#layout) · [Develop](#develop)
 
 ```
 opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ jev_gate (Python) ──▶ Jev API
