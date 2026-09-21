@@ -7,6 +7,18 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Security
+- CI workflow actions pinned to a full commit SHA (with a version
+  comment) instead of a mutable tag (`@v4`/`@v5`) — standard
+  supply-chain hardening (a compromised or re-pointed tag can't
+  silently change what CI runs). Also checked while at it: the two
+  transitive `npm` packages with install scripts flagged locally
+  (`msgpackr-extract`'s `node-gyp-build-optional-packages`,
+  `protobufjs`'s postinstall) are both well-known native-module/
+  version-check patterns from deeply transitive, non-project-controlled
+  dependencies (via `@opencode/plugin`) — read both scripts, nothing
+  suspicious, no action needed.
+
+### Security
 - **Prompt-injection fencing for the brief, and the residual risk
   documented explicitly for the first time.** The same security review
   that found the kill-list/redaction gaps also flagged that
