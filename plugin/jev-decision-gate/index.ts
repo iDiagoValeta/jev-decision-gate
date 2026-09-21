@@ -425,62 +425,99 @@ function minimalEnv(options: Record<string, unknown>): Record<string, string | u
   }
 }
 
-function runGate(options: Record<string, unknown>, event: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(pythonBin(options), ["-m", "jev_gate.cli"], {
-      cwd: repoRoot(options),
-      env: minimalEnv(options),
-    })
-    let stdout = ""
-    let stderr = ""
-    const CAP = 256 * 1024
-    const timer = setTimeout(() => {
+// Spawns the gate subprocess without writing stdin yet, so its cold start
+// (interpreter init, `typesafe_sdk` import) can overlap with an async
+// caller-side step (objectiveFor's session.context RPC) instead of paying
+// both costs back to back. Every permission.reply() this plugin makes
+// races a short, non-configurable server-side window (see
+// docs/TROUBLESHOOTING.md "Ordinary permission replies can silently miss
+// the window", issue #15) — this does not close that race, it narrows it.
+function spawnGate(options: Record<string, unknown>): {
+  send: (event: Record<string, unknown>) => void
+  cancel: () => void
+  result: Promise<Record<string, unknown>>
+} {
+  const child = spawn(pythonBin(options), ["-m", "jev_gate.cli"], {
+    cwd: repoRoot(options),
+    env: minimalEnv(options),
+  })
+  let stdout = ""
+  let stderr = ""
+  const CAP = 256 * 1024
+  let settleResolve!: (value: Record<string, unknown>) => void
+  let settleReject!: (reason: unknown) => void
+  const result = new Promise<Record<string, unknown>>((resolve, reject) => {
+    settleResolve = resolve
+    settleReject = reject
+  })
+  const timer = setTimeout(() => {
+    try {
+      child.kill("SIGTERM")
+    } catch {
+      // ignore
+    }
+    const killer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        // ignore
+      }
+    }, 2000)
+    killer.unref?.()
+    settleReject(new Error("gate timeout"))
+  }, timeoutMsOf(options))
+  ;(timer as unknown as { unref?: () => void }).unref?.()
+  child.stdout.on("data", (chunk) => {
+    if (stdout.length < CAP) stdout += String(chunk).slice(0, CAP - stdout.length)
+  })
+  child.stderr.on("data", (chunk) => {
+    if (stderr.length < CAP) stderr += String(chunk).slice(0, CAP - stderr.length)
+  })
+  child.on("error", (error) => {
+    clearTimeout(timer)
+    settleReject(error)
+  })
+  child.on("close", (code) => {
+    clearTimeout(timer)
+    if (code !== 0) {
+      settleReject(new Error("gate exit " + String(code) + " " + stderr.slice(0, 200)))
+      return
+    }
+    try {
+      settleResolve(JSON.parse(stdout) as Record<string, unknown>)
+    } catch (parseError) {
+      settleReject(parseError)
+    }
+  })
+  return {
+    send(event) {
+      try {
+        child.stdin.write(JSON.stringify(event))
+        child.stdin.end()
+      } catch (stdinError) {
+        clearTimeout(timer)
+        settleReject(stdinError)
+      }
+    },
+    cancel() {
+      clearTimeout(timer)
       try {
         child.kill("SIGTERM")
       } catch {
         // ignore
       }
-      const killer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL")
-        } catch {
-          // ignore
-        }
-      }, 2000)
-      killer.unref?.()
-      reject(new Error("gate timeout"))
-    }, timeoutMsOf(options))
-    ;(timer as unknown as { unref?: () => void }).unref?.()
-    child.stdout.on("data", (chunk) => {
-      if (stdout.length < CAP) stdout += String(chunk).slice(0, CAP - stdout.length)
-    })
-    child.stderr.on("data", (chunk) => {
-      if (stderr.length < CAP) stderr += String(chunk).slice(0, CAP - stderr.length)
-    })
-    child.on("error", (error) => {
-      clearTimeout(timer)
-      reject(error)
-    })
-    child.on("close", (code) => {
-      clearTimeout(timer)
-      if (code !== 0) {
-        reject(new Error("gate exit " + String(code) + " " + stderr.slice(0, 200)))
-        return
-      }
-      try {
-        resolve(JSON.parse(stdout) as Record<string, unknown>)
-      } catch (parseError) {
-        reject(parseError)
-      }
-    })
-    try {
-      child.stdin.write(JSON.stringify(event))
-      child.stdin.end()
-    } catch (stdinError) {
-      clearTimeout(timer)
-      reject(stdinError)
-    }
-  })
+      // Swallow the eventual close/error event so it doesn't surface as an
+      // unhandled rejection once nothing is awaiting `result` anymore.
+      result.catch(() => {})
+    },
+    result,
+  }
+}
+
+function runGate(options: Record<string, unknown>, event: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const gate = spawnGate(options)
+  gate.send(event)
+  return gate.result
 }
 
 type ConversationTurn = { role: "user" | "assistant"; text: string }
@@ -877,6 +914,10 @@ async function handleOne(
   resources: string[],
   endedSessions: Set<string>,
 ): Promise<{ decision: string; repliedOk: boolean }> {
+  // From permission.asked to whenever we attempt (or give up on) a reply —
+  // used to diagnose the reply-vs-server-window race (issue #15), not just
+  // Jev's own call time (which runGate already measures separately).
+  const receivedAt = Date.now()
   // Claim the whole request (evaluation + reply) before calling Jev, not
   // just before replying. setup() runs more than once per opencode
   // process (confirmed in production logs: same pid, different inst),
@@ -899,8 +940,12 @@ async function handleOne(
     try {
       await ctx.permission.reply({ sessionID, requestID, decision: "reject" })
     } catch (err) {
-      log({ sessionID, requestID, tool: action, gateAction: "reject", reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
+      log({ sessionID, requestID, tool: action, gateAction: "reject", reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception", totalElapsedMs: Date.now() - receivedAt })
       repliedOk = false
+      // The reject was computed but never delivered — the tool call may be
+      // hanging with no signal at all otherwise. See docs/TROUBLESHOOTING.md
+      // "Ordinary permission replies can silently miss the window".
+      alertHuman("Jev: bloqueo no entregado a tiempo", `${action}: patrón catastrófico detectado, pero la respuesta llegó tarde. Revisa OpenCode.`)
     }
     return { decision: "deny", repliedOk }
   }
@@ -921,8 +966,10 @@ async function handleOne(
         gateAction: "allow",
         reason: "reply-failed",
         error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+        totalElapsedMs: Date.now() - receivedAt,
       })
       repliedOk = false
+      alertHuman("Jev: pregunta no desbloqueada a tiempo", "La herramienta de pregunta puede haberse quedado colgada. Revisa OpenCode.")
     }
     log({
       sessionID,
@@ -944,8 +991,21 @@ async function handleOne(
     return { decision: "ask-human", repliedOk: true }
   }
 
+  // Spawn the gate subprocess before objectiveFor's session.context RPC
+  // resolves, not after: its cold start (interpreter init, typesafe_sdk
+  // import) then overlaps with that RPC instead of adding to it serially.
+  // Every millisecond here is one this permission's reply doesn't get to
+  // spend against the server's reply window (issue #15).
+  const gate = spawnGate(options)
+  const startedAt = Date.now()
   try {
-    const objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))
+    let objective: string
+    try {
+      objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))
+    } catch (err) {
+      gate.cancel()
+      throw err
+    }
     const rawDetail = joined.slice(0, 4000)
     const detail = redactSecrets(rawDetail)
     const riskHints =
@@ -961,8 +1021,12 @@ async function handleOne(
       context: { sessionID, requestID, risk_hints: riskHints },
       policy: { default: "ask-human when unsure" },
     }
-    const startedAt = Date.now()
-    const decision = await runGate(options, gateEvent)
+    gate.send(gateEvent)
+    const decision = await gate.result
+    // Spans spawn → decision (overlaps objectiveFor's RPC), not just the
+    // subprocess's own runtime — larger than pre-issue-#15-fix elapsedMs
+    // values for the same underlying Jev call; that's the full budget that
+    // matters for the reply-window race, not a regression.
     const elapsedMs = Date.now() - startedAt
     log({
       sessionID,
@@ -986,8 +1050,24 @@ async function handleOne(
       try {
         await ctx.permission.reply({ sessionID, requestID, decision: decision.action === "allow" ? "once" : "reject" })
       } catch (err) {
-        log({ sessionID, requestID, tool: action, gateAction: decision.action, reason: "reply-failed", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
+        log({
+          sessionID,
+          requestID,
+          tool: action,
+          gateAction: decision.action,
+          reason: "reply-failed",
+          error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+          totalElapsedMs: Date.now() - receivedAt,
+        })
         repliedOk = false
+        // Jev decided, but the reply arrived after the server stopped
+        // tracking the request — the tool call is likely hanging with no
+        // other signal. See docs/TROUBLESHOOTING.md "Ordinary permission
+        // replies can silently miss the window" (issue #15).
+        alertHuman(
+          "Jev: decisión no entregada a tiempo",
+          `${action} → ${decision.action}, pero la respuesta llegó tarde. La tool call puede haberse quedado colgada; revisa OpenCode.`,
+        )
       }
     } else {
       alertHuman(

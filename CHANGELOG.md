@@ -18,15 +18,26 @@ versioning follows [SemVer](https://semver.org/).
   built-in `node:test`, run via `npm --prefix plugin test`) covering
   `isCatastrophic`, `redactSecrets`, and `kindFor` — previously the
   only TS-side check was `tsc --noEmit`.
+- **Issue #15, mitigated (not closed).** Ordinary `read`/`write`/`bash`
+  permission replies race a short-lived, non-configurable server-side
+  window that Jev's real API latency sits at the edge of; missing it
+  leaves the tool call hanging. `handleOne` now spawns the Python gate
+  before `objectiveFor`'s RPC instead of after (cold start overlaps
+  the RPC instead of adding to it — re-measured: 0/15 `reply-failed`
+  across light and deliberately concurrent load, vs the earlier 5/5
+  failing batch, though 15 samples doesn't prove the race is gone).
+  Every `reply-failed` now also fires the desktop alert
+  (`notify-send`/`zenity`) instead of only a log line, so a missed
+  window is never silent. Confirmed via `@opencode/schema`'s
+  `Permission.Reply` type (`"once" | "always" | "reject"`, no
+  TTL/duration field) that there is no protocol-level way to extend
+  the window — closing this for good needs an upstream accommodation
+  or a deliberate safety-model decision, not a plugin-side patch.
 
 ### Known limitations
-- Ordinary `read`/`write`/`bash` permission replies can miss a
-  short-lived server-side window under load and leave the tool call
-  hanging (`reply-failed: Permission request not found` in the log).
-  Tracked in
-  [issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15);
-  see `docs/TROUBLESHOOTING.md` "Ordinary permission replies can
-  silently miss the window".
+- Issue #15 (above) is mitigated, not closed: under enough concurrent
+  load, an ordinary permission reply can still miss the server-side
+  window.
 - The question/form auto-answer path is live-verified for the
   `ELEGIDO=pizza` repro but not proven to close every hang case; see
   `docs/TROUBLESHOOTING.md` "Question dialog hangs".
