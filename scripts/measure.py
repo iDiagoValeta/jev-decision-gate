@@ -8,6 +8,7 @@ schema versions (action vs gateAction, elapsedMs vs duration_ms).
 """
 import argparse
 import json
+import math
 import os
 import sys
 from collections import Counter
@@ -15,6 +16,31 @@ from collections import Counter
 TRAP_REASONS = {"catastrophic-pattern"}
 DENY_REASONS = {"jev-deny"}
 FAIL_OPEN = "fail-open"
+
+
+def _safe_float(x, default=0.0):
+    """float(x), rejecting non-numeric AND non-finite (NaN/Infinity).
+
+    Round 8 review, live-verified: a JSON-valid-but-non-numeric
+    elapsedMs string crashed the whole report (ValueError, uncaught);
+    a NaN/Infinity elapsedMs didn't crash but silently poisoned
+    p95/mean for the entire report with no warning, and made --json's
+    own output invalid JSON (json.dumps emits bare NaN/Infinity
+    tokens by default). Same bug class round 6 already fixed for
+    decision.confidence in client.py, unreviewed here until now.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _safe_int(x, default=0):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return default
 
 
 def load(paths):
@@ -28,9 +54,18 @@ def load(paths):
                     if not line:
                         continue
                     try:
-                        rows.append(json.loads(line))
+                        parsed = json.loads(line)
                     except json.JSONDecodeError:
                         corrupt += 1
+                        continue
+                    # A line can be valid JSON and still not be a log row
+                    # (a bare number/string/null/array) — round 8 review,
+                    # live-verified this crashed main()'s first .get()
+                    # call on it. Same "tolerates corrupt lines" bucket.
+                    if not isinstance(parsed, dict):
+                        corrupt += 1
+                        continue
+                    rows.append(parsed)
         except FileNotFoundError:
             pass
     return rows, corrupt
@@ -57,10 +92,10 @@ def main():
     total = len(rows)
     traps = sum(1 for r in rows if r.get("reason") in TRAP_REASONS or r.get("reason") in DENY_REASONS)
     failopen = sum(1 for r in rows if r.get("reason") == FAIL_OPEN)
-    lat = sorted(float(r.get("elapsedMs", r.get("duration_ms", 0)) or 0) for r in rows)
+    lat = sorted(_safe_float(r.get("elapsedMs", r.get("duration_ms", 0))) for r in rows)
     p95 = lat[min(len(lat) - 1, int(0.95 * len(lat)))] if lat else 0
     mean = sum(lat) / len(lat) if lat else 0
-    tokens = sum(int((r.get("usage") or {}).get("input_tokens", 0)) for r in rows
+    tokens = sum(_safe_int((r.get("usage") or {}).get("input_tokens", 0)) for r in rows
                  if isinstance(r.get("usage"), dict))
     cost = tokens * args.price_per_1k / 1000.0
     out = {
@@ -98,7 +133,13 @@ def main():
         print(f"input_tokens={tokens} est_cost_usd={out['est_cost_usd']}")
         if args.by_session:
             for sid, b in out["by_session"].items():
-                print(f"  session {sid[:8]}: n={b['n']} allow={b['allow']} fail_open={b['fail_open']}")
+                # A lone UTF-16 surrogate in sessionID (round 8 review,
+                # live-verified) crashes a raw print via stdout's utf-8
+                # encoder — same bug class round 7 fixed for sha256_hex,
+                # unreviewed here. errors="replace" for a display-only
+                # truncated preview, not anything requiring fidelity.
+                safe_sid = sid[:8].encode("utf-8", errors="replace").decode("utf-8")
+                print(f"  session {safe_sid}: n={b['n']} allow={b['allow']} fail_open={b['fail_open']}")
         print("note=cost needs --price-per-1k and usage.input_tokens in log")
 
 

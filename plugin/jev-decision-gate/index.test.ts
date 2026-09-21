@@ -224,6 +224,31 @@ test("claimReply: a requestID with path-unsafe characters is hashed, not used as
   }
 })
 
+test("claimReply: an overlong alnum requestID is hashed, not used as a raw (too-long) filename (round 8 finding: ENAMETOOLONG silently reopened the double-eval race)", () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
+  try {
+    const longId = "a".repeat(5000)
+    assert.equal(claimReply({ gateDir }, longId, "instA"), "won")
+    assert.equal(claimReply({ gateDir }, longId, "instB"), "lost")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("claimReply: the marker directory existing as a plain file reports error (not lost) for every requestID, forever (round 8 finding)", () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
+  try {
+    fs.writeFileSync(path.join(gateDir, ".jev-gate-replied"), "")
+    assert.equal(claimReply({ gateDir }, "req-A", "instA"), "error")
+    // A DIFFERENT requestID must also report "error", not "lost" — if this
+    // were ever "lost", it would wrongly imply requestID A actually holds
+    // the claim, when the marker mechanism itself is just broken.
+    assert.equal(claimReply({ gateDir }, "req-B", "instB"), "error")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
 test("postApiReply: non-zero exit rejects with the CLI's stderr, prefixed and truncated", async () => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-fake-bin-"))
   const fakeBin = path.join(binDir, "opencode")

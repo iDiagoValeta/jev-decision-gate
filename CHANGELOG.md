@@ -7,6 +7,48 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`claimReply`: the marker directory existing as a plain file
+  permanently misclassified every claim as "lost" instead of
+  "error".** Found and live-verified by an 8th adversarial review
+  round. `fs.mkdirSync`'s `EEXIST` (the marker *directory path* itself
+  is unusable) and `fs.writeFileSync`'s `EEXIST` (this specific
+  requestID's marker already exists — the intended case) shared one
+  catch block, both mapped to `"lost"`. A broken marker path meant
+  every permission and form, forever, got logged as the misleading
+  `duplicate-suppressed` (implying a race with a live second
+  instance, not a broken path) with no self-healing — contradicting
+  `claimReply`'s own documented contract ("error — marker unusable,
+  evaluate anyway"). Split into two try/catch blocks so a broken
+  marker *directory* correctly reports `"error"`.
+- `claimReply`: an all-alnum `requestID` over Linux's 255-byte
+  `NAME_MAX` hit `ENAMETOOLONG` on the raw-filename fast path,
+  silently reopening the double-evaluation race this function exists
+  to close (confirmed live: two racing claims for an identical
+  5000-char ID both returned `"error"`, not won/lost). The fast path
+  now also bounds length, falling through to the hashed (fixed
+  64-char) filename above 200 chars.
+- **`scripts/measure.py` crashed entirely — no report at all — on a
+  JSON-valid-but-wrong-shape log line**, despite its own docstring
+  claiming to tolerate corrupt lines: a non-object top-level value, a
+  non-numeric `elapsedMs` string, or a non-numeric `usage.input_tokens`
+  string all threw uncaught. New `_safe_float`/`_safe_int` helpers and
+  a shape check in `load()` (same "corrupt" bucket as unparseable
+  JSON) close this for the whole class instead of one field at a time.
+- A `NaN`/`Infinity` `elapsedMs` silently skewed `measure.py`'s
+  p95/mean for the entire report with no warning, and made `--json`
+  output invalid JSON (`json.dumps`'s default `allow_nan=True` emits
+  bare `NaN`/`Infinity` tokens). Same bug class round 6 fixed for
+  `decision.confidence` in `client.py`, unreviewed in `measure.py`
+  until now — `_safe_float` rejects non-finite the same way
+  `_finite_float` does.
+- `measure.py --by-session`'s plain-text output crashed on a lone
+  UTF-16 surrogate in `sessionID` (same root-cause class as round 7's
+  `sha256_hex` fix, in a different, unfixed location) — sanitized with
+  `errors="replace"` before printing.
+  32 TS tests now (was 30), 57 Python tests (was 52, including a new
+  `tests/test_measure.py` — this script had zero test coverage before).
+
+### Fixed
 - **A lone UTF-16 surrogate in `HALT.detail` silently dropped the entire
   log line for that event, with no error anywhere.** Found by a 7th
   live-execution review round (following round 6's method: run real
