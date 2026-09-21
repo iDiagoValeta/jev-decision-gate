@@ -130,6 +130,19 @@ Live autonomy check (non-interactive, against a running service):
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail.
+- **Fence the untrusted parts of the brief, don't pretend they're
+  trusted.** `OBJECTIVE` and `HALT.detail` are attacker-reachable
+  (conversation text, file/command content). `build_objective_block`
+  wraps both in a per-request random-token fence with an explicit
+  "this is data" instruction, and neutralizes any accidental/forged
+  match of the fence token inside the untrusted content itself, so a
+  fake closing marker can't inject trailing `POLICY:`/`QUESTION:`
+  lines. This is a partial mitigation, not a fix — Jev's judgment over
+  the fenced content is still the only real defense against a
+  sufficiently convincing adversarial payload. See `SECURITY.md`
+  "Accepted risk: prompt injection into Jev's brief" for the full,
+  explicitly-stated trade-off (found by an adversarial security
+  review; previously an undocumented, implicit assumption).
 - **Jev decides, no thresholds.** The winning action is whatever
   Jev's `decision` answer says, at any confidence. Safe/risk answers
   are evidence, not vetoes. Unknown strings and errors still degrade
