@@ -18,6 +18,13 @@ uncertain falls back to your manual prompt — with a desktop popup
 > an unrecognized decision all fall back to asking you, and a local
 > kill-list rejects catastrophic shell commands before Jev is ever
 > asked. You remain responsible for what gets approved.
+>
+> **`opencode run --auto` bypasses this gate entirely** — including the
+> catastrophic kill-list — because `--auto` resolves permissions
+> client-side before the plugin can reply. Never use `--auto` when the
+> gate's decisions are meant to matter; see
+> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the
+> reproduction and the safe alternative for headless sessions.
 
 **Contents:** [Requirements](#requirements) ·
 [Quickstart](#quickstart) · [Safety model](#safety-model) ·

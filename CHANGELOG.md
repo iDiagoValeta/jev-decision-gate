@@ -48,10 +48,25 @@ versioning follows [SemVer](https://semver.org/).
   thresholds" design), a positive `write` case, and a `doom_loop`
   destructive case.
 
+### Added
+- README badges (CI, license, Python, Node), a top-of-file risk
+  disclaimer for the auto-approval model, and a contents line.
+- `permissions: read-all` on the `ci` workflow — no job writes to the
+  GitHub API.
+- Repo description and topics updated on GitHub for visibility.
+
 ### Known limitations
 - The question/form auto-answer path is live-verified for the
   `ELEGIDO=pizza` repro but not proven to close every hang case; see
   `docs/TROUBLESHOOTING.md` "Question dialog hangs".
+- **`opencode run --auto` bypasses the gate entirely, including the
+  catastrophic kill-list** — confirmed with a zero-risk live repro
+  (`terraform destroy`, `terraform` not installed): executed under
+  `--auto`, correctly blocked (`executed: false`) via the raw session
+  API. `--auto` resolves permissions client-side without waiting for
+  `permission.asked` subscribers, so no plugin can win that race; not
+  fixable from inside this plugin. See `docs/TROUBLESHOOTING.md` and
+  issue #21. Use the raw session API for headless work instead.
 
 ## [0.2.0] - 2026-09-21
 
