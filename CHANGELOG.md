@@ -7,6 +7,44 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`install.sh --global` crashed with an unhandled `FileNotFoundError`
+  on a fresh machine** where `~/.config/opencode/` doesn't exist yet —
+  a plausible, likely common first-run scenario, not an edge case.
+  Found by a 9th adversarial review round that actually ran the
+  installer in a sandboxed temp `HOME`, not just read the shell
+  script. `set -euo pipefail` aborted the whole install right after
+  the node-deps step, printing a raw Python traceback instead of
+  "Done." The config-writing step never created the parent directory
+  before `open(config_path, "w")`. Fixed with `os.makedirs(...,
+  exist_ok=True)` before the write; live-verified against the exact
+  failing scenario (confirmed the pre-fix script really does raise
+  there, and the fix resolves it, writing a correct config).
+
+### Verified clean (round 9, live-execution)
+- `postApiReply`'s JSON payload under adversarial content: no shell
+  injection (confirmed empirically, not assumed, against `spawn()`'s
+  array-args form), NUL bytes and lone UTF-16 surrogates both escape
+  safely before reaching argv (different, safer mechanism than round
+  7's direct-encode bug — checked and found not to reproduce here),
+  oversized payloads reject cleanly via the existing `'error'` handler
+  (no crash) and, when reachable through a real oversized form option
+  value, are already caught by `handleFormAsked`'s existing
+  `form-reply-failed`/`alertHuman` path.
+- `formSeen`'s size-cap clearing (added round 8) reopening the
+  in-memory "already being processed" gate for a still-in-flight form:
+  confirmed this does happen, but `claimReply`'s file-based lock
+  (`.jev-gate-replied/form:<id>`) catches every re-discovery — stress
+  test with ~2200 concurrent forms and repeated cap-clears produced
+  exactly one gate evaluation and exactly one reply per form, zero
+  duplicates. The durable backstop holds under real, not just
+  reasoned-about, concurrency.
+- `install.sh --project` / `uninstall.sh` against no config, an
+  unrelated-schema config, a config with an existing gate entry
+  (re-running doesn't duplicate it), and invalid-JSON configs (crashes
+  with an unfriendly error, but the original file is left byte-for-byte
+  untouched — no data loss either way).
+
+### Fixed
 - **`claimReply`: the marker directory existing as a plain file
   permanently misclassified every claim as "lost" instead of
   "error".** Found and live-verified by an 8th adversarial review

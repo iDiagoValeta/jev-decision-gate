@@ -46,7 +46,7 @@ else
 fi
 
 python3 - "$CONFIG" "$PLUGIN_DIR" "$LOG_FILE" <<'EOF'
-import json, sys
+import json, os, sys
 config_path, plugin_pkg, log_file = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     with open(config_path) as f:
@@ -66,6 +66,9 @@ elif cfg["permission"] != "ask":
           "the gate needs \"permission\": \"ask\" to receive permission.asked "
           "events at all; set it yourself if you want the gate to do anything.",
           file=sys.stderr)
+config_dir = os.path.dirname(config_path)
+if config_dir:
+    os.makedirs(config_dir, exist_ok=True)
 with open(config_path, "w") as f:
     json.dump(cfg, f, indent=2)
 print(f"wrote {config_path}")
