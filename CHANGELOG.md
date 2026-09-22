@@ -7,6 +7,50 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Two ReDoS (algorithmic-complexity) bugs could freeze the whole
+  opencode host for tens of seconds on realistic-sized input, before Jev
+  is ever called.** Found and live-verified by an 11th adversarial review
+  round, independently reproduced and extended. `isCatastrophic`'s
+  kill-list regex for `rm -rf <target>` uses `.*`/`(\S*\s+)*` before
+  searching for a real target; on a long string with no target present,
+  every occurrence of "rm -rf" forces its own O(remaining-length)
+  backtrack search, making the whole check O(n^2) — live-verified: ~1.6MB
+  of `rm -rf junkword...` froze the event loop for ~19s. Follow-up
+  scanning found the same `.* ` + literal-search shape in at least 10
+  more of the 23-pattern kill list (dd, find, curl, wget, base64,
+  powershell, git push, kubectl delete, aws s3 rm), all reachable the
+  same way. Separately, `redactSecrets`'s `scheme://user:pass@host` regex
+  has an unbounded scheme-prefix repetition, so a long string with no
+  `://` anywhere forces the same kind of O(n^2) backtracking; reachable
+  via `labelsFromFormField` on a single long multichoice option *before*
+  its own 200-char truncation applies (live-verified: 100k chars took
+  6.3s). The identical regex shape exists in Python's `schemas.py`
+  (`build_objective_block`), where the standalone `python3 -m
+  jev_gate.cli` entry point has no length bound on `objective` at all —
+  a 5,000,000-char payload via stdin consumed 100% CPU for over 2.5
+  minutes.
+
+  Fixed two ways, chosen to close all discovered (and any not-yet-found)
+  instances of the same shape rather than patch each of the 11+ affected
+  regexes individually: `isCatastrophic` now bounds its input to the
+  same 4000 chars Jev's own `detail` field already sees
+  (`rawDetail = joined.slice(0, 4000)`), so this doesn't reduce real
+  detection — nothing past that point is evaluated by either layer
+  today. The `scheme://user:pass@` regex (both TS and Python) now bounds
+  its scheme-prefix repetition to 20 characters (real schemes are a
+  handful of characters), a strict O(n^2) -> O(n) fix with zero
+  matching-behavior change, verified against realistic connection
+  strings (postgresql, mongodb(+srv), mysql, redis, amqp, https, sftp).
+
+  4 new regression tests (TS: adversarial-input timing bounds for both
+  `isCatastrophic` and `redactSecrets`/`labelsFromFormField`, plus a test
+  documenting the length-cap boundary as intentional; Python: the same
+  timing-bound test for `redact_secrets`), each confirmed to fail
+  against the pre-fix code (14.9s+ and 10.4s respectively) and pass
+  against the fix (under 15ms).
+  37 TS tests now (was 33), 58 Python tests now (was 57).
+
+### Fixed
 - **`handleOne`: a synchronous `spawn()` throw silently blackholed the
   permission — no reply, no log, no alert, and blocked all future
   retries for that requestID.** Found and live-verified by a 10th

@@ -85,8 +85,12 @@ export function redactSecrets(text: string): string {
     out = out.replace(re, "[REDACTED]")
   }
   // scheme://user:PASSWORD@host — redact only the password, keep the
-  // rest (host/port/path) visible for debugging context.
-  out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s/:@]+):([^\s/@]{1,})@/g, "$1:[REDACTED]@")
+  // rest (host/port/path) visible for debugging context. Scheme repetition
+  // bounded to 20 (real schemes are a handful of chars) — round 11 finding:
+  // an unbounded `*` here is O(n^2) on long input with no "://" anywhere,
+  // since the engine retries a greedy-then-backtrack search from every
+  // position (live-verified: 100k chars took 6.3s unbounded, 6ms bounded).
+  out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]{0,20}:\/\/[^\s/:@]+):([^\s/@]{1,})@/g, "$1:[REDACTED]@")
   // Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
   // not just stand alone (password=...) — the keyword can appear anywhere
   // in the token, not only at its start.
@@ -100,9 +104,21 @@ export function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf8").digest("hex")
 }
 
+// Several CATASTROPHIC patterns use `.*`/`(\S*\s+)*` before a literal
+// target (round 11 finding): on a long string with no real target, each
+// occurrence of the pattern's trigger word forces its own O(remaining
+// length) backtrack search, so a string with many trigger occurrences is
+// O(n^2) overall — live-verified: ~1.6MB of "rm -rf junk..." froze the
+// event loop for ~19s. Bounding the check to the same length Jev's own
+// judgment already sees (rawDetail below truncates `joined` to this same
+// 4000 chars) closes this without reducing real detection: nothing past
+// this point is evaluated by either layer today.
+const CATASTROPHIC_CHECK_MAX_CHARS = 4000
+
 export function isCatastrophic(joined: string): boolean {
-  const normalized = normalizeCommand(joined)
-  return CATASTROPHIC.some((re) => re.test(joined) || re.test(normalized))
+  const bounded = joined.length > CATASTROPHIC_CHECK_MAX_CHARS ? joined.slice(0, CATASTROPHIC_CHECK_MAX_CHARS) : joined
+  const normalized = normalizeCommand(bounded)
+  return CATASTROPHIC.some((re) => re.test(bounded) || re.test(normalized))
 }
 
 // Documented OpenCode permission keys (https://opencode.ai/docs/permissions/):

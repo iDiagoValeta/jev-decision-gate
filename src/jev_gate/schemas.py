@@ -20,8 +20,13 @@ _SECRET_PATTERNS = [
     # (base64 of the JSON header's leading `{"`).
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     # scheme://user:PASSWORD@host — redact only the password, keep the
-    # rest (host/port/path) visible for debugging context.
-    re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://[^\s/:@]+):([^\s/@]{1,})@"),
+    # rest (host/port/path) visible for debugging context. Scheme repetition
+    # bounded to 20 (real schemes are a handful of chars) — round 11 finding:
+    # an unbounded `*` here is O(n^2) on long input with no "://" anywhere
+    # (live-verified: 50k chars took 1.15s unbounded, 0.001s bounded; the
+    # standalone `python3 -m jev_gate.cli` has no other length guard on
+    # `objective`, so this was reachable with a multi-MB stdin payload).
+    re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]{0,20}://[^\s/:@]+):([^\s/@]{1,})@"),
     # Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
     # not just stand alone (password=...) — the keyword can appear anywhere
     # in the token, not only at its start.

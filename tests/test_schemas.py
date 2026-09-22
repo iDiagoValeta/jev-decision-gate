@@ -36,6 +36,22 @@ def test_redact_secrets_is_safe_on_non_string_and_empty_input():
     assert redact_secrets("") == ""
 
 
+def test_redact_secrets_does_not_hang_on_a_long_string_with_no_scheme_match():
+    # regression: round 11 ReDoS finding. The scheme://user:pass@ regex's
+    # `*`-repeated prefix had no bound, so a long string with no "://"
+    # anywhere forced a greedy-then-backtrack scan from every position
+    # (live-verified pre-fix: 50k chars took 1.15s, 5,000,000 chars fed to
+    # the standalone `python3 -m jev_gate.cli` froze it for 2.5+ minutes).
+    import time
+    from jev_gate.schemas import redact_secrets
+    adversarial = "A" * 150000
+    t0 = time.monotonic()
+    result = redact_secrets(adversarial)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5, f"redact_secrets took {elapsed:.2f}s on adversarial input, expected < 0.5s"
+    assert result == adversarial
+
+
 def test_build_objective_block_falls_back_when_objective_is_empty():
     from jev_gate.schemas import build_objective_block
     halt = {"kind": "read", "tool": "read", "detail": "Read src/app.py"}

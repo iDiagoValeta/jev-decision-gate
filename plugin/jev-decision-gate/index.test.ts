@@ -100,6 +100,27 @@ test("isCatastrophic: subpath deletes under /home/<user> or .. stay NOT caught (
   }
 })
 
+test("isCatastrophic: does not hang on a long adversarial string (regression: round 11 ReDoS finding)", () => {
+  // Several patterns use `.*`/`(\S*\s+)*` before a literal target, so a
+  // string with many "rm -rf" occurrences and no real target forces
+  // repeated O(remaining-length) backtracking — live-verified pre-fix:
+  // ~1.6MB of this shape froze the event loop for ~19s.
+  const adversarial = ("rm -rf " + "junkword ".repeat(50)).repeat(3500)
+  const t0 = Date.now()
+  const result = isCatastrophic(adversarial)
+  const elapsedMs = Date.now() - t0
+  assert.ok(elapsedMs < 500, `isCatastrophic took ${elapsedMs}ms on adversarial input, expected < 500ms`)
+  assert.equal(result, false) // no real target anywhere in the junk — must not false-positive either
+})
+
+test("isCatastrophic: a real target beyond the length cap is still not evaluated past it (documented trade-off, not a regression)", () => {
+  // Consistent with rawDetail's own 4000-char truncation, which already
+  // bounds what Jev's judgment sees from the same `joined` string.
+  const padded = "x".repeat(4100) + " rm -rf /"
+  assert.equal(isCatastrophic(padded), false)
+  assert.equal(isCatastrophic("rm -rf / " + "x".repeat(4100)), true) // target within the first 4000 chars is still caught
+})
+
 test("normalizeCommand: strips backslashes and expands bare $IFS", () => {
   assert.equal(normalizeCommand("r\\m -rf /"), "rm -rf /")
   assert.equal(normalizeCommand("rm$IFS-rf$IFS/"), "rm -rf /")
@@ -158,6 +179,26 @@ test("redactSecrets: closes security-review gaps (compound key=value identifiers
   // widened "keyword embedded in a longer identifier" pattern).
   assert.match(redactSecrets("password: hunter2345"), /password:\s*\[REDACTED\]/)
   assert.match(redactSecrets("token=abcd1234"), /token=\[REDACTED\]/)
+})
+
+test("redactSecrets: does not hang on a long string with no scheme match (regression: round 11 ReDoS finding)", () => {
+  // The scheme://user:pass@ regex's `*`-repeated prefix had no bound, so a
+  // long string with no "://" anywhere forced a greedy-then-backtrack scan
+  // from every position — live-verified pre-fix: 100k chars took 6.3s.
+  const adversarial = "A".repeat(150000)
+  const t0 = Date.now()
+  const result = redactSecrets(adversarial)
+  const elapsedMs = Date.now() - t0
+  assert.ok(elapsedMs < 500, `redactSecrets took ${elapsedMs}ms on adversarial input, expected < 500ms`)
+  assert.equal(result, adversarial) // no secret pattern present, must pass through unchanged
+})
+
+test("labelsFromFormField: does not hang on an oversized option before LABEL_MAX_CHARS truncation (regression: round 11 ReDoS finding)", () => {
+  const t0 = Date.now()
+  const out = labelsFromFormField({ options: ["pizza", "pasta", "A".repeat(150000)] })
+  const elapsedMs = Date.now() - t0
+  assert.ok(elapsedMs < 500, `labelsFromFormField took ${elapsedMs}ms, expected < 500ms`)
+  assert.equal(out[2].length, 200)
 })
 
 test("kindFor: maps documented permission actions to a gate kind", () => {
