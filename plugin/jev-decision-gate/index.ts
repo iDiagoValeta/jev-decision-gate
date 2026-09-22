@@ -432,7 +432,7 @@ export function valueForPick(field: unknown, pick: string): string | null {
 }
 
 /** List pending interactive forms (question tool uses kind=question forms on 2.0.x). */
-function listPendingForms(): Promise<Array<Record<string, unknown>>> {
+export function listPendingForms(): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve) => {
     const child = spawn("opencode", ["api", "GET", "/api/form"], {
       env: process.env,
@@ -445,6 +445,20 @@ function listPendingForms(): Promise<Array<Record<string, unknown>>> {
       } catch {
         // ignore
       }
+      // Same SIGKILL backstop spawnGate's timeout/cancel paths already have
+      // (round 13 review) — this call site was left out of that fix (round
+      // 14 review, live-verified: a hung `opencode` CLI that ignores
+      // SIGTERM stays alive indefinitely, and this runs on every 750ms
+      // poll tick with no backpressure, so a single hang leaks one
+      // orphaned process per tick).
+      const killer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          // ignore
+        }
+      }, 2000)
+      killer.unref?.()
       resolve([])
     }, 5000)
     child.stdout?.on("data", (c) => {
@@ -492,6 +506,18 @@ export function postApiReply(apiPath: string, body: Record<string, unknown>, err
       } catch {
         // ignore
       }
+      // Same SIGKILL backstop spawnGate's timeout/cancel paths already have
+      // (round 13 review) — this call site was left out of that fix
+      // (round 14 review, live-verified). Every permission/form reply goes
+      // through here.
+      const killer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          // ignore
+        }
+      }, 2000)
+      killer.unref?.()
       reject(new Error(`${errPrefix} timeout`))
     }, 10000)
     child.stderr?.on("data", (c) => {
@@ -864,9 +890,27 @@ export default Plugin.define({
             : payload) as Record<string, unknown>
           const fid = String(form.id ?? payload.id ?? "")
           if (fid) capped(formSeen).add(fid)
-          const task = handleFormAsked(ctx, logEv, inst, options, form, endedSessions)
+          // handleFormAsked re-derives its own formID from *this* payload's
+          // .id alone (no further fallback) — if the real id only lived at
+          // the outer event's payload.id (form.id itself absent), fid above
+          // resolves it correctly but handleFormAsked would still see
+          // formID="" and hit its missing-ids early return, permanently
+          // stuck: nothing gets claimed on disk (claimReply never runs),
+          // yet formSeen is now marked forever, blocking the poll path's
+          // retry for a form nothing ever actually processed (round 14
+          // review). Hand it a form object whose .id already matches fid.
+          const formForHandler = fid && !form.id ? { ...form, id: fid } : form
+          const task = handleFormAsked(ctx, logEv, inst, options, formForHandler, endedSessions)
           void task.catch(() => {
-            // Failures are logged inside the handler.
+            // Failures are logged inside the handler. Mirror the poll
+            // path's own cleanup (round 14 review): most failures inside
+            // handleFormAsked are swallowed by its own internal fail-open
+            // catch and never reject here, but a throw BEFORE its
+            // claimReply call (e.g. missing-ids on a malformed event) never
+            // claims anything on disk — leaving fid in formSeen forever
+            // would permanently block the poll path's own retry for a form
+            // that was never actually claimed.
+            if (fid) formSeen.delete(fid)
           })
           continue
         }

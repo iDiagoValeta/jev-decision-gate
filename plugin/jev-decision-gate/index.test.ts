@@ -12,6 +12,7 @@ import JevGate, {
   isCatastrophic,
   kindFor,
   labelsFromFormField,
+  listPendingForms,
   looksLikeSessionGone,
   normalizeCommand,
   postApiReply,
@@ -569,6 +570,115 @@ test("setup: schedules a periodic prune of the on-disk reply-marker directory, n
   } finally {
     global.setInterval = origSetInterval
     global.clearInterval = origClearInterval
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("listPendingForms: a hung `opencode` CLI that ignores SIGTERM is still killed via a SIGKILL backstop (round 14 finding)", async () => {
+  // Same bug class round 13 fixed in spawnGate's timeout/cancel paths, but
+  // that audit only covered spawnGate itself — listPendingForms (called
+  // every 750ms by setup()'s poll timer) and postApiReply (every
+  // permission/form reply) were left with SIGTERM-only kills and no
+  // backstop, live-verified to leak indefinitely. postApiReply shares the
+  // identical fix and was verified manually (its own timeout is 10s,
+  // making an automated test here disproportionately slow); this test
+  // covers the pattern via listPendingForms's shorter 5s timeout.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-listforms-sigkill-bin-"))
+  const pidFile = path.join(binDir, "child.pid")
+  fs.writeFileSync(
+    path.join(binDir, "opencode"),
+    [
+      "#!/usr/bin/env python3",
+      "import os, signal, time",
+      "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+      `open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))`,
+      "time.sleep(15)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  const origPath = process.env.PATH
+  process.env.PATH = `${binDir}${path.delimiter}${origPath ?? ""}`
+  try {
+    const t0 = Date.now()
+    const result = await listPendingForms()
+    assert.deepEqual(result, [])
+    assert.ok(Date.now() - t0 < 5500, "should resolve at its own ~5s timeout")
+
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 50))
+    const pid = parseInt(fs.readFileSync(pidFile, "utf8"), 10)
+    const isAlive = () => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let dead = false
+    for (let i = 0; i < 50 && !dead; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      dead = !isAlive()
+    }
+    assert.ok(dead, "child should have been SIGKILLed by the backstop, but is still alive")
+  } finally {
+    process.env.PATH = origPath
+    fs.rmSync(binDir, { recursive: true, force: true })
+  }
+})
+
+test("setup: event-stream form path resolves a form id that only lives at the outer event payload, not just inside the nested form object (round 14 finding)", async () => {
+  // handleFormAsked re-derives its own formID from the object it's handed
+  // (.id alone, no further fallback). The event-stream path itself already
+  // falls back to the outer payload's .id when the nested form object
+  // lacks one (fid = form.id ?? payload.id, a few lines above), but used
+  // to hand handleFormAsked the unchanged nested object regardless — so a
+  // form whose id only lived at the outer level hit handleFormAsked's own
+  // missing-ids early return, claiming nothing on disk (claimReply never
+  // ran), while formSeen was already marked — permanently foreclosing the
+  // poll path's own retry for a form nothing ever actually processed.
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formid-mismatch-"))
+  try {
+    let emitted = false
+    const ctx = {
+      options: { gateDir, enabled: true },
+      event: {
+        subscribe: async function* () {
+          if (!emitted) {
+            emitted = true
+            // id lives only at properties.id, not inside properties.form —
+            // sessionID lives inside form (isolates the id mismatch from
+            // any speculation about sessionID's own shape).
+            yield {
+              type: "form.created",
+              properties: { id: "form-r14-1", form: { sessionID: "sess-r14", fields: [] } },
+            }
+          }
+        },
+      },
+      session: {
+        // sessionIsEnded runs right after claimReply inside
+        // handleFormAsked; making it report "ended" short-circuits the
+        // function immediately afterward, without spawning the real gate
+        // subprocess — claimReply's marker file is the only observable
+        // this test needs.
+        get: async () => {
+          throw new Error("Session sess-r14 not found")
+        },
+        context: async () => [],
+      },
+    }
+    const teardown = await (JevGate as { setup: (ctx: unknown) => Promise<(() => void) | undefined> }).setup(ctx)
+    await new Promise((r) => setTimeout(r, 300))
+    teardown?.()
+
+    const repliedDir = path.join(gateDir, ".jev-gate-replied")
+    const claimed = fs.existsSync(repliedDir) && fs.readdirSync(repliedDir).length > 0
+    assert.ok(
+      claimed,
+      "handleFormAsked should have reached claimReply (form-r14-1's id resolved from the outer payload), not silently dropped via missing-ids",
+    )
+  } finally {
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
 })
