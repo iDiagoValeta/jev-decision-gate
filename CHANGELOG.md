@@ -7,6 +7,35 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`textOfMessage` never extracted text from assistant messages — every
+  turn the agent itself said or reasoned silently vanished from OBJECTIVE,
+  on every single permission and form Jev has ever evaluated.** Found by
+  a 15th adversarial review round, confirmed against the actual installed
+  `@opencode/client@2.0.11` type definitions (not observed behavior or
+  speculation): `ctx.session.context()` returns `SessionMessageInfo[]`,
+  and `SessionMessageAssistant` has neither `.text` nor `.parts` at
+  all — its text lives in `content[].text` for `"text"`/`"reasoning"`
+  items, a shape `textOfMessage` never handled (it only checked `.text`
+  directly or a legacy `.parts` array, both of which only ever existed on
+  user messages). Live-verified end-to-end via `handleOne` with a fake
+  gate subprocess that echoes back the objective it received: an
+  assistant message containing the exact command about to run was
+  completely absent from what Jev saw, leaving only the human's request.
+  This directly contradicts `objectiveFor`'s own documented intent
+  ("lets Jev judge whether a halt matches what the human asked AND what
+  the agent has been doing, not just the human's last message") and
+  degrades the signal behind every decision this gate has ever made,
+  fail-silently (no error, so undetectable without reading the real
+  types) — explaining why 14 prior rounds, working from observed
+  behavior rather than the installed SDK's actual types, never caught
+  it. Fixed by also extracting `content[].text` for `"text"`/`"reasoning"`
+  items (`"tool"` items have no plain text and are skipped, mirroring the
+  existing `.parts` handling). New regression tests, isolated via a
+  surgical revert of just the parsing branch (kept the export) to confirm
+  they exercise the actual logic, not just its presence. 43 TS tests now
+  (was 41).
+
+### Fixed
 - **`listPendingForms` and `postApiReply` had the same missing-SIGKILL-backstop
   gap round 13 fixed in `spawnGate` — that audit only covered `spawnGate`
   itself.** Found by a 14th adversarial review round, live-verified: a

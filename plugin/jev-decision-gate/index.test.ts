@@ -17,6 +17,7 @@ import JevGate, {
   normalizeCommand,
   postApiReply,
   redactSecrets,
+  textOfMessage,
   valueForPick,
 } from "./index.js"
 
@@ -681,4 +682,41 @@ test("setup: event-stream form path resolves a form id that only lives at the ou
   } finally {
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
+})
+
+test("textOfMessage: extracts assistant text from the real opencode 2.0.x message shape (round 15 finding)", () => {
+  // SessionMessageAssistant (the installed @opencode/client's real type)
+  // has neither .text nor .parts — text lives in content[].text for
+  // "text"/"reasoning" items. Before this, every assistant turn silently
+  // vanished from OBJECTIVE (verified end-to-end via handleOne: the gate
+  // received only the user's messages, never anything the agent itself
+  // said or reasoned), contradicting objectiveFor's own comment that
+  // OBJECTIVE should reflect "what the agent has been doing."
+  const assistantMsg = {
+    type: "assistant",
+    id: "m2",
+    agent: "build",
+    content: [
+      { type: "reasoning", text: "The user wants the temp dir cleaned." },
+      { type: "tool", tool: "bash", input: { command: "rm -rf /tmp/x" } },
+      { type: "text", text: "I'll run rm -rf /tmp/x to clean up." },
+    ],
+  }
+  const result = textOfMessage(assistantMsg)
+  assert.equal(result?.role, "assistant")
+  assert.match(result?.text ?? "", /temp dir cleaned/)
+  assert.match(result?.text ?? "", /rm -rf \/tmp\/x to clean up/)
+  // Tool-call content items have no plain text and must not appear.
+  assert.doesNotMatch(result?.text ?? "", /"tool":"bash"/)
+})
+
+test("textOfMessage: still handles the v2 .text shape and the legacy .parts shape (no regression)", () => {
+  assert.deepEqual(textOfMessage({ type: "user", text: "hello" }), { role: "user", text: "hello" })
+  assert.deepEqual(textOfMessage({ role: "assistant", parts: [{ text: "hi" }, { text: "there" }] }), {
+    role: "assistant",
+    text: "hi\nthere",
+  })
+  assert.equal(textOfMessage({ type: "assistant", content: [{ type: "tool", tool: "bash" }] }), null)
+  assert.equal(textOfMessage(null), null)
+  assert.equal(textOfMessage({ type: "system" }), null)
 })
