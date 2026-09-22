@@ -640,6 +640,20 @@ function spawnGate(options: Record<string, unknown>): {
       } catch {
         // ignore
       }
+      // Same SIGKILL backstop as the timeout path above: without it, a
+      // child that doesn't die on SIGTERM (installed its own handler, or
+      // just misses the signal) leaks forever — cancel() has no other
+      // caller to retry it (round 13 review, live-verified: a child that
+      // ignores SIGTERM stayed alive at least 8s past cancel() with no
+      // fix, with nothing left anywhere to clean it up).
+      const killer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          // ignore
+        }
+      }, 2000)
+      killer.unref?.()
       // Swallow the eventual close/error event so it doesn't surface as an
       // unhandled rejection once nothing is awaiting `result` anymore.
       result.catch(() => {})
