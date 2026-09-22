@@ -116,6 +116,12 @@ def main():
         by = {}
         for r in rows:
             sid = r.get("sessionID") or "unknown"
+            # A log row's sessionID isn't guaranteed to be a string (round 12
+            # review, live-verified: a numeric sessionID crashes the
+            # --by-session text path's sid[:8] below with TypeError). --json
+            # mode is unaffected (json.dumps coerces non-string keys itself).
+            if not isinstance(sid, str):
+                sid = str(sid)
             b = by.setdefault(sid, {"n": 0, "allow": 0, "fail_open": 0})
             b["n"] += 1
             if (r.get("gateAction") or r.get("action")) == "allow":
