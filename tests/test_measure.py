@@ -89,3 +89,17 @@ def test_main_by_session_plain_text_survives_a_lone_surrogate_sessionid(tmp_path
     measure.main()  # must not raise UnicodeEncodeError
     out = capsys.readouterr().out
     assert "session " in out
+
+
+def test_main_by_session_plain_text_survives_a_non_string_sessionid(tmp_path, monkeypatch, capsys):
+    # Round 12 review: sid[:8] assumed sessionID was always a string.
+    # A numeric sessionID crashed the --by-session text path (not --json,
+    # which coerces non-string dict keys itself) with
+    # TypeError: 'int' object is not subscriptable.
+    measure = _load_measure()
+    log = tmp_path / "log.jsonl"
+    log.write_text(json.dumps({"gateAction": "allow", "sessionID": 12345}) + "\n")
+    monkeypatch.setattr(sys, "argv", ["measure.py", "--log", str(log), "--by-session"])
+    measure.main()  # must not raise TypeError
+    out = capsys.readouterr().out
+    assert "session 12345" in out

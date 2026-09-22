@@ -4,7 +4,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
-import {
+import JevGate, {
   alertHuman,
   capped,
   claimReply,
@@ -466,6 +466,47 @@ test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesaf
     assert.equal(logs[0].reason, "fail-open")
     assert.match(String(logs[0].error_class), /null bytes/)
   } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("setup: schedules a periodic prune of the on-disk reply-marker directory, not just once at startup (round 12 finding)", async () => {
+  // pruneReplied() used to only run once, at setup() itself — a
+  // long-running opencode host (days/weeks, setup() never re-invoked)
+  // accumulated one marker file per permission/form forever (live-verified:
+  // 5000 claimReply calls -> 5000 unpruned files). Fixed by giving it its
+  // own setInterval, mirroring the existing form-poll timer. Assert the
+  // wiring directly (timer created + cleared) rather than waiting a real
+  // hour: setup() must now register 2 intervals (poll + prune), and
+  // teardown must clear both.
+  const origSetInterval = global.setInterval
+  const origClearInterval = global.clearInterval
+  let created = 0
+  let cleared = 0
+  global.setInterval = ((...args: Parameters<typeof setInterval>) => {
+    created++
+    return origSetInterval(...args)
+  }) as typeof setInterval
+  global.clearInterval = ((...args: Parameters<typeof clearInterval>) => {
+    cleared++
+    return origClearInterval(...args)
+  }) as typeof clearInterval
+
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-setup-timers-"))
+  try {
+    const ctx = {
+      options: { gateDir, enabled: true },
+      event: { subscribe: async function* () {} },
+      session: { get: async () => ({}), context: async () => [] },
+    }
+    const teardown = await (JevGate as { setup: (ctx: unknown) => Promise<(() => void) | undefined> }).setup(ctx)
+    assert.equal(created, 2, "setup() should register 2 intervals (form-poll + reply-marker prune)")
+    assert.equal(typeof teardown, "function")
+    teardown?.()
+    assert.equal(cleared, 2, "teardown should clear both intervals")
+  } finally {
+    global.setInterval = origSetInterval
+    global.clearInterval = origClearInterval
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
 })

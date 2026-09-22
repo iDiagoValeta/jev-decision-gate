@@ -7,6 +7,30 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The on-disk reply-marker directory (`.jev-gate-replied/`) was only
+  pruned once, at `setup()` startup — a long-running opencode host
+  process (days/weeks, `setup()` never re-invoked) accumulated one marker
+  file per permission/form forever.** Found by a 12th adversarial review
+  round, live-verified: 5000 `claimReply` calls produced 5000 unpruned
+  files. Same bug class already fixed for the in-memory collections
+  (`resolved`/`endedSessions`/`formSeen`, via `capped()`); this was its
+  on-disk sibling, left out of that fix. Fixed by giving `pruneReplied` its
+  own `setInterval` (1h cadence, matching its own `maxAgeMs` default),
+  mirroring the existing form-poll timer, cleared on teardown alongside it.
+  New regression test asserts `setup()` registers 2 intervals and teardown
+  clears both — fails pre-fix (1 interval), passes post-fix (2).
+  38 TS tests now (was 37).
+- **`scripts/measure.py --by-session` (plain-text mode) crashed with
+  `TypeError: 'int' object is not subscriptable` if a log row's
+  `sessionID` was numeric instead of a string.** Found by the same round.
+  `sid[:8]` assumed `sessionID` was always a string; `--json` mode is
+  unaffected (`json.dumps` coerces non-string dict keys itself), but the
+  text-mode preview truncation crashed on any non-string, truthy
+  `sessionID`. Fixed by coercing `sid` to `str` before slicing. New
+  regression test, same revert-and-confirm-fails discipline.
+  59 Python tests now (was 58).
+
+### Fixed
 - **Two ReDoS (algorithmic-complexity) bugs could freeze the whole
   opencode host for tens of seconds on realistic-sized input, before Jev
   is ever called.** Found and live-verified by an 11th adversarial review

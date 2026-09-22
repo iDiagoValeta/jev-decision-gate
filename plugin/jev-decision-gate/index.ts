@@ -797,6 +797,15 @@ export default Plugin.define({
     const logEv = (entry: Record<string, unknown>): void =>
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
+    // pruneReplied only ran once, at setup() — a long-running opencode host
+    // process (days/weeks, setup() never re-invoked) accumulates one marker
+    // file per permission/form forever (round 12 finding, live-verified:
+    // 5000 claimReply calls -> 5000 unpruned files). Same class of bug
+    // already fixed for the in-memory collections via capped(); this is
+    // its on-disk sibling. Cadence matches pruneReplied's own maxAgeMs
+    // default (1h) — no need to poll as often as the form-list.
+    const pruneTimer = setInterval(() => pruneReplied(options), 3600000)
+    ;(pruneTimer as unknown as { unref?: () => void }).unref?.()
     const controller = new AbortController()
     const formSeen = new Set<string>()
     // Poll pending forms: on opencode 2.0.x the question tool opens a
@@ -917,6 +926,7 @@ export default Plugin.define({
     })()
     return () => {
       clearInterval(pollTimer)
+      clearInterval(pruneTimer)
       controller.abort()
     }
   },
