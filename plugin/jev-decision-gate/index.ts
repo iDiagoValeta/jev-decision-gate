@@ -1050,7 +1050,7 @@ async function handleFormAsked(
   }
 }
 
-async function handleOne(
+export async function handleOne(
   ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
   log: (entry: Record<string, unknown>) => void,
   inst: string,
@@ -1134,14 +1134,25 @@ async function handleOne(
 
   const kind = kindFor(action, resources)
 
-  // Spawn the gate subprocess before objectiveFor's session.context RPC
-  // resolves, not after: its cold start (interpreter init, typesafe_sdk
-  // import) then overlaps with that RPC instead of adding to it serially.
-  // Every millisecond here is one this permission's reply doesn't get to
-  // spend against the server's reply window (issue #15).
-  const gate = spawnGate(options)
-  const startedAt = Date.now()
+  // spawnGate is called INSIDE the try (round 10 review, live-verified):
+  // spawn() throws SYNCHRONOUSLY, not via a rejected promise, when an env
+  // value derived from options (e.g. a NUL byte in a malformed
+  // typesafeKey/logFile/gateDir) is invalid. Outside the try, that throw
+  // propagated out of handleOne entirely, past every log()/alertHuman()
+  // call in this function, caught only by setup()'s bare event-loop catch
+  // — which logs nothing, alerts no one, and marks repliedOk:true so a
+  // later duplicate permission.asked for the same requestID never even
+  // retries (claimReply already claimed it). Strictly worse than every
+  // other fail-open path in this file, which was built specifically to
+  // never fail silently.
   try {
+    // Spawn the gate subprocess before objectiveFor's session.context RPC
+    // resolves, not after: its cold start (interpreter init, typesafe_sdk
+    // import) then overlaps with that RPC instead of adding to it serially.
+    // Every millisecond here is one this permission's reply doesn't get to
+    // spend against the server's reply window (issue #15).
+    const gate = spawnGate(options)
+    const startedAt = Date.now()
     let objective: string
     try {
       objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))

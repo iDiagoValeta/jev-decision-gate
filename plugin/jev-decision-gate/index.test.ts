@@ -8,6 +8,7 @@ import {
   alertHuman,
   capped,
   claimReply,
+  handleOne,
   isCatastrophic,
   kindFor,
   labelsFromFormField,
@@ -398,4 +399,32 @@ test("alertHuman: does not crash the host process when notify-send/zenity are mi
   })
   fs.rmSync(emptyBinDir, { recursive: true, force: true })
   assert.equal(result.status, 0, `child process should exit 0, got status=${result.status}, stderr=${result.stderr}`)
+})
+
+test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesafeKey) fails open with a log entry, not a silent blackhole (round 10 finding)", async () => {
+  // spawnGate's spawn() call throws SYNCHRONOUSLY, not via a rejected
+  // promise, on an invalid env value. It used to sit outside handleOne's
+  // own try block, so the throw skipped every log()/alertHuman() call in
+  // this function and was only caught by setup()'s bare event-loop catch
+  // — no log, no alert, and a false repliedOk:true that blocked any
+  // future retry for the same requestID.
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-handleone-"))
+  try {
+    const logs: Record<string, unknown>[] = []
+    const log = (entry: Record<string, unknown>) => logs.push(entry)
+    const ctx = {
+      session: {
+        get: async () => ({}),
+        context: async () => [],
+      },
+    }
+    const badKey = "sk-abc" + String.fromCharCode(0) + "def"
+    const out = await handleOne(ctx, log, "inst1", { typesafeKey: badKey, gateDir }, "sess1", "req1", "bash", ["echo hi"], new Set())
+    assert.deepEqual(out, { decision: "ask-human", repliedOk: true })
+    assert.equal(logs.length, 1, "the failure must be logged, not silently swallowed")
+    assert.equal(logs[0].reason, "fail-open")
+    assert.match(String(logs[0].error_class), /null bytes/)
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
 })
