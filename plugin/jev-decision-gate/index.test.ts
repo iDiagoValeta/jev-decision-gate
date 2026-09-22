@@ -470,6 +470,68 @@ test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesaf
   }
 })
 
+test("spawnGate's cancel(): a child that ignores SIGTERM is still killed, via the same SIGKILL backstop the timeout path already has (round 13 finding)", async () => {
+  // cancel() (called from handleOne when objectiveFor detects the session
+  // ended) only sent SIGTERM once, with no backstop — unlike the timeout
+  // path a few lines above it in spawnGate, which escalates to SIGKILL
+  // after 2s if the child doesn't die. A child that ignores/misses SIGTERM
+  // (installed its own handler, scheduling hiccup) leaked forever: nothing
+  // else ever retries killing it.
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-cancel-sigkill-"))
+  const pidFile = path.join(gateDir, "child.pid")
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    [
+      "#!/usr/bin/env python3",
+      "import os, signal, time",
+      "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+      `open(${JSON.stringify(pidFile)}, "w").write(str(os.getpid()))`,
+      "time.sleep(10)",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    const log = () => {}
+    const ctx = {
+      session: {
+        get: async () => ({}),
+        context: async () => {
+          // Give the child time to install its SIGTERM handler before
+          // objectiveFor rejects and handleOne calls gate.cancel().
+          await new Promise((r) => setTimeout(r, 500))
+          throw new Error("Session ses_test not found")
+        },
+      },
+    }
+    const options = { gateDir, pythonBin: fakePython }
+    const out = await handleOne(ctx, log, "inst1", options, "sess1", "req1", "bash", ["echo hi"], new Set())
+    assert.equal(out.decision, "ask-human")
+
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 50))
+    const pid = parseInt(fs.readFileSync(pidFile, "utf8"), 10)
+    assert.ok(Number.isInteger(pid) && pid > 0, "child should have written its own PID")
+
+    const isAlive = () => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let dead = false
+    for (let i = 0; i < 80 && !dead; i++) {
+      await new Promise((r) => setTimeout(r, 100))
+      dead = !isAlive()
+    }
+    assert.ok(dead, "child should have been SIGKILLed by cancel()'s backstop, but is still alive")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
 test("setup: schedules a periodic prune of the on-disk reply-marker directory, not just once at startup (round 12 finding)", async () => {
   // pruneReplied() used to only run once, at setup() itself — a
   // long-running opencode host (days/weeks, setup() never re-invoked)

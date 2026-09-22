@@ -53,6 +53,18 @@ try:
         cfg = json.load(f)
 except FileNotFoundError:
     cfg = {}
+except json.JSONDecodeError as e:
+    # .jsonc invites comments/trailing commas; this installer only speaks
+    # strict JSON (round 13 review, live-verified: any existing comment in
+    # the file crashes here with a raw traceback and set -e then aborts the
+    # whole script, including the pip/npm installs already done above it).
+    print(f"ERROR: {config_path} is not valid JSON ({e}). If it has comments "
+          "or trailing commas, this installer can't merge into it "
+          "automatically — add this to its \"plugins\" array by hand:\n"
+          f'  {{"package": {json.dumps(plugin_pkg)}, '
+          f'"options": {{"logFile": {json.dumps(log_file)}}}}}',
+          file=sys.stderr)
+    sys.exit(1)
 plugins = cfg.get("plugins", [])
 plugins = [p for p in plugins if not (
     (isinstance(p, dict) and "jev-decision-gate" in str(p.get("package", ""))) or

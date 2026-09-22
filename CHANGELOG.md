@@ -7,6 +7,38 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`spawnGate`'s `cancel()` had no SIGKILL backstop, unlike the timeout
+  path a few lines above it in the same function — a child that ignores
+  or misses SIGTERM leaked forever.** Found by a 13th adversarial review
+  round, live-verified: a child process that installs its own SIGTERM
+  handler stayed alive at least 8s after `cancel()` (called from
+  `handleOne` when `objectiveFor` detects the session ended mid-flight)
+  with nothing left anywhere to retry killing it — every other exit path
+  in `spawnGate` already had this backstop except this one. Fixed by
+  giving `cancel()` the same 2s SIGKILL escalation the timeout path uses.
+  New regression test spawns a real SIGTERM-ignoring child and confirms
+  it's dead within the backstop window; fails pre-fix (still alive at
+  8.5s), passes post-fix (~2.5s). 39 TS tests now (was 38).
+- **`install.sh`/`uninstall.sh` crashed with a raw Python traceback if
+  `opencode.jsonc` already had comments or trailing commas** — the exact
+  case that extension's own name invites, and the one real reason to use
+  `.jsonc` over `.json`. `set -euo pipefail` then aborted the whole
+  script: for `install.sh`, after the pip/npm installs had already run;
+  for `uninstall.sh`, after the `.bak` backup was made but before
+  anything else (log purge, pip uninstall) could run, with no indication
+  to the user whether the plugin was actually removed. Fixed by catching
+  `json.JSONDecodeError` specifically and printing a clear, actionable
+  message (the exact block to add/remove by hand) instead of a bare
+  traceback — this doesn't attempt to parse JSONC, which would risk
+  silently mis-editing a config with comments the user cares about; it
+  fails cleanly instead. New regression test for `uninstall.sh` (real
+  subprocess, no side effects); `install.sh`'s identical fix was verified
+  manually rather than by an automated test, since it also runs a real
+  `pip install`/`npm install` first — not something to trigger from every
+  `pytest` run. 60 Python tests now (was 59, new file
+  `tests/test_uninstall_sh.py`).
+
+### Fixed
 - **The on-disk reply-marker directory (`.jev-gate-replied/`) was only
   pruned once, at `setup()` startup — a long-running opencode host
   process (days/weeks, `setup()` never re-invoked) accumulated one marker

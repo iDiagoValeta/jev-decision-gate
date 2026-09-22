@@ -25,7 +25,20 @@ for cfg in "${targets[@]}"; do
 import json, sys
 p = sys.argv[1]
 with open(p) as f:
-    cfg = json.load(f)
+    try:
+        cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        # .jsonc invites comments/trailing commas; this uninstaller only
+        # speaks strict JSON (round 13 review, live-verified). The backup
+        # at p + ".bak" above is untouched and safe — nothing has been
+        # written back yet.
+        print(f"ERROR: {p} is not valid JSON ({e}). If it has comments or "
+              "trailing commas, this uninstaller can't edit it "
+              "automatically — remove the jev-decision-gate entry from "
+              f"its \"plugins\" array by hand ({p}.bak is an untouched "
+              "backup, safe to delete once you're done).",
+              file=sys.stderr)
+        sys.exit(1)
 before = len(cfg.get("plugins", []))
 cfg["plugins"] = [x for x in cfg.get("plugins", [])
                   if "jev-decision-gate" not in json.dumps(x)]
