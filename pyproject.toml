@@ -1,6 +1,6 @@
 [project]
 name = "jev-decision-gate"
-version = "0.2.0"
+version = "0.3.0"
 description = "Jev (TypeSafe AI) as the permission gate for OpenCode"
 readme = "README.md"
 license = { text = "MIT" }
