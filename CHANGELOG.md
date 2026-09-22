@@ -7,6 +7,40 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **`listPendingForms` and `postApiReply` had the same missing-SIGKILL-backstop
+  gap round 13 fixed in `spawnGate` — that audit only covered `spawnGate`
+  itself.** Found by a 14th adversarial review round, live-verified: a
+  hung `opencode` CLI that ignores SIGTERM leaked indefinitely through
+  both call sites. `listPendingForms` runs on every 750ms poll tick with
+  no backpressure, so a single hang leaks one orphaned process per tick;
+  `postApiReply` backs every permission/form reply. Fixed by giving both
+  the same 2s SIGKILL escalation `spawnGate` already has. New regression
+  test (`listPendingForms`, whose 5s timeout is faster to exercise than
+  `postApiReply`'s 10s) spawns a real SIGTERM-ignoring child and confirms
+  it's dead within the backstop window; `postApiReply`'s identical fix
+  was verified manually.
+- **The event-stream form path (`form.created`/`question.*.asked`) could
+  silently and permanently drop a form whose id lived only at the outer
+  event payload, not inside the nested form object.** Same round.
+  `handleFormAsked` re-derives its own `formID` from the object it's
+  handed (`.id` alone, no further fallback), but the event-stream path
+  already falls back to the outer payload's `.id` for its own `formSeen`
+  tracking (`fid = form.id ?? payload.id`) — it just never carried that
+  resolution into the object passed to `handleFormAsked`. A form shaped
+  that way hit `handleFormAsked`'s own missing-ids early return: nothing
+  ever got claimed on disk (`claimReply` never ran), while `formSeen` was
+  already marked, permanently foreclosing the poll path's own retry for a
+  form nothing had actually processed. Fixed by handing `handleFormAsked`
+  a form object whose `.id` already matches the resolved `fid`. Also
+  mirrored the poll path's own `formSeen` cleanup-on-failure in the
+  event-stream path's catch, for consistency (a narrower, mostly
+  defensive fix on its own — `handleFormAsked`'s internal fail-open catch
+  swallows nearly every other failure without rejecting, so this rarely
+  fires today, but nothing currently guarantees it never will).
+  Both new regression tests fail against the pre-fix code and pass
+  against the fix. 41 TS tests now (was 39).
+
+### Fixed
 - **`spawnGate`'s `cancel()` had no SIGKILL backstop, unlike the timeout
   path a few lines above it in the same function — a child that ignores
   or misses SIGTERM leaked forever.** Found by a 13th adversarial review
