@@ -696,9 +696,9 @@ function runGate(options: Record<string, unknown>, event: Record<string, unknown
 
 type ConversationTurn = { role: "user" | "assistant"; text: string }
 
-function textOfMessage(message: unknown): ConversationTurn | null {
+export function textOfMessage(message: unknown): ConversationTurn | null {
   if (!message || typeof message !== "object") return null
-  const msg = message as { type?: unknown; role?: unknown; text?: unknown; parts?: unknown }
+  const msg = message as { type?: unknown; role?: unknown; text?: unknown; parts?: unknown; content?: unknown }
   // v2 shape: { type: "user"|"assistant", text: "..." }. Legacy shape:
   // { role: "user"|"assistant", parts: [{ text }] }.
   const role = msg.type === "user" || msg.role === "user"
@@ -708,6 +708,23 @@ function textOfMessage(message: unknown): ConversationTurn | null {
       : null
   if (role === null) return null
   if (typeof msg.text === "string" && msg.text.trim()) return { role, text: msg.text }
+  // Real assistant-message shape (round 15 review, confirmed against the
+  // installed @opencode/client types, not just observed behavior):
+  // SessionMessageAssistant has neither .text nor .parts at all — its text
+  // lives in content[].text for "text"/"reasoning" items ("tool" items
+  // have no plain text and are skipped, same reasoning as the .parts
+  // branch below). Without this, every assistant turn silently vanished
+  // from what Jev is shown, despite the surrounding code's own comment
+  // that OBJECTIVE should reflect "what the agent has been doing, not
+  // just the human's last message."
+  if (Array.isArray(msg.content)) {
+    const text = msg.content
+      .filter((p): p is { type?: unknown; text?: unknown } => !!p && typeof p === "object")
+      .filter((p) => (p.type === "text" || p.type === "reasoning") && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join("\n")
+    if (text.trim()) return { role, text }
+  }
   if (Array.isArray(msg.parts)) {
     // Only plain text parts (thinking/response). Tool-call parts have no
     // `.text` field and are skipped, keeping this cheap even for turns
