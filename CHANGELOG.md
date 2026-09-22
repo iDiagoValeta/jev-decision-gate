@@ -6,6 +6,19 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-22
+
+15 rounds of adversarial review since 0.2.0, alternating live-execution
+security review with correctness/reliability review, each round finding
+and fixing real bugs until round 16 came back clean. Highlights: a
+process-crash bug that took down the whole opencode host on the first
+fail-open alert on a headless machine, two ReDoS bugs that could freeze
+the host for tens of seconds on realistic input, several subprocess leaks
+(missing SIGKILL backstops), and a signal-quality bug confirmed against
+the real installed SDK types where Jev had never once seen what the agent
+itself said or reasoned, only the human's messages — present since this
+project's inception. Full details in the entries below.
+
 ### Fixed
 - **`textOfMessage` never extracted text from assistant messages — every
   turn the agent itself said or reasoned silently vanished from OBJECTIVE,
