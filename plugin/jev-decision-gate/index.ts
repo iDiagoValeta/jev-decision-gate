@@ -186,15 +186,23 @@ function apiKeyOf(options: Record<string, unknown>): string {
 
 // Was 15000 until a production log showed p99=9295ms and max=13140ms for
 // successful calls (spawn-to-decision, 669 samples) even WITHOUT
-// concurrent load — under a handful of simultaneous sessions each
-// spawning their own `python3 -m jev_gate.cli` process (no pooling/
-// reuse), interpreter-startup contention pushed 11 real calls past the
-// 15s cliff into "gate timeout" fail-opens, each one silently stalling
-// its session with no self-heal (live-verified: two clusters,
-// 18:45:44-18:45:59 and 19:13:44-19:16:53,
-// matching exactly the concurrent-session windows in the same log).
-// 25000 gives ~2.7x headroom over that p99 while staying under the
-// existing 30000 hard cap.
+// concurrent load, and 11 real "gate timeout" fail-opens clustered
+// exactly in two windows (18:45:44-18:45:59 and 19:13:44-19:16:53) that
+// matched several concurrent opencode sessions — each fail-open silently
+// stalled its session with no self-heal. The *mechanism* is still open:
+// a follow-up controlled load test (80 concurrent `python3 -m
+// jev_gate.cli` calls, isolated from the opencode service) completed in
+// under 2.5s with zero errors, which rules out interpreter-spawn/CPU
+// contention among gate subprocesses as the cause — an earlier version
+// of this comment claimed that mechanism and was wrong to state it as
+// settled. The more likely explanation is the sequential event-loop
+// (see docs/ARCHITECTURE.md, "documented as an accepted limitation")
+// queueing several sessions' permissions behind one another, or
+// upstream API-side latency under real multi-session load that a
+// synthetic single-machine test doesn't reproduce — neither is
+// confirmed. Whatever the mechanism, more headroom is a safe mitigation
+// either way: 25000 gives ~2.7x over the observed p99 while staying
+// under the existing 30000 hard cap.
 export const DEFAULT_GATE_TIMEOUT_MS = 25000
 
 export function timeoutMsOf(options: Record<string, unknown>): number {
