@@ -5,7 +5,6 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import JevGate, {
-  alertHuman,
   capped,
   claimReply,
   handleOne,
@@ -426,33 +425,13 @@ test("looksLikeSessionGone: genuine session-gone phrasing still matches", () => 
   }
 })
 
-test("alertHuman: does not crash the host process when notify-send/zenity are missing (round 6 finding: spawn()'s async ENOENT is only reported via an 'error' event, which is fatal to the whole process when unhandled — this is the escalation path for nearly every fail-open/ask-human outcome, so the whole opencode host used to die on the first alert on a headless machine)", () => {
-  // Must run in a real child process: if the bug regressed, calling
-  // alertHuman() in-process would crash this entire test file, not just
-  // fail one assertion.
-  const emptyBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-no-notify-bin-"))
-  const nodeDir = path.dirname(process.execPath)
-  const script = `
-    const mod = await import(${JSON.stringify(path.join(import.meta.dirname, "index.js"))});
-    mod.alertHuman("t", "b");
-    await new Promise((r) => setTimeout(r, 300));
-    process.exit(0);
-  `
-  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, PATH: `${nodeDir}${path.delimiter}${emptyBinDir}` },
-    timeout: 5000,
-  })
-  fs.rmSync(emptyBinDir, { recursive: true, force: true })
-  assert.equal(result.status, 0, `child process should exit 0, got status=${result.status}, stderr=${result.stderr}`)
-})
-
 test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesafeKey) fails open with a log entry, not a silent blackhole (round 10 finding)", async () => {
   // spawnGate's spawn() call throws SYNCHRONOUSLY, not via a rejected
   // promise, on an invalid env value. It used to sit outside handleOne's
-  // own try block, so the throw skipped every log()/alertHuman() call in
-  // this function and was only caught by setup()'s bare event-loop catch
-  // — no log, no alert, and a false repliedOk:true that blocked any
-  // future retry for the same requestID.
+  // own try block, so the throw skipped every log() call in this function
+  // and was only caught by setup()'s bare event-loop catch — no log, and
+  // a false repliedOk:true that blocked any future retry for the same
+  // requestID.
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-handleone-"))
   try {
     const logs: Record<string, unknown>[] = []
@@ -917,6 +896,33 @@ test("handleOne: error_detail from the python gate's JSON is logged alongside er
     assert.equal(logs[0]?.error_class, "transport")
     assert.equal(logs[0]?.error_detail, "Connection reset by peer")
   } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("handleOne: a fail-open never spawns notify-send/zenity — the desktop-popup feature was removed, not just defaulted off", async () => {
+  // Regression guard for the removal itself, at the real integration
+  // point (handleOne's catch-all fail-open), not just "the deleted
+  // function doesn't exist". If a future change reintroduces a desktop
+  // alert on this path, this test's marker files start appearing again.
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-no-popup-"))
+  const marker = path.join(binDir, "called.marker")
+  for (const name of ["notify-send", "zenity"]) {
+    fs.writeFileSync(path.join(binDir, name), `#!/bin/sh\necho "$0" >> ${JSON.stringify(marker)}\n`, { mode: 0o755 })
+  }
+  const origPath = process.env.PATH
+  process.env.PATH = `${binDir}${path.delimiter}${origPath ?? ""}`
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-no-popup-gate-"))
+  try {
+    const ctx = { session: { get: async () => ({}), context: async () => [] } }
+    // A missing/invalid pythonBin forces handleOne's outer catch (fail-open).
+    const out = await handleOne(ctx, () => {}, "inst1", { gateDir, pythonBin: "/nonexistent/python3" }, "sess1", "req1", "bash", ["echo hi"], new Set())
+    assert.equal(out.decision, "ask-human")
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(fs.existsSync(marker), false, "no desktop alert must fire on fail-open")
+  } finally {
+    process.env.PATH = origPath
+    fs.rmSync(binDir, { recursive: true, force: true })
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
 })

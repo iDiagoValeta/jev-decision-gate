@@ -6,6 +6,57 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+- **The desktop popup (`notify-send`/`zenity`) on ask-human/fail-open is
+  gone.** Live-verified as actively disruptive during an extended
+  concurrent-load session (several opencode sessions on one host hitting
+  the gate at once, each `gate timeout`/`transport` fail-open spawning
+  its own unattended dialog with no one there to click it — 9 stacked
+  `zenity` windows observed at once). Removed `alertHuman()` and every
+  call site rather than just defaulting a toggle off, per explicit
+  request. Every delegation is still fully recorded in the JSONL log
+  (`gateAction`, `reason`, `error_class`, `error_detail` — see below);
+  that log is now the only signal.
+
+### Fixed
+- **`scripts/measure.py` counted `duplicate-suppressed` rows as real
+  ask-human decisions.** `setup()` runs twice per opencode process (an
+  opencode quirk, already mitigated at the decision level via
+  `claimReply`): every real permission is logged once for real and once
+  as a `duplicate-suppressed` no-op that never called Jev. `measure.py`
+  grouped by `gateAction` alone, with no `reason` filter, so it counted
+  both — live-verified against a production log: 418/849 rows were the
+  no-op vs 10 genuine ask-human, reporting a false ~50% ask-human rate
+  where the true rate was ~1%. Now excluded from `total`/`actions`/
+  `allow_rate`/`by_session` and reported separately as
+  `duplicates_suppressed`.
+- **Default gate timeout (15s) had no real margin under concurrent
+  load.** A production log of 669 successful calls showed p99=9295ms,
+  max=13140ms even without contention — every permission spawns a fresh
+  `python3 -m jev_gate.cli` process (no pooling), so a handful of
+  simultaneous sessions pushed 11 real calls past the cliff into
+  `gate timeout` fail-opens. Raised to 25000ms (still clamped to
+  1000–30000 via `timeoutMs`/`JEV_GATE_TIMEOUT_MS`).
+- **`error_class` alone ("transport", "exception", ...) gave no way to
+  diagnose a fail-open without reproducing it live.** `decide_event` now
+  also returns `error_detail` (redacted, capped at 200 chars) alongside
+  `error_class`; both the standalone CLI log path and the
+  plugin-spawned path (`index.ts`, permission and form-answer sites)
+  record it.
+
+### Added
+- **Personal/project notes Jev weighs as context.** Two optional
+  plain-text sources, read fresh on every decision: a global file
+  (`$XDG_CONFIG_HOME/jev-gate/notes.md`, falling back to
+  `~/.config/jev-gate/notes.md`) for preferences across every project,
+  and a per-project file (`.jev-notes.md` at `JEV_GATE_DIR` —
+  gitignored, never committed, so a malicious PR can't smuggle in fake
+  "always allow" notes). Shown to Jev as a `USER-NOTES` section when
+  either is non-empty; this is evidence, exactly like `OBJECTIVE` —
+  never a rule engine. It cannot force an allow, and nothing here runs
+  before or instead of Jev: the catastrophic kill-list and the
+  ask-human/fail-open defaults are unchanged.
+
 ## [0.3.0] - 2026-09-22
 
 15 rounds of adversarial review since 0.2.0, alternating live-execution
