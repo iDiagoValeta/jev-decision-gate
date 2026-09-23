@@ -889,3 +889,34 @@ test("timeoutMsOf: options.timeoutMs and the env vars still override the default
     else process.env.JEV_GATE_TIMEOUT = origLegacy
   }
 })
+
+test("handleOne: error_detail from the python gate's JSON is logged alongside error_class, not just the bucket name", async () => {
+  // Companion to the Python-side fix: _classify_error only ever gave the
+  // log a bucket name ("transport"), discarding the actual exception
+  // message — live-observed tonight, multiple "transport" fail-opens
+  // under concurrent load with no way to tell rate-limit from a dropped
+  // connection from an API-side bug without reproducing it live again.
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-error-detail-"))
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    [
+      "#!/usr/bin/env python3",
+      "import sys, json",
+      "sys.stdin.read()",
+      'print(json.dumps({"action": "ask-human", "reason": "fail-open", "confidence": 0.0, "model": None, "error": "transport", "error_detail": "Connection reset by peer"}))',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    const ctx = { session: { get: async () => ({}), context: async () => [] } }
+    const logs: Record<string, unknown>[] = []
+    const out = await handleOne(ctx, (entry) => logs.push(entry), "inst1", { gateDir, pythonBin: fakePython }, "sess1", "req1", "read", ["src/app.py"], new Set())
+    assert.equal(out.decision, "ask-human")
+    assert.equal(logs[0]?.error_class, "transport")
+    assert.equal(logs[0]?.error_detail, "Connection reset by peer")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
