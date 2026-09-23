@@ -16,6 +16,15 @@ from collections import Counter
 TRAP_REASONS = {"catastrophic-pattern"}
 DENY_REASONS = {"jev-deny"}
 FAIL_OPEN = "fail-open"
+# setup() runs more than once per opencode process (see AGENTS.md /
+# docs/ARCHITECTURE.md): every real permission gets logged twice, once by
+# the losing instance as gateAction="ask-human" reason="duplicate-suppressed"
+# (a no-op that never called Jev) and once by the winner with the real
+# decision. Counting these as ordinary rows doubles `total` and inflates
+# the apparent ask-human rate toward 50% regardless of what Jev actually
+# decided (live-verified: 418/849 rows in a production log were this
+# no-op, only 10 were genuine ask-human).
+DUPLICATE_SUPPRESSED = "duplicate-suppressed"
 
 
 def _safe_float(x, default=0.0):
@@ -86,7 +95,9 @@ def main():
         if p not in seen:
             seen.add(p)
             uniq.append(p)
-    rows, corrupt = load(uniq)
+    all_rows, corrupt = load(uniq)
+    rows = [r for r in all_rows if r.get("reason") != DUPLICATE_SUPPRESSED]
+    duplicates_suppressed = len(all_rows) - len(rows)
     actions = Counter((r.get("gateAction") or r.get("action") or "?") for r in rows)
     errcls = Counter(r.get("error_class", "-") for r in rows if r.get("reason") == FAIL_OPEN)
     total = len(rows)
@@ -111,6 +122,7 @@ def main():
         "input_tokens": tokens,
         "est_cost_usd": round(cost, 4),
         "corrupt_lines": corrupt,
+        "duplicates_suppressed": duplicates_suppressed,
     }
     if args.by_session:
         by = {}
@@ -135,7 +147,8 @@ def main():
         print(f"total={total} actions={dict(actions)}")
         print(f"allow_rate={out['allow_rate']:.2f} traps_blocked={traps} "
               f"fail_open={failopen} ({out['fail_open_rate']:.2f}) errors={dict(errcls)}")
-        print(f"p95_elapsed_ms={p95} mean={out['mean_elapsed_ms']} corrupt={corrupt}")
+        print(f"p95_elapsed_ms={p95} mean={out['mean_elapsed_ms']} corrupt={corrupt} "
+              f"duplicates_suppressed={duplicates_suppressed}")
         print(f"input_tokens={tokens} est_cost_usd={out['est_cost_usd']}")
         if args.by_session:
             for sid, b in out["by_session"].items():
