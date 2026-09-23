@@ -266,6 +266,63 @@ def test_main_logs_error_class_on_fail_open(tmp_path, monkeypatch):
     assert row["error_class"] == "exception"
 
 
+def test_main_logs_error_detail_alongside_error_class_on_fail_open(tmp_path, monkeypatch):
+    # Live-observed tonight: "transport" fail-opens under heavy concurrent
+    # load (several opencode sessions hitting Jev at once) with no way to
+    # tell rate-limit from a dropped connection from an API-side bug,
+    # because _classify_error's bucket name is all the log ever kept —
+    # the actual exception message client.py's JevCallError wraps was
+    # discarded before it reached the log. error_class alone answers "did
+    # it fail", error_detail is what makes a repeat diagnosable without
+    # reproducing it live again.
+    import io
+    import json
+
+    import jev_gate.cli as cli_mod
+    from jev_gate.cli import main
+
+    def bad(state, questions, api_key, model):
+        raise RuntimeError("Connection reset by peer while calling TypeSafe API")
+
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("JEV_GATE_LOG", str(log))
+    monkeypatch.setenv("TYPESAFE_API_KEY", "x")
+    monkeypatch.setattr(cli_mod.client_mod, "evaluate", bad)
+    event = {"objective": "o", "halt": {"kind": "read", "tool": "read", "detail": "Read f"},
+             "context": {}, "policy": {}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    main()
+    row = json.loads(log.read_text().strip())
+    assert row["error_class"] == "exception"
+    assert row["error_detail"] == "Connection reset by peer while calling TypeSafe API"
+
+
+def test_error_detail_is_redacted_and_capped(tmp_path, monkeypatch):
+    import io
+    import json
+
+    import jev_gate.cli as cli_mod
+    from jev_gate.cli import main
+
+    def bad(state, questions, api_key, model):
+        raise RuntimeError("token=s3cr3tvalue1234 " + "x" * 300)
+
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("JEV_GATE_LOG", str(log))
+    monkeypatch.setenv("TYPESAFE_API_KEY", "x")
+    monkeypatch.setattr(cli_mod.client_mod, "evaluate", bad)
+    event = {"objective": "o", "halt": {"kind": "read", "tool": "read", "detail": "Read f"},
+             "context": {}, "policy": {}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event)))
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+    main()
+    row = json.loads(log.read_text().strip())
+    assert "s3cr3tvalue1234" not in row["error_detail"]
+    assert "[REDACTED]" in row["error_detail"]
+    assert len(row["error_detail"]) <= 200
+
+
 def test_cli_log_schema_v2(tmp_path, monkeypatch):
     import json
 

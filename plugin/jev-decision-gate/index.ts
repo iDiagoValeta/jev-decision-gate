@@ -1165,6 +1165,7 @@ async function handleFormAsked(
         optionsCount: labels.length,
         fieldKey: key,
         ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
+        ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
         phase: "form-answer",
       })
 
@@ -1390,6 +1391,7 @@ export async function handleOne(
       hasKey: apiKeyOf(options) !== "",
       resKinds,
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
     })
     let repliedOk = true
     if (decision.action === "allow" || decision.action === "deny") {

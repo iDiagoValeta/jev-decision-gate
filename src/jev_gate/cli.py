@@ -72,8 +72,10 @@ def decide_event(event, evaluate_fn, _error_box=None):
             out["usage"] = result["usage"]
         return out
     except Exception as exc:
+        detail = schemas_mod.redact_secrets(str(exc))[:200]
         if _error_box is not None:
             _error_box["error_class"] = _classify_error(exc)
+            _error_box["error_detail"] = detail
         return {
             "action": "ask-human",
             "reason": "fail-open",
@@ -81,6 +83,7 @@ def decide_event(event, evaluate_fn, _error_box=None):
             "confidence": 0.0,
             "model": None,
             "error": _classify_error(exc),
+            "error_detail": detail,
         }
 
 
@@ -137,6 +140,8 @@ def _write_log_entry(event, out, error_box):
                 entry["usage"] = out["usage"]
             if out.get("reason") == "fail-open" and error_box.get("error_class"):
                 entry["error_class"] = error_box["error_class"]
+                if error_box.get("error_detail"):
+                    entry["error_detail"] = error_box["error_detail"]
             handle.write(json.dumps(entry) + "\n")
         _chmod_600(log_path)
     except Exception:

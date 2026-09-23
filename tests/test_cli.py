@@ -40,6 +40,7 @@ def test_decide_event_fail_open_on_error():
         "confidence": 0.0,
         "model": None,
         "error": "exception",
+        "error_detail": "down",
     }
 
 
