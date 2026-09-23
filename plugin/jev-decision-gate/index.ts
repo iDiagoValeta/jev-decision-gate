@@ -739,6 +739,59 @@ export function textOfMessage(message: unknown): ConversationTurn | null {
   return null
 }
 
+// permission.asked's optional `source` ({type:"tool", messageID, id}):
+// points back at the exact tool-call part that triggered this permission.
+export type PermissionSource = { messageID: string; id: string }
+
+// The "subagent" permission action (opencode 2.0.11; docs still call it
+// "task") carries only the target agent's short name in `resources` —
+// live-verified: `resKinds` was consistently "text:7ch", the exact length
+// of "general", for every subagent dispatch observed, never the dispatch's
+// `description`/`prompt`. Jev then evaluates a "write" action whose only
+// evidence is a 7-character agent slug, with `objectiveFor` unable to fill
+// the gap since it deliberately excludes tool-call payloads (see
+// `textOfMessage`) — the actual dispatch prompt lives nowhere Jev can see
+// it, so it defaults to low-confidence deny nearly every time (0.06-0.26
+// confidence across a live run of 6 parallel subagent dispatches, all
+// denied). `source` lets us pull the real dispatch content (agent/
+// description/prompt) from the same session-context RPC `objectiveFor`
+// already makes, so Jev can judge what the subagent will actually do
+// instead of just its target agent type. Fails open to the original
+// (thin) resources on any lookup failure — this only ever adds evidence,
+// never removes the existing fail-open path.
+export async function subagentDetailFor(
+  ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+  source: PermissionSource | null | undefined,
+): Promise<string | null> {
+  if (!source?.messageID || !source?.id) return null
+  try {
+    const messages = await ctx.session.context({ sessionID })
+    const list = Array.isArray(messages) ? messages : []
+    const message = list.find(
+      (m): m is { content?: unknown } =>
+        !!m && typeof m === "object" && (m as { id?: unknown }).id === source.messageID,
+    )
+    const content = Array.isArray((message as { content?: unknown } | undefined)?.content)
+      ? ((message as { content: unknown[] }).content)
+      : []
+    const call = content.find(
+      (c): c is { state?: unknown } => !!c && typeof c === "object" && (c as { id?: unknown }).id === source.id,
+    )
+    const input = (call as { state?: { input?: unknown } } | undefined)?.state?.input
+    if (!input || typeof input !== "object") return null
+    const { agent, description, prompt } = input as Record<string, unknown>
+    const parts = [
+      typeof agent === "string" && agent ? `agent: ${agent}` : "",
+      typeof description === "string" && description ? `description: ${description}` : "",
+      typeof prompt === "string" && prompt ? `prompt: ${prompt}` : "",
+    ].filter(Boolean)
+    return parts.length ? parts.join("\n") : null
+  } catch {
+    return null
+  }
+}
+
 class SessionEndedError extends Error {
   constructor(message = "session-ended") {
     super(message)
@@ -939,6 +992,13 @@ export default Plugin.define({
         const resources = Array.isArray((data as { resources?: unknown }).resources)
           ? ((data as { resources: unknown[] }).resources.map(String))
           : []
+        const source = ((): PermissionSource | null => {
+          const s = (data as { source?: unknown }).source
+          if (!s || typeof s !== "object") return null
+          const messageID = (s as { messageID?: unknown }).messageID
+          const id = (s as { id?: unknown }).id
+          return typeof messageID === "string" && typeof id === "string" ? { messageID, id } : null
+        })()
         if (!sessionID || !requestID) {
           logEv({
             sessionID: sessionID || null,
@@ -984,7 +1044,7 @@ export default Plugin.define({
           continue
         }
 
-        const task = handleOne(ctx, logEv, inst, options, sessionID, requestID, action, resources, endedSessions)
+        const task = handleOne(ctx, logEv, inst, options, sessionID, requestID, action, resources, endedSessions, source)
         inFlight.set(requestID, task)
         try {
           const outcome = await task
@@ -1161,6 +1221,7 @@ export async function handleOne(
   action: string,
   resources: string[],
   endedSessions: Set<string>,
+  source?: PermissionSource | null,
 ): Promise<{ decision: string; repliedOk: boolean }> {
   // From permission.asked to whenever we attempt (or give up on) a reply —
   // used to diagnose the reply-vs-server-window race (issue #15), not just
@@ -1180,8 +1241,8 @@ export async function handleOne(
     return { decision: "ask-human", repliedOk: true }
   }
 
-  const joined = resources.join("\n")
-  const resKinds = resourceKinds(resources)
+  let joined = resources.join("\n")
+  let resKinds = resourceKinds(resources)
   if (isCatastrophic(joined)) {
     log({ sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
     let repliedOk = true
@@ -1231,6 +1292,21 @@ export async function handleOne(
       repliedOk,
     })
     return { decision: "allow", repliedOk }
+  }
+
+  // The subagent/task permission's own `resources` is just the target
+  // agent's short name (see subagentDetailFor's comment) — pull the real
+  // dispatch content (agent/description/prompt) so kindFor and Jev both
+  // see what the subagent will actually do, not just its agent type.
+  // Never throws (subagentDetailFor fails open to null internally), so
+  // this can't turn into a new fail-open path of its own.
+  if (action === "subagent" || action === "task") {
+    const enriched = await subagentDetailFor(ctx, sessionID, source)
+    if (enriched) {
+      resources = [enriched]
+      joined = enriched
+      resKinds = resourceKinds(resources)
+    }
   }
 
   const kind = kindFor(action, resources)
