@@ -128,3 +128,81 @@ def test_build_objective_block_neutralizes_a_forged_fence_inside_untrusted_conte
     # Only the two genuine, function-emitted closers (one per fenced
     # section: OBJECTIVE and HALT.detail) keep the real "deadbeef>>>" text.
     assert brief.count("deadbeef>>>") == 2
+
+
+def test_build_objective_block_omits_user_notes_section_when_empty():
+    from jev_gate.schemas import build_objective_block
+    halt = {"kind": "read", "tool": "read", "detail": "Read src/app.py"}
+    assert "USER-NOTES" not in build_objective_block("do the task", halt)
+    assert "USER-NOTES" not in build_objective_block("do the task", halt, user_notes=None)
+    assert "USER-NOTES" not in build_objective_block("do the task", halt, user_notes={"global": "", "project": ""})
+
+
+def test_build_objective_block_adds_user_notes_section_when_present():
+    from jev_gate.schemas import build_objective_block
+    halt = {"kind": "write", "tool": "edit", "detail": "edit src/app.py"}
+    notes = {"global": "I trust read-only exploration completely.", "project": "This repo is a sandbox."}
+    brief = build_objective_block("do the task", halt, user_notes=notes)
+    assert "USER-NOTES" in brief
+    assert "[global] I trust read-only exploration completely." in brief
+    assert "[project] This repo is a sandbox." in brief
+    # Evidence, not a veto: the section must not read as a command Jev has
+    # to obey, matching decision.py's "Jev decides, no thresholds" and the
+    # catastrophic kill-list running before Jev is ever called.
+    assert "do not treat as a blanket override" in brief
+
+
+def test_build_objective_block_only_includes_the_non_empty_notes_source():
+    from jev_gate.schemas import build_objective_block
+    halt = {"kind": "read", "tool": "read", "detail": "Read src/app.py"}
+    brief = build_objective_block("do the task", halt, user_notes={"global": "Be conservative with secrets.", "project": ""})
+    assert "[global] Be conservative with secrets." in brief
+    assert "[project]" not in brief
+
+
+def test_build_objective_block_redacts_and_caps_user_notes():
+    from jev_gate.schemas import build_objective_block
+    halt = {"kind": "read", "tool": "read", "detail": "Read src/app.py"}
+    notes = {"global": "my token=" + "s3cr3t" * 5, "project": "q" * 5000}
+    brief = build_objective_block("do the task", halt, user_notes=notes)
+    assert "s3cr3t" not in brief
+    assert "[REDACTED]" in brief
+    assert brief.count("q") == 2000
+
+
+def test_load_user_notes_reads_global_and_project_files(tmp_path):
+    from jev_gate.schemas import load_user_notes
+    home = tmp_path / "home"
+    (home / ".config" / "jev-gate").mkdir(parents=True)
+    (home / ".config" / "jev-gate" / "notes.md").write_text("prefer caution on auth code")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".jev-notes.md").write_text("this repo is a throwaway sandbox")
+    notes = load_user_notes({"HOME": str(home), "JEV_GATE_DIR": str(project)})
+    assert notes == {"global": "prefer caution on auth code", "project": "this repo is a throwaway sandbox"}
+
+
+def test_load_user_notes_returns_empty_strings_when_nothing_configured(tmp_path):
+    from jev_gate.schemas import load_user_notes
+    notes = load_user_notes({"HOME": str(tmp_path / "no-home"), "JEV_GATE_DIR": str(tmp_path / "no-project")})
+    assert notes == {"global": "", "project": ""}
+
+
+def test_load_user_notes_is_safe_when_the_notes_path_is_a_directory(tmp_path):
+    # Defensive: a stray directory at the expected file path (e.g. a typo
+    # during setup) must degrade to "no notes", not crash the whole gate —
+    # same fail-open spirit as every other I/O boundary in this file.
+    from jev_gate.schemas import load_user_notes
+    home = tmp_path / "home"
+    (home / ".config" / "jev-gate" / "notes.md").mkdir(parents=True)
+    notes = load_user_notes({"HOME": str(home), "JEV_GATE_DIR": str(tmp_path / "no-project")})
+    assert notes == {"global": "", "project": ""}
+
+
+def test_load_user_notes_respects_xdg_config_home(tmp_path):
+    from jev_gate.schemas import load_user_notes
+    xdg = tmp_path / "xdg-config"
+    (xdg / "jev-gate").mkdir(parents=True)
+    (xdg / "jev-gate" / "notes.md").write_text("xdg-scoped preference")
+    notes = load_user_notes({"HOME": str(tmp_path / "unused-home"), "XDG_CONFIG_HOME": str(xdg)})
+    assert notes["global"] == "xdg-scoped preference"

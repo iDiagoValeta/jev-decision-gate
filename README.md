@@ -113,7 +113,27 @@ Jev's brief" for what that fence does and doesn't guarantee.
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
-`detail_sha256`) with no secrets, mode `0600`.
+`detail_sha256`) with no secrets, mode `0600`. `setup()` runs twice per
+opencode process (an opencode quirk, not this plugin's) — every real
+permission is logged once for real and once as `duplicate-suppressed`
+(a no-op that never touched Jev); `scripts/measure.py` already excludes
+those from its rates, but a raw `grep gateAction` over the log will
+double-count them.
+
+### Personal notes for Jev
+
+Give Jev standing context about how you want it to judge, read from two
+optional plain-text files (see `.jev-notes.example.md`): `.jev-notes.md`
+in a project (gitignored — never commit it, see "Layout") for
+project-scoped notes, and `$XDG_CONFIG_HOME/jev-gate/notes.md` (defaults
+to `~/.config/jev-gate/notes.md`) for notes that follow you across every
+project. Both are shown to Jev together when present.
+
+This is evidence in the brief, exactly like OBJECTIVE and RISK-HINTS —
+never a rule engine. It cannot force an allow, and nothing here runs
+before or instead of Jev: the catastrophic kill-list and the
+ask-human/fail-open defaults apply exactly the same regardless of what
+the notes say.
 
 ## Layout
 
