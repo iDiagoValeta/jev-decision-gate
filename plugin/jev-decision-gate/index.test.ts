@@ -17,6 +17,7 @@ import JevGate, {
   normalizeCommand,
   postApiReply,
   redactSecrets,
+  subagentDetailFor,
   textOfMessage,
   valueForPick,
 } from "./index.js"
@@ -719,4 +720,137 @@ test("textOfMessage: still handles the v2 .text shape and the legacy .parts shap
   assert.equal(textOfMessage({ type: "assistant", content: [{ type: "tool", tool: "bash" }] }), null)
   assert.equal(textOfMessage(null), null)
   assert.equal(textOfMessage({ type: "system" }), null)
+})
+
+test("subagentDetailFor: pulls agent/description/prompt from the matching tool-call in session context (regression: subagent's own `resources` is just the agent name, e.g. \"general\", never the dispatch content)", async () => {
+  const ctx = {
+    session: {
+      context: async () => [
+        {
+          id: "msg_1",
+          type: "assistant",
+          content: [
+            {
+              type: "tool",
+              id: "call_1",
+              state: { input: { agent: "general", description: "Auditoría security ciclo 1", prompt: "Eres @agent-security, solo lectura." } },
+            },
+          ],
+        },
+      ],
+    },
+  }
+  const out = await subagentDetailFor(ctx, "sess1", { messageID: "msg_1", id: "call_1" })
+  assert.match(String(out), /agent: general/)
+  assert.match(String(out), /description: Auditoría security ciclo 1/)
+  assert.match(String(out), /prompt: Eres @agent-security, solo lectura\./)
+})
+
+test("subagentDetailFor: fails open to null (caller keeps the original thin resources) when source is missing, nothing matches, or session.context throws", async () => {
+  const empty = { session: { context: async () => [] } }
+  assert.equal(await subagentDetailFor(empty, "sess1", null), null)
+  assert.equal(await subagentDetailFor(empty, "sess1", undefined), null)
+  assert.equal(await subagentDetailFor(empty, "sess1", { messageID: "", id: "" }), null)
+
+  const noMatch = { session: { context: async () => [{ id: "msg_other", content: [] }] } }
+  assert.equal(await subagentDetailFor(noMatch, "sess1", { messageID: "msg_1", id: "call_1" }), null)
+
+  const throws = { session: { context: async () => { throw new Error("Session ses_x not found") } } }
+  assert.equal(await subagentDetailFor(throws, "sess1", { messageID: "msg_1", id: "call_1" }), null)
+})
+
+test("handleOne: subagent dispatch sends Jev the real description/prompt, not just the thin \"general\" agent-name resource (regression: near-blanket low-confidence subagent denial — live-observed resKinds \"text:7ch\", the exact length of \"general\", with no way for Jev to judge what the subagent would actually do)", async () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-subagent-enrich-"))
+  const capturedEventPath = path.join(gateDir, "captured-event.json")
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    [
+      "#!/usr/bin/env python3",
+      "import sys, json",
+      "data = sys.stdin.read()",
+      `open(${JSON.stringify(capturedEventPath)}, "w").write(data)`,
+      'print(json.dumps({"action": "allow", "reason": "test", "confidence": 0.9, "model": "test"}))',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    const ctx = {
+      session: {
+        get: async () => ({}),
+        context: async () => [
+          {
+            id: "msg_1",
+            type: "assistant",
+            content: [
+              {
+                type: "tool",
+                id: "call_1",
+                state: {
+                  input: {
+                    agent: "general",
+                    description: "Auditoría security ciclo 1",
+                    prompt: "Eres @agent-security. Tarea ESTRICTAMENTE read-only: NO edites ni crees archivos.",
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }
+    const logs: Record<string, unknown>[] = []
+    const options = { gateDir, pythonBin: fakePython }
+    const out = await handleOne(
+      ctx,
+      (entry) => logs.push(entry),
+      "inst1",
+      options,
+      "sess1",
+      "req1",
+      "subagent",
+      ["general"],
+      new Set(),
+      { messageID: "msg_1", id: "call_1" },
+    )
+    assert.equal(out.decision, "allow")
+    const sent = JSON.parse(fs.readFileSync(capturedEventPath, "utf8"))
+    assert.match(sent.halt.detail, /Auditoría security ciclo 1/)
+    assert.match(sent.halt.detail, /read-only/)
+    // The gate log must reflect what was actually evaluated, not the
+    // original 7-char "general" resource it would otherwise show.
+    assert.notEqual(logs[0]?.resKinds, "text:7ch")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("handleOne: a subagent permission with no `source` (or a lookup that finds nothing) still evaluates, using the original thin resources — enrichment is additive, never a new failure mode", async () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-subagent-no-source-"))
+  const capturedEventPath = path.join(gateDir, "captured-event.json")
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    [
+      "#!/usr/bin/env python3",
+      "import sys, json",
+      "data = sys.stdin.read()",
+      `open(${JSON.stringify(capturedEventPath)}, "w").write(data)`,
+      'print(json.dumps({"action": "allow", "reason": "test", "confidence": 0.9, "model": "test"}))',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    const ctx = { session: { get: async () => ({}), context: async () => [] } }
+    const logs: Record<string, unknown>[] = []
+    const options = { gateDir, pythonBin: fakePython }
+    const out = await handleOne(ctx, (entry) => logs.push(entry), "inst1", options, "sess1", "req1", "subagent", ["general"], new Set())
+    assert.equal(out.decision, "allow")
+    const sent = JSON.parse(fs.readFileSync(capturedEventPath, "utf8"))
+    assert.equal(sent.halt.detail, "general")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
 })
