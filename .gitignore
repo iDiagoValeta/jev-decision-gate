@@ -15,6 +15,10 @@ coverage/
 htmlcov/
 decisions*.jsonl
 .jev-gate-replied/
+# Personal/project notes for Jev (see load_user_notes in schemas.py) — local
+# only: a malicious PR must never be able to smuggle in fake "always allow"
+# notes by committing this file.
+.jev-notes.md
 
 # Development-process artifacts (iteration logs, scratch plans/specs).
 # Never ship these; see AGENTS.md "Where development artifacts go".

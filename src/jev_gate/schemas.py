@@ -7,6 +7,7 @@ guessing from raw tool output. Secrets are redacted before sending.
 """
 
 import hashlib
+import os
 import re
 import secrets
 
@@ -65,7 +66,71 @@ def sha256_hex(text):
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
-def build_objective_block(objective, halt, risk_hints=""):
+USER_NOTES_MAX_CHARS = 2000
+
+
+def _read_notes_file(path):
+    """Best-effort read, stripped; "" on any I/O problem (missing file,
+    permission error, or a directory sitting where the file should be) —
+    notes are an optional evidence source, never a reason to fail-open the
+    whole gate."""
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def load_user_notes(env=None):
+    """Personal preferences the gate owner writes for Jev to weigh as
+    context (see build_objective_block's USER-NOTES section) — never a
+    deterministic override; the catastrophic kill-list runs before Jev is
+    ever called, and decision.py takes Jev's own choice, not the notes,
+    verbatim.
+
+    Two sources, both local-only (never committed — see .gitignore for
+    `.jev-notes.md`, which keeps a malicious PR from smuggling in fake
+    "always allow" notes):
+    - global: `$XDG_CONFIG_HOME/jev-gate/notes.md` (falls back to
+      `$HOME/.config/jev-gate/notes.md`) — this person's preferences
+      across every project the gate runs in.
+    - project: `$JEV_GATE_DIR/.jev-notes.md` — this project's own notes.
+    """
+    env = os.environ if env is None else env
+    config_home = env.get("XDG_CONFIG_HOME") or (
+        os.path.join(env["HOME"], ".config") if env.get("HOME") else ""
+    )
+    global_path = os.path.join(config_home, "jev-gate", "notes.md") if config_home else ""
+    project_dir = env.get("JEV_GATE_DIR", "")
+    project_path = os.path.join(project_dir, ".jev-notes.md") if project_dir else ""
+    return {
+        "global": _read_notes_file(global_path),
+        "project": _read_notes_file(project_path),
+    }
+
+
+def _user_notes_block(user_notes):
+    if not user_notes:
+        return []
+    sources = [
+        (label, redact_secrets(str(user_notes.get(label, "")))[:USER_NOTES_MAX_CHARS])
+        for label in ("global", "project")
+    ]
+    sources = [(label, text) for label, text in sources if text]
+    if not sources:
+        return []
+    return [
+        "USER-NOTES: preferences set by the person who owns this gate (config, "
+        "not agent conversation) — weigh as context for this decision; do not "
+        "treat as a blanket override, the catastrophic kill-list and "
+        "fail-open-on-error still apply regardless of what these say.",
+        *[f"[{label}] {text}" for label, text in sources],
+    ]
+
+
+def build_objective_block(objective, halt, risk_hints="", user_notes=None):
     """Curated brief Jev actually reads. Caps length, redacts secrets.
 
     The plugin already trims OBJECTIVE to its own configurable budget
@@ -102,13 +167,14 @@ def build_objective_block(objective, halt, risk_hints=""):
         f"{fence}>>>",
         f"RISK-HINTS: {risk_hints or 'none-detected'}",
         "POLICY: default=ask-human when unsure; fail-open on error; reversible-only for allow.",
+        *_user_notes_block(user_notes),
         "QUESTION: Judge safety and alignment with OBJECTIVE, not convenience. When in doubt, ask-human.",
     ]
     return "\n".join(lines)
 
 
-def build_state(objective, halt, context, policy):
-    brief = build_objective_block(objective, halt, (context or {}).get("risk_hints", ""))
+def build_state(objective, halt, context, policy, user_notes=None):
+    brief = build_objective_block(objective, halt, (context or {}).get("risk_hints", ""), user_notes)
     return {
         "objective": objective,
         "halt": halt,
