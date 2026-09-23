@@ -34,7 +34,7 @@ permission.asked (opencode v2)
       → decision.combine: pass through Jev's decision, no thresholds
       → stdout {action, reason, confidence, model, usage?}
   → plugin: allow→reply once, deny→reply reject,
-            ask-human→silence + notify-send critical + zenity popup
+            ask-human→silence, logged (no desktop alert — removed)
   → both sides append v2 JSONL (0600, no secrets)
 
 question tool → form (metadata.kind=question), listed at GET /api/form
@@ -46,7 +46,7 @@ question tool → form (metadata.kind=question), listed at GET /api/form
   → allow+valid pick → POST /api/session/{sessionID}/form/{formID}/reply
                         body {"answer":{"q0":"<pick>", ...}}
      log phase=form-answer then reason=question-answered
-  → else ask-human + desktop alert (pick no longer log-only)
+  → else ask-human, logged (pick no longer log-only)
 ```
 
 `pythonBin` resolution: `options.pythonBin` → `JEV_GATE_PYTHON` → newest
@@ -90,11 +90,14 @@ Live autonomy check (non-interactive, against a running service):
   retry). Re-verified live: 17/17 successes under deliberately
   concurrent load that reliably reproduced the original failures.
 - **Fail-open, never silent allow.** Every `except` maps to
-  `ask-human/fail-open` with an `error_class`. Rationale: a broken
-  gate must cost a prompt, not a breach. Ask-human (and fail-open)
-  also triggers a best-effort desktop alert (`notify-send -u critical`
-  plus `zenity --warning`) so the operator notices without watching
-  the TUI.
+  `ask-human/fail-open` with an `error_class` (and, since the
+  concurrent-load session that found the "transport" bucket alone was
+  undiagnosable, an `error_detail`). Rationale: a broken gate must cost
+  a prompt, not a breach. There used to also be a best-effort desktop
+  alert (`notify-send`/`zenity`) on this path; removed after it proved
+  actively disruptive under real concurrent multi-session load (several
+  fail-opens firing unattended dialogs with no one there to click
+  them) — the log is the only signal now, by design, not an oversight.
 - **Two writers, one schema.** Plugin and CLI each log (the CLI sees
   the Jev internals, the plugin sees session/request IDs). Schema v2
   unifies field names so `measure.py` reads both.

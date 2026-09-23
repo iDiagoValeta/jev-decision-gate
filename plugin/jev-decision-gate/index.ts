@@ -190,8 +190,8 @@ function apiKeyOf(options: Record<string, unknown>): string {
 // spawning their own `python3 -m jev_gate.cli` process (no pooling/
 // reuse), interpreter-startup contention pushed 11 real calls past the
 // 15s cliff into "gate timeout" fail-opens, each one silently stalling
-// its session behind an unattended alertHuman() popup with no self-heal
-// (live-verified: two clusters, 18:45:44-18:45:59 and 19:13:44-19:16:53,
+// its session with no self-heal (live-verified: two clusters,
+// 18:45:44-18:45:59 and 19:13:44-19:16:53,
 // matching exactly the concurrent-session windows in the same log).
 // 25000 gives ~2.7x headroom over that p99 while staying under the
 // existing 30000 hard cap.
@@ -299,9 +299,9 @@ export function claimReply(options: Record<string, unknown>, requestID: string, 
 // permission.asked would have used to retry a previously-failed reply
 // (the issue #15 pattern) — that duplicate falls through to
 // duplicate-suppressed instead of retrying. Not a lost or silently-wrong
-// decision: alertHuman already fired synchronously when the original
-// reply failed, so the operator was notified either way. At most one
-// missed *automatic* self-heal on an already-rare, already-alerted path.
+// decision: the original reply-failed entry is already in the log with
+// its own error_class/error_detail, so the record survives either way.
+// At most one missed *automatic* self-heal on an already-rare path.
 const MAX_DEDUP_ENTRIES = 2000
 
 export function capped<T extends Map<string, unknown> | Set<string>>(collection: T, max: number = MAX_DEDUP_ENTRIES): T {
@@ -323,57 +323,6 @@ function pruneReplied(options: Record<string, unknown>, maxAgeMs = 3600000): voi
     }
   } catch {
     // Directory may not exist yet; nothing to prune.
-  }
-}
-
-/** Attention-grabbing desktop alert when Jev delegates to a human. */
-export function alertHuman(title: string, body: string): void {
-  const text = redactSecrets(body).slice(0, 400)
-  const headline = title.slice(0, 120) || "Jev Decision Gate"
-  try {
-    const n = spawn(
-      "notify-send",
-      [
-        "-u",
-        "critical",
-        "-t",
-        "0",
-        "-a",
-        "Jev Decision Gate",
-        "--hint=string:sound-name:dialog-warning",
-        "--hint=string:desktop-entry:opencode",
-        headline,
-        text || "Jev needs your decision in OpenCode.",
-      ],
-      { stdio: "ignore", detached: true },
-    )
-    // spawn() reports a missing binary (ENOENT) asynchronously via an
-    // 'error' event, not the synchronous throw the try/catch here
-    // catches — an unhandled 'error' event is fatal to the whole process
-    // (round 6 review, live-verified: on a host without notify-send,
-    // the very first alertHuman() call — the escalation path for nearly
-    // every fail-open/ask-human outcome — killed the entire opencode
-    // host process, not just this notification). Every other spawn() in
-    // this file already has this listener; these two were missed.
-    n.on("error", () => {
-      // Notification is best-effort.
-    })
-    n.unref?.()
-  } catch {
-    // Notification is best-effort.
-  }
-  try {
-    const z = spawn(
-      "zenity",
-      ["--warning", "--title", headline, "--width=420", "--text", text || "Jev needs your decision in OpenCode."],
-      { stdio: "ignore", detached: true },
-    )
-    z.on("error", () => {
-      // Dialog is best-effort; notify-send alone is enough on headless.
-    })
-    z.unref?.()
-  } catch {
-    // Dialog is best-effort; notify-send alone is enough on headless.
   }
 }
 
@@ -829,20 +778,14 @@ function archivedAt(info: unknown): unknown {
 // bare /not found/i (as this used to be) matches "Provider anthropic not
 // found" just as readily as an actual session error. Misclassifying one of
 // those as "session ended" is worse than it sounds: the session gets
-// permanently cached as ended (5th confirming-review round found this is
-// the ONE fail path in the file with no alertHuman — every other error
-// path degrades to ask-human with an alert; this one just silently stops
-// replying for that session, forever, violating SECURITY.md's "never
-// silently allows" guarantee in spirit even though it denies rather than
-// allows). Checking the SDK's own `_tag` first (Effect's TaggedStruct
-// discriminant — SessionNotFoundError is the real one) is precise when
-// present; the regex fallback now requires "session" to co-occur with the
-// not-found-ish wording instead of either alone, closing the cross-
-// contamination with sibling *NotFoundError types. Deliberately not adding
-// alertHuman here too: fixing the false-positive source is the real fix,
-// and a genuinely-ended session has nothing left for a human to act on —
-// alerting on every correct classification would just be noise for the
-// common case this was actually built to handle.
+// permanently cached as ended (5th confirming-review round found this
+// just silently stops replying for that session, forever, violating
+// SECURITY.md's "never silently allows" guarantee in spirit even though
+// it denies rather than allows). Checking the SDK's own `_tag` first
+// (Effect's TaggedStruct discriminant — SessionNotFoundError is the real
+// one) is precise when present; the regex fallback now requires "session"
+// to co-occur with the not-found-ish wording instead of either alone,
+// closing the cross-contamination with sibling *NotFoundError types.
 export function looksLikeSessionGone(err: unknown): boolean {
   const tag = (err as { _tag?: unknown } | null | undefined)?._tag
   if (tag === "SessionNotFoundError") return true
@@ -1170,22 +1113,13 @@ async function handleFormAsked(
       })
 
       if (decision.action !== "allow" || typeof decision.pick !== "string" || !decision.pick) {
-        alertHuman(
-          "Jev necesita tu decisión",
-          `Formulario: ${description || title || detail}`.slice(0, 280),
-        )
         return
       }
       if (labels.length > 0 && !labels.includes(decision.pick)) {
-        alertHuman("Jev: opción inválida", `Jev eligió "${decision.pick}" fuera de la lista. Responde en OpenCode.`)
         return
       }
       const value = valueForPick(field, decision.pick)
       if (value === null) {
-        alertHuman(
-          "Jev: opción ambigua",
-          `Dos opciones distintas se ven igual tras redactar/truncar ("${decision.pick}"). Responde en OpenCode.`,
-        )
         return
       }
       picks.push(decision.pick)
@@ -1211,7 +1145,6 @@ async function handleFormAsked(
         reason: "form-reply-failed",
         error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
       })
-      alertHuman("Jev no pudo responder", `Fallo al enviar la respuesta del formulario. ${String(err).slice(0, 160)}`)
     }
   } catch (err) {
     log({
@@ -1224,7 +1157,6 @@ async function handleFormAsked(
       error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
       phase: "form-answer",
     })
-    alertHuman("Jev necesita tu decisión", "Error evaluando el formulario del agente. Responde en OpenCode.")
   }
 }
 
@@ -1271,7 +1203,6 @@ export async function handleOne(
       // The reject was computed but never delivered — the tool call may be
       // hanging with no signal at all otherwise. See docs/TROUBLESHOOTING.md
       // "Ordinary permission replies can silently miss the window".
-      alertHuman("Jev: bloqueo no entregado a tiempo", `${action}: patrón catastrófico detectado, pero la respuesta llegó tarde. Revisa OpenCode.`)
     }
     return { decision: "deny", repliedOk }
   }
@@ -1295,7 +1226,6 @@ export async function handleOne(
         totalElapsedMs: Date.now() - receivedAt,
       })
       repliedOk = false
-      alertHuman("Jev: pregunta no desbloqueada a tiempo", "La herramienta de pregunta puede haberse quedado colgada. Revisa OpenCode.")
     }
     log({
       sessionID,
@@ -1332,9 +1262,9 @@ export async function handleOne(
   // spawn() throws SYNCHRONOUSLY, not via a rejected promise, when an env
   // value derived from options (e.g. a NUL byte in a malformed
   // typesafeKey/logFile/gateDir) is invalid. Outside the try, that throw
-  // propagated out of handleOne entirely, past every log()/alertHuman()
-  // call in this function, caught only by setup()'s bare event-loop catch
-  // — which logs nothing, alerts no one, and marks repliedOk:true so a
+  // propagated out of handleOne entirely, past every log() call in this
+  // function, caught only by setup()'s bare event-loop catch — which logs
+  // nothing and marks repliedOk:true so a
   // later duplicate permission.asked for the same requestID never even
   // retries (claimReply already claimed it). Strictly worse than every
   // other fail-open path in this file, which was built specifically to
@@ -1412,16 +1342,7 @@ export async function handleOne(
         // tracking the request — the tool call is likely hanging with no
         // other signal. See docs/TROUBLESHOOTING.md "Ordinary permission
         // replies can silently miss the window" (issue #15).
-        alertHuman(
-          "Jev: decisión no entregada a tiempo",
-          `${action} → ${decision.action}, pero la respuesta llegó tarde. La tool call puede haberse quedado colgada; revisa OpenCode.`,
-        )
       }
-    } else {
-      alertHuman(
-        "Jev necesita tu decisión",
-        `${action}: ${detail.slice(0, 220) || "permiso pendiente en OpenCode"}`,
-      )
     }
     return { decision: String(decision.action), repliedOk }
   } catch (err) {
@@ -1446,7 +1367,6 @@ export async function handleOne(
       reason: "fail-open",
       error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
     })
-    alertHuman("Jev: error del gate", `Fail-open. Revisa OpenCode (${action}).`)
     return { decision: "ask-human", repliedOk: true }
   }
 }

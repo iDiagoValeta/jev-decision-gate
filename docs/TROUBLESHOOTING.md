@@ -202,8 +202,8 @@ question reply API were wrong for this line):
    with body `{"answer":{"q0":"<pick>"}}`. Log shows
    `phase: "form-answer"` then `reason: "question-answered"`. This
    closes the old “pick is log-only” model. If Jev returns ask-human /
-   invalid pick / reply failure, the human is alerted
-   (`notify-send` + `zenity`) and must answer in the TUI.
+   invalid pick / reply failure, the form stays pending — logged, no
+   desktop alert (removed) — and the human answers in the TUI.
 
 **Live evidence (auto-answer):**
 

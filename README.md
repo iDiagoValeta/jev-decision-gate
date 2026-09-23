@@ -7,8 +7,11 @@
 
 Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
 calls get approved automatically, anything Jev calls risky or
-uncertain falls back to your manual prompt — with a desktop popup
-(`notify-send` + `zenity`) so you notice when the gate delegates.
+uncertain falls back to your manual prompt. Every delegation is
+recorded in the JSONL decision log (`gateAction`, `reason`,
+`error_class`, `error_detail`); there is no desktop popup — one used
+to fire on ask-human/fail-open but proved actively disruptive on a
+host running several concurrent sessions, so it was removed.
 
 > [!WARNING]
 > This plugin lets an LLM auto-approve OpenCode's tool-permission
@@ -34,7 +37,7 @@ uncertain falls back to your manual prompt — with a desktop popup
 opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ jev_gate (Python) ──▶ Jev API
      ▲                                │ allow → reply once
      │                                │ deny → reply reject
-     │                                │ ask-human → silence + desktop alert
+     │                                │ ask-human → silence, logged
      │
      └──question form (GET /api/form)──▶ plugin/ ──▶ Jev pick
             ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
@@ -59,7 +62,7 @@ listens for `form.created` / legacy question events), asks Jev for a
 pick, and submits
 `POST /api/session/{sessionID}/form/{formID}/reply` with
 `{"answer":{"q0":"<pick>"}}`. If Jev is unsure or the submit fails,
-you get the desktop alert and answer in the TUI. Live-verified on
+it stays pending for you to answer in the TUI. Live-verified on
 2.0.11 that form reply unblocks the question tool and the agent
 continued (`ELEGIDO=pizza`, idle succeeded) — not a claim that every
 hang case is fixed; see
