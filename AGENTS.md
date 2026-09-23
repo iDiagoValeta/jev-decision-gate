@@ -204,3 +204,23 @@ and checking the JSONL decision log (`JEV_GATE_LOG` / default
 `decisions-plugin.jsonl`) for the real `inst`/`pid`/`gateAction`
 sequence. Don't report an `index.ts` fix as done from a green `tsc` run
 alone.
+
+**A live service picks up `index.ts` edits without a restart — mid-edit
+inconsistent states are live-reachable, not just theoretical.**
+Live-verified 2026-09-23: while removing `alertHuman()` (function body
+first, its 9 call sites across several separate edits after), the
+already-running service logged 3 real `error_class: "alertHuman is not
+defined"` fail-opens for in-flight permissions, timestamped inside that
+exact edit window — the safety net caught it correctly (fail-open, not
+a crash or silent allow), but it confirms the running process re-reads
+this file per-event rather than caching it once at `setup()`. This
+does *not* extend to `setup()`'s own subscriptions/closures (`inst`,
+the `resolved`/`endedSessions`/`formSeen` maps): the subagent-
+enrichment fix from earlier the same day was confirmed still absent
+from live behavior hours after merging, until the service was actually
+restarted — so some state is per-process-start, some (at least
+function bodies referenced from within) is picked up live. Practical
+consequence: prefer one atomic edit over several incremental ones when
+a live service might be evaluating real permissions during the edit,
+or expect (and don't be alarmed by) a handful of harmless fail-opens
+logged with a JS error as `error_class` during the window.
