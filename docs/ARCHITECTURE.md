@@ -26,7 +26,7 @@ permission.asked (opencode v2)
                               JEV_GATE_OBJECTIVE_CHARS)
   → gateEvent { objective, halt {kind,tool,detail≤4000 redacted},
                 context {sessionID,requestID,risk_hints}, policy }
-  → spawn pythonBin -m jev_gate.cli (timeout 15s default, max 30s,
+  → spawn pythonBin -m jev_gate.cli (timeout 25s default, max 30s,
         PYTHONPATH=src, minimal env)
       → build_state: curated brief + detail_sha256
       → build_questions: decision(choice) + safe(noul) + risk(score)
@@ -163,7 +163,7 @@ Live autonomy check (non-interactive, against a running service):
   iterator implementation and confirmed it's a plain pull-based async
   iterator: `await handleOne(...)` for one permission blocks the loop
   from even starting the next event (of any kind) until that gate
-  round-trip finishes (up to `timeoutMs`, 15s default/30s max). Under
+  round-trip finishes (up to `timeoutMs`, 25s default/30s max). Under
   concurrent load — the exact scenario this plugin's autonomy design
   targets — later simultaneous permissions queue behind earlier ones,
   each additionally exposed to the reply-window pressure issue #15

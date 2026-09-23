@@ -19,6 +19,7 @@ import JevGate, {
   redactSecrets,
   subagentDetailFor,
   textOfMessage,
+  timeoutMsOf,
   valueForPick,
 } from "./index.js"
 
@@ -852,5 +853,39 @@ test("handleOne: a subagent permission with no `source` (or a lookup that finds 
     assert.equal(sent.halt.detail, "general")
   } finally {
     fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("timeoutMsOf: default is 25000ms, not 15000ms — production log showed p99=9295ms/max=13140ms for successful calls even without contention, and 11 real timeouts clustered exactly where several sessions ran concurrently", () => {
+  const origMs = process.env.JEV_GATE_TIMEOUT_MS
+  const origLegacy = process.env.JEV_GATE_TIMEOUT
+  delete process.env.JEV_GATE_TIMEOUT_MS
+  delete process.env.JEV_GATE_TIMEOUT
+  try {
+    assert.equal(timeoutMsOf({}), 25000)
+  } finally {
+    if (origMs === undefined) delete process.env.JEV_GATE_TIMEOUT_MS
+    else process.env.JEV_GATE_TIMEOUT_MS = origMs
+    if (origLegacy === undefined) delete process.env.JEV_GATE_TIMEOUT
+    else process.env.JEV_GATE_TIMEOUT = origLegacy
+  }
+})
+
+test("timeoutMsOf: options.timeoutMs and the env vars still override the default, clamped to 1000-30000", () => {
+  const origMs = process.env.JEV_GATE_TIMEOUT_MS
+  const origLegacy = process.env.JEV_GATE_TIMEOUT
+  delete process.env.JEV_GATE_TIMEOUT_MS
+  delete process.env.JEV_GATE_TIMEOUT
+  try {
+    assert.equal(timeoutMsOf({ timeoutMs: 5000 }), 5000)
+    assert.equal(timeoutMsOf({ timeoutMs: 999 }), 1000)
+    assert.equal(timeoutMsOf({ timeoutMs: 999999 }), 30000)
+    process.env.JEV_GATE_TIMEOUT_MS = "8000"
+    assert.equal(timeoutMsOf({}), 8000)
+  } finally {
+    if (origMs === undefined) delete process.env.JEV_GATE_TIMEOUT_MS
+    else process.env.JEV_GATE_TIMEOUT_MS = origMs
+    if (origLegacy === undefined) delete process.env.JEV_GATE_TIMEOUT
+    else process.env.JEV_GATE_TIMEOUT = origLegacy
   }
 })

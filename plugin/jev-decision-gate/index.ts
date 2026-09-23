@@ -184,11 +184,27 @@ function apiKeyOf(options: Record<string, unknown>): string {
   return process.env.TYPESAFE_API_KEY ?? ""
 }
 
-function timeoutMsOf(options: Record<string, unknown>): number {
+// Was 15000 until a production log showed p99=9295ms and max=13140ms for
+// successful calls (spawn-to-decision, 669 samples) even WITHOUT
+// concurrent load — under a handful of simultaneous sessions each
+// spawning their own `python3 -m jev_gate.cli` process (no pooling/
+// reuse), interpreter-startup contention pushed 11 real calls past the
+// 15s cliff into "gate timeout" fail-opens, each one silently stalling
+// its session behind an unattended alertHuman() popup with no self-heal
+// (live-verified: two clusters, 18:45:44-18:45:59 and 19:13:44-19:16:53,
+// matching exactly the concurrent-session windows in the same log).
+// 25000 gives ~2.7x headroom over that p99 while staying under the
+// existing 30000 hard cap.
+export const DEFAULT_GATE_TIMEOUT_MS = 25000
+
+export function timeoutMsOf(options: Record<string, unknown>): number {
   const raw =
-    (options.timeoutMs as unknown) ?? process.env.JEV_GATE_TIMEOUT_MS ?? process.env.JEV_GATE_TIMEOUT ?? 15000
+    (options.timeoutMs as unknown) ??
+    process.env.JEV_GATE_TIMEOUT_MS ??
+    process.env.JEV_GATE_TIMEOUT ??
+    DEFAULT_GATE_TIMEOUT_MS
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10)
-  if (!Number.isFinite(n)) return 15000
+  if (!Number.isFinite(n)) return DEFAULT_GATE_TIMEOUT_MS
   return Math.min(30000, Math.max(1000, n))
 }
 
