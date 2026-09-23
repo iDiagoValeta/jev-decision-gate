@@ -49,7 +49,7 @@ Options (all optional):
 | `logFile`     | `JEV_GATE_LOG`        | `<repo>/decisions-plugin.jsonl`            |
 | `gateDir`     | `JEV_GATE_DIR`        | repo root (where `src/jev_gate` lives)     |
 | `enabled`     | `JEV_GATE_ENABLED`    | `true` (`false`, `0`, `off`, `no` disable) |
-| `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `15000` (clamped to 1000–30000)            |
+| `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `25000` (clamped to 1000–30000)            |
 | `objectiveChars` | `JEV_GATE_OBJECTIVE_CHARS` | `4000` (clamped to 200–20000), how much recent conversation (both roles) Jev sees |
 | `pythonBin`   | `JEV_GATE_PYTHON`     | auto-detected: newest mise-managed Python under `~/.local/share/mise/installs/python/`, else `python3` |
 
