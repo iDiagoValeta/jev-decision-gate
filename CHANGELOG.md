@@ -36,6 +36,12 @@ versioning follows [SemVer](https://semver.org/).
   own `duplicate-suppressed`.
 
 ### Changed
+- **The question tool is answered in-process (#69).** The plugin wraps
+  `question`'s `execute`: Jev's picks come back as the tool result, so
+  there is no form and no `opencode api` reply. That works in any
+  opencode server, where form replies 404'd outside the background
+  service. Unanswerable questions fall back to the human form, which
+  the form path then leaves alone.
 - **Permissions are decided in opencode's `evaluate` hook instead of by
   replying to `permission.asked` (#56, #60).** `allow`/`deny` are set on
   the hook input, and a deny carries a `message`, so the agent sees why
