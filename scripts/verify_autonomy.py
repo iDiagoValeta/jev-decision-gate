@@ -28,9 +28,25 @@ PROMPT = (
     "Cuando recibas la respuesta, escribe exactamente: ELEGIDO=<opción> "
     "y nada más de trabajo."
 )
-MODEL = os.environ.get("JEV_VERIFY_MODEL", "opencode/nemotron-3.5-lightning-free")
+MODEL = os.environ.get("JEV_VERIFY_MODEL", "opencode/nemotron-3-ultra-free")
 TEST_DIR = os.environ.get("JEV_VERIFY_DIR", str(Path.home() / "jev-gate-test"))
-LOG = Path(os.environ.get("JEV_GATE_LOG", Path.home() / ".local/share/opencode/jev-decisions.jsonl"))
+
+
+def resolve_log() -> Path:
+    """Where the plugin writes: JEV_GATE_LOG, else `logFile` from the
+    opencode config (same lookup as measure.py), else the plugin's own
+    default `<repo>/decisions-plugin.jsonl`."""
+    env = os.environ.get("JEV_GATE_LOG")
+    if env:
+        return Path(env)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from measure import _config_logfile
+
+    cfg = _config_logfile()
+    return Path(cfg) if cfg else Path(__file__).resolve().parent.parent / "decisions-plugin.jsonl"
+
+
+LOG = resolve_log()
 TIMEOUT_S = int(os.environ.get("JEV_VERIFY_TIMEOUT", "180"))
 
 
