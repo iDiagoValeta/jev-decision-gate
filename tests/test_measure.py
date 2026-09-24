@@ -15,8 +15,8 @@ def _load_measure():
 
 
 def test_load_skips_json_valid_non_object_rows_as_corrupt(tmp_path):
-    # Round 8 review: a line that's valid JSON but not an object (a bare
-    # number/string/null/array) used to crash main()'s first .get() call
+    # A line that's valid JSON but not an object (a bare
+    # number/string/null/array) would crash main()'s first .get() call
     # on it. Must land in the same "corrupt" bucket as unparseable JSON.
     measure = _load_measure()
     log = tmp_path / "log.jsonl"
@@ -56,7 +56,7 @@ def test_main_survives_an_adversarial_log_and_emits_valid_json(tmp_path, monkeyp
     # usage.input_tokens, NaN/Infinity elapsedMs, and a lone UTF-16
     # surrogate in sessionID (escaped as \ud800 in the JSON text, exactly
     # how a real producer's ensure_ascii-style JSON encoder would write
-    # it — matching round 7's finding in the TS/Python bridge).
+    # it — the same shape sha256_hex must tolerate in the TS/Python bridge).
     measure = _load_measure()
     log = tmp_path / "log.jsonl"
     rows = [
@@ -96,12 +96,12 @@ def test_duplicate_suppressed_rows_excluded_from_totals_and_action_rates(tmp_pat
     # docs/ARCHITECTURE.md): every real permission is logged once by the
     # losing instance as gateAction="ask-human" reason="duplicate-suppressed"
     # (a no-op — it never called Jev) and once by the winner with the real
-    # decision. Before this fix, the Counter over gateAction lumped those
-    # no-ops in with genuine ask-human delegations, so a session with ~50%
-    # duplicate noise reported an ~50% ask-human rate when the true rate
-    # (real Jev delegations / real decisions) was near zero — live-verified
-    # against production log: 418/849 rows were duplicate-suppressed vs 10
-    # genuine ask-human rows.
+    # decision. A plain Counter over gateAction would lump those no-ops in
+    # with genuine ask-human delegations, so a session with ~50%
+    # duplicate noise would report an ~50% ask-human rate when the true
+    # rate (real Jev delegations / real decisions) is near zero —
+    # confirmed against a production log: 418/849 rows were
+    # duplicate-suppressed vs 10 genuine ask-human rows.
     measure = _load_measure()
     log = tmp_path / "log.jsonl"
     rows = [

@@ -31,13 +31,12 @@ DUPLICATE_SUPPRESSED = "duplicate-suppressed"
 def _safe_float(x, default=0.0):
     """float(x), rejecting non-numeric AND non-finite (NaN/Infinity).
 
-    Round 8 review, live-verified: a JSON-valid-but-non-numeric
-    elapsedMs string crashed the whole report (ValueError, uncaught);
-    a NaN/Infinity elapsedMs didn't crash but silently poisoned
-    p95/mean for the entire report with no warning, and made --json's
-    own output invalid JSON (json.dumps emits bare NaN/Infinity
-    tokens by default). Same bug class round 6 already fixed for
-    decision.confidence in client.py, unreviewed here until now.
+    A JSON-valid-but-non-numeric elapsedMs string would crash the whole
+    report (ValueError, uncaught); a NaN/Infinity elapsedMs wouldn't
+    crash but would silently poison p95/mean for the entire report with
+    no warning, and make --json's own output invalid JSON (json.dumps
+    emits bare NaN/Infinity tokens by default). Same bug class as
+    decision.confidence in client.py.
     """
     try:
         v = float(x)
@@ -96,9 +95,9 @@ def load(paths):
                         corrupt += 1
                         continue
                     # A line can be valid JSON and still not be a log row
-                    # (a bare number/string/null/array) — round 8 review,
-                    # live-verified this crashed main()'s first .get()
-                    # call on it. Same "tolerates corrupt lines" bucket.
+                    # (a bare number/string/null/array), which would crash
+                    # main()'s first .get() call on it. Same "tolerates
+                    # corrupt lines" bucket.
                     if not isinstance(parsed, dict):
                         corrupt += 1
                         continue
@@ -169,10 +168,10 @@ def main():
         by = {}
         for r in rows:
             sid = r.get("sessionID") or "unknown"
-            # A log row's sessionID isn't guaranteed to be a string (round 12
-            # review, live-verified: a numeric sessionID crashes the
-            # --by-session text path's sid[:8] below with TypeError). --json
-            # mode is unaffected (json.dumps coerces non-string keys itself).
+            # A log row's sessionID isn't guaranteed to be a string: a
+            # numeric sessionID would crash the --by-session text path's
+            # sid[:8] below with TypeError. --json mode is unaffected
+            # (json.dumps coerces non-string keys itself).
             if not isinstance(sid, str):
                 sid = str(sid)
             b = by.setdefault(sid, {"n": 0, "allow": 0, "fail_open": 0})
@@ -196,10 +195,9 @@ def main():
         print(f"input_tokens={tokens} est_cost_usd={out['est_cost_usd']}")
         if args.by_session:
             for sid, b in out["by_session"].items():
-                # A lone UTF-16 surrogate in sessionID (round 8 review,
-                # live-verified) crashes a raw print via stdout's utf-8
-                # encoder — same bug class round 7 fixed for sha256_hex,
-                # unreviewed here. errors="replace" for a display-only
+                # A lone UTF-16 surrogate in sessionID would crash a raw
+                # print via stdout's utf-8 encoder — same bug class as
+                # sha256_hex. errors="replace" for a display-only
                 # truncated preview, not anything requiring fidelity.
                 safe_sid = sid[:8].encode("utf-8", errors="replace").decode("utf-8")
                 print(f"  session {safe_sid}: n={b['n']} allow={b['allow']} fail_open={b['fail_open']}")

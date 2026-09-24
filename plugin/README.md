@@ -3,13 +3,14 @@
 Lets Jev answer permission prompts automatically. Allow goes through,
 deny blocks, anything uncertain falls back to your manual prompt.
 Agent questions are auto-answered too: the question tool's permission
-is passed through instantly (no Jev call), then OpenCode opens a
-**form** (`metadata.kind=question`) that the plugin polls for
-(`GET /api/form`) and answers on Jev's behalf via
-`POST /api/session/{sessionID}/form/{formID}/reply`. If Jev is unsure
-or the reply fails, you get a desktop alert and answer in the TUI —
-see the repo's `docs/ARCHITECTURE.md` and `docs/TROUBLESHOOTING.md`
-for the full two-phase flow and its known limits.
+is passed through instantly (no Jev call), and the question tool
+itself is wrapped so Jev answers each field in-process. When that
+can't answer, OpenCode opens a **form** (`metadata.kind=question`)
+that the plugin polls for (`GET /api/form`) and answers on Jev's
+behalf via `POST /api/session/{sessionID}/form/{formID}/reply`. If Jev
+is unsure or the reply fails, it stays pending for you to answer in
+the TUI — see the repo's `docs/ARCHITECTURE.md` and
+`docs/TROUBLESHOOTING.md` for the full flow and its known limits.
 
 Requires OpenCode on the `@opencode/plugin` line (`permission.asked`
 events — the more common `@opencode-ai/plugin` line does not fire it,

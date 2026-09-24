@@ -2,18 +2,19 @@
 
 ## Flow
 
-Requires `"permission": "ask"` in opencode's config (global or
-project) — under `"allow"` the evaluate hook sees `effect=allow`
-already and leaves it alone (and on 2.0.11 no `permission.asked` fired
-at all), so there is nothing for the gate to decide. See `docs/TROUBLESHOOTING.md`.
+Requires `"permission": "ask"` in opencode's config (global or project):
+under `"allow"` the evaluate hook sees `effect=allow` already and leaves
+it alone, and no `permission.asked` event fires at all when the ambient
+mode is already `allow`, so there is nothing for the gate to decide. See
+`docs/TROUBLESHOOTING.md`.
 
 ```
-permission evaluate hook (ctx.permission.hook("evaluate"), opencode 2.0.16)
+permission evaluate hook (ctx.permission.hook("evaluate"))
   → input.effect already allow/deny (user config) → leave it, done
   → claim eval:<sessionID>:<source>:<action>:<sha> (exclusive marker) — lose it, do nothing
   → action === "question" → effect=allow (passthrough), NO Jev
         log reason=question-permission-passthrough
-        (answering happens via form API — see below)
+        (answering happens via the wrapped question tool or the form API — see below)
   → catastrophic check (local regex over normalized command, no network)
         → effect=deny + message "Blocked by jev-decision-gate: ... kill-list"
   → subagent/task: enrich resources with the dispatch prompt
@@ -22,16 +23,16 @@ permission evaluate hook (ctx.permission.hook("evaluate"), opencode 2.0.16)
                               ≤4000 chars default (options.objectiveChars /
                               JEV_GATE_OBJECTIVE_CHARS)
   → gateEvent { objective, halt {kind,tool,detail≤4000 redacted — for edits
-                the patches from metadata.files are appended (#66)},
+                the patches from metadata.files are appended},
                 context {sessionID,risk_hints}, policy }
   → runGate: spawn pythonBin -m jev_gate.cli (timeout 25s default, max 30s,
         PYTHONPATH=src, minimal env); one retry if the child died from a
-        signal or a transient spawn error (#61)
+        signal or a transient spawn error
       → build_state / build_questions / client.evaluate → Jev (system_one)
       → decision.combine: pass through Jev's decision, no thresholds
   → allow → effect=allow
     deny  → effect=deny + message "Denied by jev-decision-gate (Jev): ..."
-            (the agent gets the reason and continues, #60)
+            (the agent gets the reason and continues)
     ask-human / any error → effect stays "ask" → opencode emits
             permission.asked and prompts the human; the plugin only logs
             reason=asked-human for it (no Jev, no reply)
@@ -40,7 +41,7 @@ permission evaluate hook (ctx.permission.hook("evaluate"), opencode 2.0.16)
 Fallback (hook API missing, logged reason=hook-unavailable): the older
 permission.asked + `opencode api POST .../permission/{id}/reply` path.
 
-question tool (wrapped via ctx.tool.transform, #69)
+question tool (wrapped via ctx.tool.transform)
   → Jev answers each question in-process (multichoice + pick, labels
     redacted on the way out, mapped back to the original label)
   → all answered → the tool returns {output:{answers}, content, metadata}
@@ -50,12 +51,11 @@ question tool (wrapped via ctx.tool.transform, #69)
     marked so the form path below does not ask Jev again
 
 question tool → form (metadata.kind=question), listed at GET /api/form
-  → ONE shared 750ms poller per process (not per setup() instance, #59),
+  → ONE shared 750ms poller per process (not per setup() instance),
     listing each known project directory via
-    GET /api/form?location[directory]=<dir> (#58 — the bare endpoint
-    only lists the service's own directory, so project forms were
-    always invisible to it); at most one tick in flight at a time
-    (also listens form.created / legacy question.v2.asked /
+    GET /api/form?location[directory]=<dir> (the bare endpoint only
+    lists the service's own directory); at most one tick in flight at
+    a time (also listens form.created / legacy question.v2.asked /
     question.asked)
   → claim form:<formID> (same exclusive-marker pattern)
   → objectiveFor (bounded; failures fall back to a short default)
@@ -63,13 +63,13 @@ question tool → form (metadata.kind=question), listed at GET /api/form
   → allow+valid pick → POST /api/session/{sessionID}/form/{formID}/reply
                         body {"answer":{"q0":"<pick>", ...}}
      log phase=form-answer then reason=question-answered
-  → else ask-human, logged (pick no longer log-only)
+  → else ask-human, logged
 ```
 
 `pythonBin` resolution: `options.pythonBin` → `JEV_GATE_PYTHON` → newest
 mise install under `~/.local/share/mise/installs/python/*/bin/python3` →
 `python3`. The spawn sets `PYTHONPATH=<repo>/src` so `typesafe_sdk`
-works when the opencode service’s `/usr/bin/python3` lacks it.
+works when the opencode service's `/usr/bin/python3` lacks it.
 
 Live autonomy check (non-interactive, against a running service):
 `scripts/verify_autonomy.py` — see `docs/TROUBLESHOOTING.md`.
@@ -78,30 +78,27 @@ Live autonomy check (non-interactive, against a running service):
 
 - **Shared state lives on `globalThis`, not in module scope.** opencode
   loads a separate copy of the plugin module for each `setup()` instance
-  (one per project directory). Measured live: module-level "shared"
-  state gave one form poller per directory (78 poll processes in 10 s
-  with 7 dirs). With `globalThis[Symbol.for("jev-decision-gate.shared.v1")]`
-  it is one poller per process (11 in 10 s with 6 dirs, round-robin).
-  A test imports two copies of the module and asserts they share one
-  interval.
+  (one per project directory). Module-scope "shared" state would give one
+  form poller per directory instead of one per process. With
+  `globalThis[Symbol.for("jev-decision-gate.shared.v1")]` there is one
+  poller per process, shared across all instances. A test imports two
+  copies of the module and asserts they share one interval.
 - **The question tool is answered inside the tool, not through its
   form.** Wrapping `question`'s `execute` returns Jev's pick as the tool
   result, so no reply has to reach the server, and it works outside the
-  background service (#69). The form path remains only for the human
-  fallback and for non-question forms.
+  background service. The form path remains only for the human fallback
+  and for non-question forms.
 - **Permissions are decided in the `evaluate` hook, not by replying to
-  `permission.asked`.** Live-verified on 2.0.16: opencode awaits the
-  async hook (4 s delay tested), `effect=allow` runs the tool with no
-  prompt, `effect=deny` + `message` fails just that tool call with the
-  message and the agent continues, and leaving `ask` falls through to
-  the normal human prompt. The reply path had two structural defects
-  this removes: replies went through `opencode api`, which always
-  targets the background service, so every decision 404'd when the
-  plugin ran in any other server (#56: 13/13 and 5/5 in production);
-  and a bare `reject` aborted the whole agent turn (#60). It also
-  removes the reply-window/`reply-failed` class (#15) for permissions.
-  Forms still reply via `opencode api` (no form API in the plugin
-  context), so form answers still only work in the background service.
+  `permission.asked`.** opencode awaits the async hook; `effect=allow`
+  runs the tool with no prompt, `effect=deny` + `message` fails just that
+  tool call with the message and the agent continues, and leaving `ask`
+  falls through to the normal human prompt. Replying to `permission.asked`
+  via `opencode api` always targets the background service, so a
+  decision 404s when the plugin runs in any other server; and a bare
+  `reject` reply aborts the whole agent turn. The `evaluate` hook avoids
+  both. Forms still reply via `opencode api` (there is no form API in the
+  plugin context), so form answers still only work in the background
+  service.
 - **`opencode run --auto` is out of scope — it bypasses the gate
   entirely, by design.** `--auto` is a client-side "auto-approve
   permissions not explicitly denied" behavior in opencode's own CLI; it
@@ -109,71 +106,47 @@ Live autonomy check (non-interactive, against a running service):
   resolves a request before this plugin's reply (always at least one
   subprocess spawn plus an HTTP round trip) can land — including
   defeating the catastrophic-pattern kill-list, which replies in
-  ~100ms with no network call and still loses. Confirmed live with a
-  zero-risk repro (`terraform destroy`, `terraform` not installed):
-  executed under `--auto`, correctly blocked (`executed: false`) via
-  the raw session API with no `--auto`. No fix is possible from inside
-  this plugin — there is no hook that fires before `--auto` commits.
-  See `docs/TROUBLESHOOTING.md` and issue #21. Headless/autonomous
-  sessions that need the gate's protection must go through the raw
-  session API (`POST /api/session`, `POST /api/session/{id}/prompt`,
-  poll `GET /api/session/{id}/message`) instead of `--auto`.
-- **(Superseded for permissions by the `evaluate` hook above; still
-  how form answers and the fallback path reply.) Reply via `opencode
-  api POST`, never `ctx.permission.reply()`.** The SDK method was intermittently
-  unreliable (`reply-failed: Permission request not found`) on
-  permissions that were, live-verified, still pending server-side
-  minutes later — never a timing race, despite an earlier same-day
-  theory that it was (see `docs/TROUBLESHOOTING.md`, issue #15, for the
-  full story of how that theory got falsified). `replyPermission` in
-  `index.ts` shells out to `opencode api POST
-  /api/session/{sessionID}/permission/{requestID}/reply`, mirroring
-  `replyFormAnswer`'s already-reliable pattern for form answers, at all
-  four sites that used to call the SDK method (catastrophic-reject,
-  question-permission passthrough, main allow/deny, duplicate-event
-  retry). Re-verified live: 17/17 successes under deliberately
-  concurrent load that reliably reproduced the original failures.
+  ~100ms with no network call and still loses. No fix is possible from
+  inside this plugin — there is no hook that fires before `--auto`
+  commits. See `docs/TROUBLESHOOTING.md`. Headless/autonomous sessions
+  that need the gate's protection must go through the raw session API
+  (`POST /api/session`, `POST /api/session/{id}/prompt`, poll
+  `GET /api/session/{id}/message`) instead of `--auto`.
+- **Reply via `opencode api POST`, never `ctx.permission.reply()`.**
+  The SDK method proved unreliable for replying to `permission.asked`
+  in this environment. `replyPermission` in `index.ts` shells out to
+  `opencode api POST /api/session/{sessionID}/permission/{requestID}/reply`,
+  mirroring `replyFormAnswer`'s pattern for form answers. This path is
+  now only exercised by the `hook-unavailable` fallback, since
+  permissions are normally decided in the `evaluate` hook; form answers
+  always use it, since there is no form API in the plugin context.
 - **Fail-open, never silent allow.** Every `except` maps to
-  `ask-human/fail-open` with an `error_class` (and, since the
-  concurrent-load session that found the "transport" bucket alone was
-  undiagnosable, an `error_detail`). Rationale: a broken gate must cost
-  a prompt, not a breach. There used to also be a best-effort desktop
-  alert (`notify-send`/`zenity`) on this path; removed after it proved
-  actively disruptive under real concurrent multi-session load (several
-  fail-opens firing unattended dialogs with no one there to click
-  them) — the log is the only signal now, by design, not an oversight.
+  `ask-human`/`fail-open` with an `error_class` (and, when useful, an
+  `error_detail`). Rationale: a broken gate must cost a prompt, not a
+  breach. There is no desktop alert on this path; the log is the only
+  signal, by design.
 - **Two writers, one schema.** Plugin and CLI each log (the CLI sees
   the Jev internals, the plugin sees session/request IDs). Schema v2
   unifies field names so `measure.py` reads both.
 - **Two-phase question handling (form API on 2.0.x).** Agent questions
-  are split across permission unlock and form answer:
+  are split across permission unlock and answering:
   1. `permission.asked` with `action === "question"` — passthrough
-     allow via `permission.reply({ decision: "once" })` with **no**
-     `ctx.session.context` and **no** Jev call. Mid-flight
-     `session.context` on this path was implicated (not proven) in
-     the post-pick hang; the permission phase only unlocks the tool.
-  2. Question tool opens a **form** (`metadata.kind=question`). The
-     plugin discovers it via `GET /api/form` polling (and
-     `form.created` / legacy question events), Jev returns a `pick`,
-     and the plugin submits
+     allow with **no** `ctx.session.context` and **no** Jev call. The
+     permission phase only unlocks the tool.
+  2. The wrapped `question` tool answers in-process when Jev can
+     (see above). When it can't, the tool opens a **form**
+     (`metadata.kind=question`). The plugin discovers it via
+     `GET /api/form` polling (and `form.created` / legacy question
+     events), Jev returns a `pick`, and the plugin submits
      `POST /api/session/{sessionID}/form/{formID}/reply` with
-     `{"answer":{"q0":"<pick>"}}`. This closes the old “pick is
-     log-only” model (`permission.reply` has no option field and
-     cannot answer for the human). Earlier docs that said
-     `question.v2.asked` / `/api/question` were wrong for 2.0.11 —
-     those event names may still appear as legacy listeners, but the
-     live surface is the form API.
-  Live-verified on 2.0.11: form reply unblocks the question tool and
-  the agent continued (`ELEGIDO=pizza`, idle succeeded). That is **not**
-  a claim that every hang case is fixed. Historical failed fixes and
-  diagnostics live in `docs/TROUBLESHOOTING.md` "Question dialog hangs".
+     `{"answer":{"q0":"<pick>"}}`.
 - **`kindFor` covers documented OpenCode permission keys.** Mapping
   follows https://opencode.ai/docs/permissions/: read-class
   (`read`, `glob`, `grep`, `external_directory`, `lsp`, `skill`, …),
   write-class (`edit` / `write` / `apply_patch`, `bash`, `task`,
   `webfetch`, `websearch`, …), `doom_loop` → destructive, `question`
   → multichoice (permission path only; see above). Anything else
-  fail-opens to ask-human with an alert.
+  fail-opens to ask-human.
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail.
@@ -187,98 +160,78 @@ Live autonomy check (non-interactive, against a running service):
   lines. This is a partial mitigation, not a fix — Jev's judgment over
   the fenced content is still the only real defense against a
   sufficiently convincing adversarial payload. See `SECURITY.md`
-  "Accepted risk: prompt injection into Jev's brief" for the full,
-  explicitly-stated trade-off (found by an adversarial security
-  review; previously an undocumented, implicit assumption).
+  "Accepted risk: prompt injection into Jev's brief" for the full
+  trade-off.
 - **Option labels are capped and redacted too, not just OBJECTIVE/
-  detail.** A second adversarial pass found that `labelsFromFormField`
-  (`index.ts`, question-tool multichoice options) fed Jev's `"pick"`
-  criteria with attacker-reachable label text that had no length cap
-  and no redaction, unlike `OBJECTIVE`/`HALT.detail`. Not a bypass —
-  whatever Jev picks must still be one of the attacker's own
-  pre-supplied options, checked independently on both the TS
-  (`labels.includes`) and Python (`choice not in options`) sides — but
-  an unbounded, unfenced injection/cost surface all the same. Each
-  label is now redacted and capped at 200 chars (`normalizedLabel`);
+  detail.** `labelsFromFormField` (`index.ts`, question-tool multichoice
+  options) feeds Jev's `"pick"` criteria with attacker-reachable label
+  text, so each label is redacted and capped at 200 chars
+  (`normalizedLabel`). Whatever Jev picks must still be one of the
+  attacker's own pre-supplied options, checked independently on both the
+  TS (`labels.includes`) and Python (`choice not in options`) sides.
   `valueForPick` re-derives the same normalization at lookup time
   (rather than assuming a positional mapping) so a truncated/redacted
   pick still round-trips to its real underlying value.
 - **Form answers honor field types and visibility, not just
-  multichoice picks (issues #55/#57).** In `handleFormAsked`, a
-  `multiselect` field's reply value is an **array** of the picked
-  option values (`{"answer":{"q0":["pizza"]}}`) rather than a string;
-  `hidden`/`when` conditions gate each field against the answers
-  already decided (`fieldVisible`, `eq`/`neq` compared with `===`; an
-  unreferenced key ⇒ `eq` false / `neq` true), and a not-visible or
-  unanswerable field (no options, non-multiselect type) is omitted
-  from the reply — the server 400s on a reply that includes a field
-  whose `when` isn't satisfied, so sending it is not optional. Every
-  early exit from the field loop logs a distinct `reason`
-  (`form-jev-not-allow`, `form-pick-not-offered`,
-  `form-pick-ambiguous`, `form-unsupported-field`,
-  `form-field-hidden`) with `fieldKey` instead of returning silently;
-  any aborting reason leaves the form pending for the human, same as
-  any other ask-human.
-- **The event-subscription loop is sequential, by construction, not
-  by oversight — documented as an accepted limitation, not fixed.**
-  The same review traced `for await (const event of ctx.event.
-  subscribe(...))` (`index.ts`) against `@opencode/plugin`'s actual
-  iterator implementation and confirmed it's a plain pull-based async
-  iterator: `await handleOne(...)` for one permission blocks the loop
-  from even starting the next event (of any kind) until that gate
-  round-trip finishes (up to `timeoutMs`, 25s default/30s max). Under
-  concurrent load — the exact scenario this plugin's autonomy design
-  targets — later simultaneous permissions queue behind earlier ones,
-  each additionally exposed to the reply-window pressure issue #15
-  was fixed for. This also means `inFlight`'s "concurrent duplicates
-  await the same promise" branch is currently unreachable (only one
-  requestID can occupy it at a time by construction) — not incorrect,
-  just dead code a future maintainer could misread as live concurrency
-  protection. Parallelizing event dispatch would touch the exact
-  dedup/claim logic that caused issue #15/R52/R55/R57's duplicate-
-  evaluation bugs, so it's being left as a known, named limitation for
-  a dedicated change with its own review, not folded into this cycle's
-  fixes. The unbounded growth of `resolved`/`endedSessions`/`formSeen`
-  that the same review flagged *was* fixed here — a size cap
-  (`capped()`, 2000 entries, clears rather than tracking per-entry
-  age) — since that one was low-risk and additive, unlike parallelizing
-  the loop.
+  multichoice picks.** In `handleFormAsked`, a `multiselect` field's
+  reply value is an **array** of the picked option values
+  (`{"answer":{"q0":["pizza"]}}`) rather than a string; `hidden`/`when`
+  conditions gate each field against the answers already decided
+  (`fieldVisible`, `eq`/`neq` compared with `===`; an unreferenced key
+  ⇒ `eq` false / `neq` true), and a not-visible or unanswerable field
+  (no options, non-multiselect type) is omitted from the reply — the
+  server 400s on a reply that includes a field whose `when` isn't
+  satisfied. Every early exit from the field loop logs a distinct
+  `reason` (`form-jev-not-allow`, `form-pick-not-offered`,
+  `form-pick-ambiguous`, `form-unsupported-field`, `form-field-hidden`)
+  with `fieldKey` instead of returning silently; any aborting reason
+  leaves the form pending for the human, same as any other ask-human.
+- **The event-subscription loop is sequential, by construction.** The
+  `for await (const event of ctx.event.subscribe(...))` loop
+  (`index.ts`) is a plain pull-based async iterator: `await
+  handleOne(...)` for one permission blocks the loop from starting the
+  next event (of any kind) until that gate round-trip finishes (up to
+  `timeoutMs`, 25s default/30s max). Under concurrent load, later
+  simultaneous permissions queue behind earlier ones. This also means
+  `inFlight`'s "concurrent duplicates await the same promise" branch is
+  currently unreachable (only one requestID can occupy it at a time by
+  construction) — dead code, not incorrect, kept because parallelizing
+  event dispatch would touch the dedup/claim logic directly and needs
+  its own dedicated review. `resolved`/`endedSessions`/`formSeen` are
+  bounded (`capped()`, 2000 entries, clears rather than tracking
+  per-entry age) to prevent unbounded growth.
 - **Jev decides, no thresholds.** The winning action is whatever
   Jev's `decision` answer says, at any confidence. Safe/risk answers
   are evidence, not vetoes. Unknown strings and errors still degrade
   to ask-human; catastrophic patterns never reach Jev.
 - **One evaluation per request, claimed before calling Jev.** The
   server may emit the same permission request more than once while
-  pending, AND `setup()` runs more than once per opencode process
-  (confirmed: same `pid`, different `inst` in the log) — two independent
-  plugin instances can receive the same event. An exclusive marker file
-  (`.jev-gate-replied/<requestID>`) is claimed at the top of `handleOne`,
-  before any Jev call: the loser skips entirely (no Jev call, no reply
-  attempt), the winner evaluates and replies once. Form answers use the
-  same pattern with a `form:`-prefixed claim key. Within one
-  instance, in-flight sharing + a resolved cache also dedupe cheaply;
-  late duplicates log `duplicate-suppressed` — except on the form path
-  (#59), where a losing claim logs nothing at all: with 15+ sibling
-  instances racing every form, the losers' `duplicate-suppressed` rows
-  were ~90% of the log while carrying zero information (losing is the
-  expected outcome, not an event).
-- **One shared form poller per process, listing per project directory
-  (#58, #59).** Each `setup()` instance used to start its own 750ms
-  `opencode api GET /api/form` interval — with 15–40 project
-  directories in one process, ~20 CLI spawns/second at idle (~2 cores).
-  Module-level state (`registerPoller`/`unregisterPoller`, exported for
-  tests) now means the first instance starts the single interval and
-  later ones only register their handler; the last cleanup stops it.
-  Each `setup()` also registers its own `ctx.location.directory`
+  pending, and `setup()` runs more than once per opencode process — two
+  independent plugin instances can receive the same event. An exclusive
+  marker file (`.jev-gate-replied/<requestID>`) is claimed at the top of
+  `handleOne`, before any Jev call: the loser skips entirely (no Jev
+  call, no reply attempt), the winner evaluates and replies once. Form
+  answers use the same pattern with a `form:`-prefixed claim key. Within
+  one instance, in-flight sharing plus a resolved cache also dedupe
+  cheaply; late duplicates log `duplicate-suppressed` — except on the
+  form path, where a losing claim logs nothing at all (with many sibling
+  instances racing every form, losing is the expected outcome, not an
+  event worth a log row).
+- **One shared form poller per process, listing per project directory.**
+  Each `setup()` instance would otherwise start its own 750ms
+  `opencode api GET /api/form` interval, one per project directory in
+  the process. Module-level state (`registerPoller`/`unregisterPoller`,
+  exported for tests) means the first instance starts the single
+  interval and later ones only register their handler; the last cleanup
+  stops it. Each `setup()` also registers its own `ctx.location.directory`
   (refcounted, removed on cleanup) and every tick lists each known
   directory via `GET /api/form?location[directory]=<dir>`
   (`formListPath`, encoded with `encodeURIComponent`) — the bare
-  endpoint only lists the service's own directory, so project sessions'
-  forms were previously always `[]` and never auto-answered. With no
-  known directory it falls back to the bare endpoint. At most one tick
-  runs at a time (a still-running tick skips the next one) so slow
-  listings can't stack processes. The tick uses any one registered
-  handler's ctx (`session.context` is a process-wide RPC).
+  endpoint only lists the service's own directory. With no known
+  directory it falls back to the bare endpoint. At most one tick runs at
+  a time (a still-running tick skips the next one) so slow listings
+  can't stack processes. The tick uses any one registered handler's ctx
+  (`session.context` is a process-wide RPC).
 - **Single-writer log.** The plugin logs every decision; the Python
   gate stays silent when spawned by the plugin (`JEV_GATE_CLI_LOG=0`)
   and logs only in standalone use.
@@ -299,7 +252,7 @@ Live autonomy check (non-interactive, against a running service):
 
 | File | Owns |
 | ---- | ---- |
-| `plugin/jev-decision-gate/index.ts` | hook, catastrophic, kind, objective, form API poll/reply, human alert, spawn (`pythonBin`/mise/`PYTHONPATH`), log |
+| `plugin/jev-decision-gate/index.ts` | hook, catastrophic, kind, objective, question tool wrap, form API poll/reply, spawn (`pythonBin`/mise/`PYTHONPATH`), log |
 | `src/jev_gate/schemas.py` | brief, redaction, questions |
 | `src/jev_gate/client.py` | SDK wrapper, usage passthrough |
 | `src/jev_gate/decision.py` | decision combine, no thresholds (pure, fully tested) |

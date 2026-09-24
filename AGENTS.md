@@ -18,11 +18,18 @@ opencode v2 → index.ts ctx.permission.hook("evaluate") → spawn python3 -m je
             → decision.py combines the answer → cli.py prints JSON
             → index.ts sets input.effect allow / deny+message / leaves "ask"
               (ask → opencode prompts the human; no reply API involved)
-opencode v2 → question tool opens form (metadata.kind=question)
-            → index.ts polls GET /api/form (also listens form.created /
-              legacy question events) → Jev pick
-            → POST /api/session/{sessionID}/form/{formID}/reply
-              body {"answer":{"q0":"<pick>"}}
+
+opencode v2 → question tool permission → evaluate hook allows it through
+              instantly, no Jev call (reason: question-permission-passthrough)
+            → ctx.tool.transform wraps the question tool itself → asks Jev
+              each field in-process (phase: question-tool) and answers there
+              when Jev can decide
+            → if that path can't answer, OpenCode opens a form
+              (metadata.kind=question) → index.ts polls GET /api/form (also
+              listens for form.created / legacy question events) → Jev pick
+              → POST /api/session/{sessionID}/form/{formID}/reply
+              body {"answer":{"q0":"<pick>"}} (phase: form-answer, human
+              fallback)
 ```
 
 Full flow and ADRs: `docs/ARCHITECTURE.md`. Read it before touching the
@@ -39,24 +46,20 @@ two separate products — but they are NOT interchangeable and a given
 install is one or the other, never both under the same binary.
 
 **Do not "simplify" by porting this gate to the 1.18.x line.** Its
-`permission.ask` hook is confirmed dead code since v1.3.0 (see
-`docs/TROUBLESHOOTING.md` for the issue links) — a plugin using it
-loads cleanly and is simply never called. As of 2026-09-24 this
-environment runs `opencode` 2.0.16 from `~/.opencode/bin/opencode` (the
-official installer's path; the earlier cleanup kept this one), and
-2026-09-20 notes below refer to the then-current 2.0.11 install after removing
-several redundant/stale installs (a separate `opencode-v2` binary copy,
-a pnpm global `opencode-ai@1.18.25`, a stale `~/.opencode/bin/opencode`,
-a desktop app) that had accumulated across sessions — keep it that way;
-don't hand-copy a binary under a new name to "pin" a version (see
-TROUBLESHOOTING for why that breaks the canonical install instead).
+`permission.ask` hook is dead code — a plugin using it loads cleanly
+and is simply never called (see `docs/TROUBLESHOOTING.md` for
+details). Install `opencode` from the official installer
+(`~/.opencode/bin/opencode`); don't keep multiple copies (a renamed
+binary, a pnpm global `opencode-ai` install, a desktop app) side by
+side, and don't hand-copy a binary under a new name to "pin" a
+version — see `docs/TROUBLESHOOTING.md` for why that breaks the
+canonical install.
 
 **`"permission": "allow"` in opencode.json means the gate does
-nothing.** Confirmed on 2.0.11: no `permission.asked` event fires at
-all when the ambient mode is already `allow` — there is nothing to
-intercept. The config (global or project) must set
-`"permission": "ask"` for Jev to ever get consulted. If a fresh install
-"does nothing" with no errors, check this first.
+nothing.** No `permission.asked` event fires when the ambient mode is
+already `allow` — there is nothing to intercept. The config (global or
+project) must set `"permission": "ask"` for Jev to ever get consulted.
+If a fresh install "does nothing" with no errors, check this first.
 
 The `@opencode/plugin` SDK package version (`plugin/package.json`) and
 the `opencode` CLI binary version are independently numbered — pin the
@@ -96,38 +99,29 @@ bug.
    `ctx.session.context` and **no** Jev call
    (`reason: "question-permission-passthrough"`). The answer itself
    comes from the wrapped `question` tool (`ctx.tool.transform`,
-   `phase: "question-tool"`), not from the form, whenever Jev can
-   answer (#69); the form path is the human fallback.
-   On OpenCode 2.0.x the question tool then opens a **form**
-   (`metadata.kind=question`, listed at `GET /api/form`). The plugin
+   `phase: "question-tool"`), which asks Jev each field in-process and
+   answers there whenever Jev can decide; the form path
+   (OpenCode opens a form, `metadata.kind=question`, listed at
+   `GET /api/form`) is the human fallback for when it can't. The plugin
    polls `/api/form` (and also listens for `form.created` / legacy
    question events); Jev picks; the plugin replies with
    `POST /api/session/{sessionID}/form/{formID}/reply` body
    `{"answer":{"q0":"<pick>"}}`. Log shows `phase: form-answer` then
-   `reason: question-answered`. That closes the old “pick is log-only”
-   model. Mid-flight `session.context` on the permission path was
-   implicated (not proven) in the post-pick hang; three earlier fixes
-   failed (cross-instance race, skip-reply-once, skip-reply-again-with-
-   evidence). Live-verified on 2.0.11: form reply unblocks the question
-   tool and the agent continued (`ELEGIDO=pizza`, idle succeeded) —
-   do **not** generalize that to “hang fixed for all cases.” Read
-   `docs/TROUBLESHOOTING.md` "Question dialog hangs" before changing
-   this path again.
+   `reason: question-answered`. Read `docs/TROUBLESHOOTING.md`
+   "Question dialog hangs" before changing this path again.
 5. **`setup()` runs once per project directory, so many times per
-   opencode process.** Confirmed live on 2.0.16: a new `inst` appears
-   for each new session directory (15+ in one process), and every
-   instance sees the process-wide event stream. Any code path that
-   evaluates or replies must claim first (see `claimReply` in
-   `index.ts`); the `evaluate` hook claims on
+   opencode process.** A new `inst` appears for each new session
+   directory, and every instance sees the process-wide event stream.
+   Any code path that evaluates or replies must claim first (see
+   `claimReply` in `index.ts`); the `evaluate` hook claims on
    `eval:<sessionID>:<source>:<action>:<sha>`. Assume you are racing
    sibling instances. **Each instance also gets its own copy of the
    module**, so anything that must be shared per process (poller,
    dedup sets) goes on `globalThis[Symbol.for("jev-decision-gate.shared.v1")]`,
-   never in a module-level `const`/`let` (#59: that silently produced
-   one poller per directory).
+   never in a module-level `const`/`let`.
 6. **Deny always carries a `message`.** A bare reject aborts the
-   agent's whole turn (#60). The `evaluate` hook sets `input.message`
-   on every deny.
+   agent's whole turn. The `evaluate` hook sets `input.message` on
+   every deny.
 
 ## Finish on main, nowhere else
 
@@ -185,12 +179,10 @@ interactive permission/dialog flow can only be verified by hand (or
 Any change that touches behavior, a supported version, a config
 requirement, or a known limitation MUST update the relevant doc in the
 same change: `docs/ARCHITECTURE.md` (flow/ADRs), `docs/TROUBLESHOOTING.md`
-(symptoms/fixes), `CHANGELOG.md` (`[Unreleased]`), and this file when
-the fact belongs here. A fix that works but isn't documented is not
-done — the next session (human or agent) will rediscover the same dead
-end from scratch, as happened repeatedly in this repo's own history
-(the opencode-v2/opencode-ai confusion, the dead `permission.ask`
-hook, the `permission: allow` no-op) before it got written down.
+(symptoms/fixes), and this file when the fact belongs here. History is
+not kept in the repo; `git log` is the changelog. A fix that works but
+isn't documented is not done — the next session (human or agent) will
+rediscover the same dead end from scratch.
 
 ## Where development artifacts go
 
@@ -200,9 +192,7 @@ records *how* the project got built rather than *what it currently is*
 — goes in `.dev/` at the repo root, which is gitignored. Never commit
 this kind of file under `docs/` or the repo root: `docs/` is what a
 contributor reads to understand the current system, and process notes
-mixed in there read as confusing clutter, not documentation (this repo
-shipped `docs/superpowers/plans/` and a root `ITERATION.md` publicly
-for a while before this was fixed).
+mixed in there read as confusing clutter, not documentation.
 
 - Still being added to across sessions (e.g. an ongoing round/iteration
   log) → keep it in `.dev/`, don't delete it.
@@ -222,21 +212,13 @@ sequence. Don't report an `index.ts` fix as done from a green `tsc` run
 alone.
 
 **A live service picks up `index.ts` edits without a restart — mid-edit
-inconsistent states are live-reachable, not just theoretical.**
-Live-verified 2026-09-23: while removing `alertHuman()` (function body
-first, its 9 call sites across several separate edits after), the
-already-running service logged 3 real `error_class: "alertHuman is not
-defined"` fail-opens for in-flight permissions, timestamped inside that
-exact edit window — the safety net caught it correctly (fail-open, not
-a crash or silent allow), but it confirms the running process re-reads
-this file per-event rather than caching it once at `setup()`. This
-does *not* extend to `setup()`'s own subscriptions/closures (`inst`,
-the `resolved`/`endedSessions`/`formSeen` maps): the subagent-
-enrichment fix from earlier the same day was confirmed still absent
-from live behavior hours after merging, until the service was actually
-restarted — so some state is per-process-start, some (at least
-function bodies referenced from within) is picked up live. Practical
-consequence: prefer one atomic edit over several incremental ones when
-a live service might be evaluating real permissions during the edit,
-or expect (and don't be alarmed by) a handful of harmless fail-opens
-logged with a JS error as `error_class` during the window.
+inconsistent states are live-reachable, not just theoretical.** The
+running process re-reads this file per-event rather than caching
+function bodies once at `setup()`, but `setup()`'s own
+subscriptions/closures (`inst`, the `resolved`/`endedSessions`/
+`formSeen` maps) are only picked up on a fresh `setup()` call, i.e.
+after a restart. Practical consequence: prefer one atomic edit over
+several incremental ones when a live service might be evaluating real
+permissions during the edit, and expect (don't be alarmed by) a
+handful of harmless fail-opens logged with a JS error as `error_class`
+during such a window.

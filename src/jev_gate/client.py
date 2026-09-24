@@ -11,8 +11,8 @@ class JevCallError(Exception):
 def _finite_float(x):
     """float(x), but reject NaN/Infinity too.
 
-    Round 6 review, live-verified: neither the SDK's pydantic models nor
-    Python's own float()/json.loads() reject a non-finite confidence —
+    Neither the SDK's pydantic models nor Python's own
+    float()/json.loads() reject a non-finite confidence —
     json.dumps(float("nan")) emits a bare `NaN` token, which is invalid
     JSON (RFC 8259) and breaks the TS side's JSON.parse of the gate's
     stdout, turning a value decision.combine() doesn't even use for

@@ -90,8 +90,8 @@ def test_redact_secrets_closes_security_review_gaps():
     # scheme/user/host/port/path kept visible for debugging context.
     assert redact_secrets("postgresql://admin:hunter2VerySecret@db.internal:5432/prod") == \
         "postgresql://admin:[REDACTED]@db.internal:5432/prod"
-    # No prefix before the keyword must still work (regression check for the
-    # widened "keyword embedded in a longer identifier" pattern).
+    # No prefix before the keyword must still work: the "keyword embedded
+    # in a longer identifier" pattern must match without one.
     assert "[REDACTED]" in redact_secrets("password: hunter2345")
     assert "[REDACTED]" in redact_secrets("token=abcd1234")
 

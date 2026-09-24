@@ -22,25 +22,23 @@ _SECRET_PATTERNS = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     # scheme://user:PASSWORD@host — redact only the password, keep the
     # rest (host/port/path) visible for debugging context. Scheme repetition
-    # bounded to 20 (real schemes are a handful of chars) — round 11 finding:
-    # an unbounded `*` here is O(n^2) on long input with no "://" anywhere
-    # (live-verified: 50k chars took 1.15s unbounded, 0.001s bounded; the
+    # is bounded to 20 (real schemes are a handful of chars): an unbounded
+    # `*` here is O(n^2) on long input with no "://" anywhere, and the
     # standalone `python3 -m jev_gate.cli` has no other length guard on
-    # `objective`, so this was reachable with a multi-MB stdin payload).
+    # `objective`, so this is reachable with a multi-MB stdin payload.
     re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]{0,20}://[^\s/:@]+):([^\s/@]{1,})@"),
     # Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
     # not just stand alone (password=...) — the keyword can appear anywhere
     # in the token, not only at its start. The flanking runs are bounded
-    # to 56 (round 11 rule): unbounded stars here are O(n^2) on
-    # keyword-dense input with no "=" anywhere (live-verified:
-    # `PASSWORD` * 20000 took 38s) — each mid-string keyword match
-    # re-scans an O(n) greedy tail looking for a separator that never
-    # comes. Real identifiers are far shorter than 56+8+56 chars.
+    # to 56: unbounded stars here are O(n^2) on keyword-dense input with
+    # no "=" anywhere, since each mid-string keyword match re-scans an
+    # O(n) greedy tail looking for a separator that never comes. Real
+    # identifiers are far shorter than 56+8+56 chars.
     re.compile(r"(?i)(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s\"']{4,})"),
 ]
 
-# CLI-flag credentials (issue #63): secrets passed as flag values rather
-# than KEY=VALUE. Every repetition below is bounded (round 11 rule).
+# Secrets passed as CLI flag values rather than KEY=VALUE. Every
+# repetition below is bounded, for the same O(n^2) reason as above.
 # curl -u/--user user:pass — keep the user, redact only the password.
 _CLI_USER_RE = re.compile(r"(--user\s+|-u\s+)([^\s:'\"]{1,100}):([^\s'\"`]{1,200})")
 # --password value / --password=value on any command (single-dash too).
@@ -49,10 +47,9 @@ _CLI_PASSWORD_FLAG_RE = re.compile(r"(^|[\s;|&({['\"`])(-{1,2}password)(=|\s+)([
 # `aws configure set aws_secret_access_key hunter2`). The name must be
 # env-var-shaped — ALL-CAPS or containing an underscore — so prose like
 # `fix password reset flow` or `grep -r token src/` is untouched.
-# Shape note (round 11 rule): ONE bounded token run, with the
-# keyword/caps/underscore checks in Python code — not nested
-# `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars in the regex, which is O(n^2)
-# on underscore-dense input (live-verified: `a_` * 25000 hung).
+# ONE bounded token run, with the keyword/caps/underscore checks done
+# in Python code — not nested `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars
+# in the regex, which is O(n^2) on underscore-dense input.
 # Overlapping candidates (`set aws_secret_access_key VALUE`: the rejected
 # `set ...` pair must not swallow the real token) rule out a plain
 # sub() — hence the manual scan, which advances one char on reject
@@ -127,11 +124,10 @@ def sha256_hex(text):
     # surrogate reaches here in ordinary (non-adversarial) use whenever an
     # emoji/non-BMP character lands on one of index.ts's plain .slice(0, N)
     # truncation boundaries (JS slices UTF-16 code units, not code points).
-    # Strict encoding raised UnicodeEncodeError, which build_state() caught
-    # as a generic "exception" (fails open, but loses the real cause) and
-    # which _write_log_entry()'s blanket except silently swallowed —
-    # dropping that entire log line with no trace (round 7 review,
-    # live-verified: 0-byte log file for an event that did happen).
+    # Strict encoding would raise UnicodeEncodeError, which build_state()
+    # catches as a generic "exception" (fails open, but loses the real
+    # cause) and which _write_log_entry()'s blanket except would silently
+    # swallow — dropping that entire log line with no trace.
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
