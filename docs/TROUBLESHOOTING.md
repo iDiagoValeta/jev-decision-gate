@@ -63,9 +63,9 @@ since nothing else resolves the permission first.
 That IS the fail-open design — but find out why:
 
 ```bash
-python3 -m jev_gate.doctor
-tail -5 "${JEV_GATE_LOG:-decisions-plugin.jsonl}"
-python3 scripts/measure.py
+python3 -m jev_gate.doctor      # "log writable (<path>)" is the log the plugin writes
+python3 scripts/measure.py      # same path, printed as log=<path>
+tail -5 <that path>
 ```
 
 | Symptom in log | Cause | Fix |

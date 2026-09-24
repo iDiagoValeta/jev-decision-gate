@@ -145,7 +145,7 @@ the notes say.
   `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps
-- `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2,
+- `scripts/` — `install.sh`, `uninstall.sh`, `measure.py` v2,
   `verify_autonomy.py` (live autonomy check)
 - `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
