@@ -463,6 +463,52 @@ export function valueForPick(field: unknown, pick: string): string | null {
   return matches.length > 0 ? matches[0] : pick
 }
 
+// Issue #57: a form field is only answerable when it's not hidden and all
+// its `when` conditions hold against the answers already decided for
+// earlier fields. `eq`/`neq` compare with `===` (the schema gives no
+// coercion rules; a numeric when-value won't match a string answer, which
+// is the safe direction). An unreferenced key counts as unanswered: `eq`
+// is false, `neq` is true. A malformed condition can't be verified, so it
+// fails safe (field not visible) rather than risking a reply value that
+// violates an unparseable constraint. Callers skip the field entirely —
+// no Jev call, no answer entry (the server 400s on a reply that includes
+// a field whose `when` isn't satisfied).
+export function fieldVisible(field: unknown, answers: Record<string, unknown>): boolean {
+  if (!field || typeof field !== "object") return true
+  const f = field as { hidden?: unknown; when?: unknown }
+  if (f.hidden === true) return false
+  const lookup = answers && typeof answers === "object" ? answers : {}
+  const when = f.when
+  if (!Array.isArray(when)) return true
+  for (const cond of when) {
+    if (!cond || typeof cond !== "object") return false
+    const c = cond as { key?: unknown; op?: unknown; value?: unknown }
+    if (typeof c.key !== "string" || c.key === "") return false
+    const op = c.op === "neq" ? "neq" : "eq"
+    const answered = lookup[c.key]
+    if (op === "neq") {
+      if (answered !== undefined && answered === c.value) return false
+    } else {
+      if (answered === undefined || answered !== c.value) return false
+    }
+  }
+  return true
+}
+
+// Issue #55: encodes Jev's pick into the value the form reply API expects
+// for this field's type. multiselect fields take an array of option values
+// (Jev's single pick -> one-element array; a future list pick is mapped
+// element-wise by the caller). Every other field takes a plain string.
+// Ambiguity (valueForPick returning null — two options collide after
+// redaction/truncation) propagates as null; callers treat it as ask-human.
+export function encodeAnswer(field: unknown, pick: string): string | string[] | null {
+  const value = valueForPick(field, pick)
+  if (value === null) return null
+  const type = field && typeof field === "object" ? (field as { type?: unknown }).type : undefined
+  if (type === "multiselect") return [value]
+  return value
+}
+
 /** List pending interactive forms (question tool uses kind=question forms on 2.0.x). */
 export function listPendingForms(): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve) => {
@@ -568,7 +614,7 @@ export function postApiReply(apiPath: string, body: Record<string, unknown>, err
 }
 
 /** Submit answers to a pending OpenCode form (question tool on 2.0.x). */
-function replyFormAnswer(sessionID: string, formID: string, answer: Record<string, string>): Promise<void> {
+function replyFormAnswer(sessionID: string, formID: string, answer: Record<string, string | string[]>): Promise<void> {
   return postApiReply(`/api/session/${sessionID}/form/${formID}/reply`, { answer }, "form-reply")
 }
 
@@ -1118,7 +1164,7 @@ async function handleFormAsked(
   }
 
   const fields = Array.isArray(payload.fields) ? payload.fields : []
-  const answer: Record<string, string> = {}
+  const answer: Record<string, string | string[]> = {}
   const picks: string[] = []
 
   try {
@@ -1135,7 +1181,50 @@ async function handleFormAsked(
         field && typeof field === "object" && typeof (field as { key?: unknown }).key === "string"
           ? String((field as { key: string }).key)
           : `q${fi}`
+      const type = field && typeof field === "object" ? (field as { type?: unknown }).type : undefined
+
+      // Issue #57: conditional/hidden fields are skipped — no Jev call, no
+      // answer entry — when their visibility doesn't hold against the
+      // answers already decided. The server 400s on a reply that includes
+      // a field whose `when` isn't satisfied, so this is not optional.
+      if (!fieldVisible(field, answer)) {
+        log({
+          sessionID,
+          requestID: formID,
+          tool: "question",
+          gateAction: "ask-human",
+          reason: "form-field-hidden",
+          fieldKey: key,
+          phase: "form-answer",
+        })
+        continue
+      }
+
       const labels = labelsFromFormField(field)
+      const required =
+        field && typeof field === "object" ? (field as { required?: unknown }).required === true : false
+
+      // Issue #57: a visible field with no options and a non-multiselect
+      // type (boolean/number/free-string) can't be answered by a pick —
+      // there is nothing for Jev to choose from. Log before calling Jev
+      // and don't call it. A non-required one is skipped (the form keeps
+      // going); a required one aborts the form (ask-human: the field
+      // stays pending for the human, since it can't be filled for them).
+      if (labels.length === 0 && type !== "multiselect") {
+        log({
+          sessionID,
+          requestID: formID,
+          tool: "question",
+          gateAction: "ask-human",
+          reason: "form-unsupported-field",
+          fieldKey: key,
+          required,
+          phase: "form-answer",
+        })
+        if (required) return
+        continue
+      }
+
       const title = field && typeof field === "object" ? String((field as { title?: unknown }).title ?? "") : ""
       const description =
         field && typeof field === "object" ? String((field as { description?: unknown }).description ?? "") : ""
@@ -1179,18 +1268,118 @@ async function handleFormAsked(
         phase: "form-answer",
       })
 
-      if (decision.action !== "allow" || typeof decision.pick !== "string" || !decision.pick) {
+      // Issue #57: no more silent early exits from the field loop — every
+      // one logs a distinct reason with gateAction "ask-human" (the field
+      // stays pending for the human) and this fieldKey.
+      const rawPick = decision.pick
+      if (decision.action !== "allow" || rawPick == null) {
+        log({
+          sessionID,
+          requestID: formID,
+          tool: "question",
+          gateAction: "ask-human",
+          reason: "form-jev-not-allow",
+          fieldKey: key,
+          decisionAction: decision.action,
+          decisionReason: decision.reason,
+          pick: rawPick ?? null,
+          phase: "form-answer",
+        })
         return
       }
-      if (labels.length > 0 && !labels.includes(decision.pick)) {
+      let pickList: string[]
+      if (!Array.isArray(rawPick)) {
+        if (typeof rawPick !== "string" || rawPick === "") {
+          log({
+            sessionID,
+            requestID: formID,
+            tool: "question",
+            gateAction: "ask-human",
+            reason: "form-jev-not-allow",
+            fieldKey: key,
+            decisionAction: decision.action,
+            decisionReason: decision.reason,
+            pick: rawPick,
+            phase: "form-answer",
+          })
+          return
+        }
+        pickList = [rawPick]
+      } else {
+        if (rawPick.length === 0 || rawPick.some((p) => typeof p !== "string" || p === "")) {
+          log({
+            sessionID,
+            requestID: formID,
+            tool: "question",
+            gateAction: "ask-human",
+            reason: "form-jev-not-allow",
+            fieldKey: key,
+            decisionAction: decision.action,
+            decisionReason: decision.reason,
+            pick: rawPick,
+            phase: "form-answer",
+          })
+          return
+        }
+        pickList = rawPick as string[]
+      }
+      if (labels.length > 0 && pickList.some((p) => !labels.includes(p))) {
+        log({
+          sessionID,
+          requestID: formID,
+          tool: "question",
+          gateAction: "ask-human",
+          reason: "form-pick-not-offered",
+          fieldKey: key,
+          pick: rawPick,
+          phase: "form-answer",
+        })
         return
       }
-      const value = valueForPick(field, decision.pick)
-      if (value === null) {
+      const values: string[] = []
+      for (const p of pickList) {
+        const encoded = encodeAnswer(field, p)
+        if (encoded === null) {
+          log({
+            sessionID,
+            requestID: formID,
+            tool: "question",
+            gateAction: "ask-human",
+            reason: "form-pick-ambiguous",
+            fieldKey: key,
+            pick: p,
+            phase: "form-answer",
+          })
+          return
+        }
+        if (typeof encoded === "string") values.push(encoded)
+        else values.push(...encoded)
+      }
+      if (type !== "multiselect" && values.length !== 1) {
+        // Several picks for a single-select field: can't tell which one Jev
+        // meant. Same treatment as any other ambiguity.
+        log({
+          sessionID,
+          requestID: formID,
+          tool: "question",
+          gateAction: "ask-human",
+          reason: "form-pick-ambiguous",
+          fieldKey: key,
+          pick: rawPick,
+          phase: "form-answer",
+        })
         return
       }
-      picks.push(decision.pick)
-      answer[key] = value
+      picks.push(...pickList)
+      answer[key] = type === "multiselect" ? values : values[0]
+    }
+
+    // Every field was skipped (hidden or unsupported): the server accepts an
+    // empty answer, which would submit the form on the human's behalf with
+    // nothing in it. Leave it pending for the human instead.
+    if (Object.keys(answer).length === 0) {
+      log({ sessionID, requestID: formID, tool: "question", gateAction: "ask-human", reason: "form-nothing-answerable", phase: "form-answer" })
+      return
     }
 
     try {

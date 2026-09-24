@@ -7,6 +7,25 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Form auto-answer now handles `multiselect` fields and conditional
+  (`hidden`/`when`) fields correctly (issues #55, #57).** A
+  `multiselect` field's reply value is an array of the picked option
+  values (Jev's single pick → `["<value>"]`; a list pick is mapped
+  element-wise). Conditional fields are gated by `fieldVisible` against
+  the answers already decided (`eq`/`neq` compared with `===`; an
+  unreferenced key makes `eq` false and `neq` true), and a not-visible
+  field is omitted from the reply — the server 400s on a reply that
+  includes a field whose `when` isn't satisfied. A visible field with
+  no options and a non-multiselect type (boolean/number/free-string)
+  can't be answered by a pick: it's logged and skipped, or — when
+  `required` — aborts the form, instead of sending Jev an option-less
+  question. Every early exit from the field loop now logs a distinct
+  `reason` (`form-jev-not-allow`, `form-pick-not-offered`,
+  `form-pick-ambiguous`, `form-unsupported-field`,
+  `form-field-hidden`, all with `fieldKey`) instead of returning
+  silently. Two new exported pure helpers, `fieldVisible` and
+  `encodeAnswer`, unit-tested alongside the existing form helpers
+  (62 TS tests now, was 53).
 - **Secret redaction now covers credentials passed as CLI flags
   (issue #63).** Both layers (`redactSecrets` in
   `plugin/jev-decision-gate/index.ts` and `redact_secrets` in

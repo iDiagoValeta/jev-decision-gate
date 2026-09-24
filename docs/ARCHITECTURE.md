@@ -159,6 +159,22 @@ Live autonomy check (non-interactive, against a running service):
   `valueForPick` re-derives the same normalization at lookup time
   (rather than assuming a positional mapping) so a truncated/redacted
   pick still round-trips to its real underlying value.
+- **Form answers honor field types and visibility, not just
+  multichoice picks (issues #55/#57).** In `handleFormAsked`, a
+  `multiselect` field's reply value is an **array** of the picked
+  option values (`{"answer":{"q0":["pizza"]}}`) rather than a string;
+  `hidden`/`when` conditions gate each field against the answers
+  already decided (`fieldVisible`, `eq`/`neq` compared with `===`; an
+  unreferenced key ⇒ `eq` false / `neq` true), and a not-visible or
+  unanswerable field (no options, non-multiselect type) is omitted
+  from the reply — the server 400s on a reply that includes a field
+  whose `when` isn't satisfied, so sending it is not optional. Every
+  early exit from the field loop logs a distinct `reason`
+  (`form-jev-not-allow`, `form-pick-not-offered`,
+  `form-pick-ambiguous`, `form-unsupported-field`,
+  `form-field-hidden`) with `fieldKey` instead of returning silently;
+  any aborting reason leaves the form pending for the human, same as
+  any other ask-human.
 - **The event-subscription loop is sequential, by construction, not
   by oversight — documented as an accepted limitation, not fixed.**
   The same review traced `for await (const event of ctx.event.
