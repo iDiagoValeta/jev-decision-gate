@@ -94,7 +94,10 @@ bug.
    single Jev+`session.context` permission path.** In the `evaluate`
    hook, `action === "question"` gets `effect = "allow"` with **no**
    `ctx.session.context` and **no** Jev call
-   (`reason: "question-permission-passthrough"`).
+   (`reason: "question-permission-passthrough"`). The answer itself
+   comes from the wrapped `question` tool (`ctx.tool.transform`,
+   `phase: "question-tool"`), not from the form, whenever Jev can
+   answer (#69); the form path is the human fallback.
    On OpenCode 2.0.x the question tool then opens a **form**
    (`metadata.kind=question`, listed at `GET /api/form`). The plugin
    polls `/api/form` (and also listens for `form.created` / legacy
@@ -117,7 +120,11 @@ bug.
    evaluates or replies must claim first (see `claimReply` in
    `index.ts`); the `evaluate` hook claims on
    `eval:<sessionID>:<source>:<action>:<sha>`. Assume you are racing
-   sibling instances.
+   sibling instances. **Each instance also gets its own copy of the
+   module**, so anything that must be shared per process (poller,
+   dedup sets) goes on `globalThis[Symbol.for("jev-decision-gate.shared.v1")]`,
+   never in a module-level `const`/`let` (#59: that silently produced
+   one poller per directory).
 6. **Deny always carries a `message`.** A bare reject aborts the
    agent's whole turn (#60). The `evaluate` hook sets `input.message`
    on every deny.

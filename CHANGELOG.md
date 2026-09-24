@@ -7,6 +7,11 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The shared form poller is now actually shared (#59, reopened).**
+  #70 kept it in module scope, but opencode loads one module copy per
+  `setup()`, so there was still one poller per directory (measured: 78
+  poll processes in 10 s with 7 dirs). The state now lives on
+  `globalThis`: 11 in 10 s with 6 dirs.
 - **One shared form poller per process instead of one per project
   directory (#59).** `setup()` runs once per project directory (15–40
   instances in one process, live-verified on 2.0.16), and each instance
@@ -31,6 +36,12 @@ versioning follows [SemVer](https://semver.org/).
   own `duplicate-suppressed`.
 
 ### Changed
+- **The question tool is answered in-process (#69).** The plugin wraps
+  `question`'s `execute`: Jev's picks come back as the tool result, so
+  there is no form and no `opencode api` reply. That works in any
+  opencode server, where form replies 404'd outside the background
+  service. Unanswerable questions fall back to the human form, which
+  the form path then leaves alone.
 - **Permissions are decided in opencode's `evaluate` hook instead of by
   replying to `permission.asked` (#56, #60).** `allow`/`deny` are set on
   the hook input, and a deny carries a `message`, so the agent sees why

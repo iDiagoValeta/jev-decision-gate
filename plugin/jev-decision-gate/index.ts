@@ -1185,6 +1185,129 @@ async function objectiveFor(
   }
 }
 
+// Question tool calls whose questions Jev could not answer and were handed
+// to the tool's own execute (which opens the human form). The form path
+// skips those forms instead of asking Jev the same thing again.
+// opencode loads a separate copy of this module for every setup()
+// instance (one per project directory), so module-level state is NOT
+// shared between instances: #70's "one poller per process" measured as
+// one poller per directory. Process-wide state has to live on
+// globalThis. The versioned key keeps a future incompatible shape from
+// colliding with an instance still running older code.
+type SharedState = {
+  questionsLeftForHuman: Set<string>
+  pollHandlers: Set<PollHandler>
+  pollDirRefs: Map<string, number>
+  formSeen: Set<string>
+  pollTimer: ReturnType<typeof setInterval> | null
+  pollInFlight: boolean
+  pollCursor: number
+}
+const SHARED: SharedState = ((globalThis as Record<symbol, unknown>)[Symbol.for("jev-decision-gate.shared.v1")] ??= {
+  questionsLeftForHuman: new Set<string>(),
+  pollHandlers: new Set<PollHandler>(),
+  pollDirRefs: new Map<string, number>(),
+  formSeen: new Set<string>(),
+  pollTimer: null,
+  pollInFlight: false,
+  pollCursor: 0,
+}) as SharedState
+const questionsLeftForHuman = SHARED.questionsLeftForHuman
+
+export type QuestionToolInput = {
+  questions?: Array<{ question?: unknown; header?: unknown; multiple?: unknown; options?: unknown }>
+}
+
+// Same shape the built-in question tool returns once a human answers
+// (captured live on 2.0.16): output.answers is one array of labels per
+// question, and content is the sentence the model reads.
+export function questionToolResult(
+  input: QuestionToolInput,
+  answers: string[][],
+): { output: { answers: string[][] }; content: string; metadata: { answers: string[][] } } {
+  const qs = Array.isArray(input.questions) ? input.questions : []
+  const pairs = qs.map((q, i) => `"${String(q?.question ?? "")}"="${(answers[i] ?? []).join(", ")}"`).join(", ")
+  return {
+    output: { answers },
+    content: `User has answered your questions: ${pairs}. You can now continue with the user's answers in mind.`,
+    metadata: { answers },
+  }
+}
+
+// Asks Jev each question of one question-tool call. Returns one [label] per
+// question, or null as soon as one cannot be answered (not allow, pick not
+// offered, ambiguous after redaction, or no options): the caller then
+// falls back to the human form for the whole call.
+export async function answerQuestionsWithJev(
+  deps: {
+    runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>
+    objective: () => Promise<string>
+    log: (entry: Record<string, unknown>) => void
+    options: Record<string, unknown>
+  },
+  sessionID: string,
+  callKey: string,
+  input: QuestionToolInput,
+): Promise<string[][] | null> {
+  const qs = Array.isArray(input.questions) ? input.questions : []
+  if (qs.length === 0) return null
+  const objective = await deps.objective()
+  const answers: string[][] = []
+  for (let i = 0; i < qs.length; i++) {
+    const q = qs[i] ?? {}
+    const originals = (Array.isArray(q.options) ? q.options : [])
+      .map((o) => (o && typeof o === "object" ? (o as { label?: unknown }).label : o))
+      .filter((l): l is string => typeof l === "string" && l.length > 0)
+      .slice(0, 10)
+    const base = { sessionID, requestID: callKey, tool: "question", phase: "question-tool", fieldIndex: i }
+    if (originals.length === 0) {
+      deps.log({ ...base, gateAction: "ask-human", reason: "form-unsupported-field" })
+      return null
+    }
+    const labels = originals.map(normalizedLabel)
+    const detail = redactSecrets(
+      [String(q.header ?? ""), String(q.question ?? ""), numberedOptions(labels)].filter(Boolean).join("\n").slice(0, 4000),
+    )
+    const startedAt = Date.now()
+    const { decision, retried } = await deps.runGate(deps.options, {
+      objective,
+      halt: { kind: "multichoice", tool: "question", detail, options: labels, numbered: numberedOptions(labels) },
+      context: { sessionID, requestID: callKey, risk_hints: "interactive-question-tool", fieldIndex: i },
+      policy: { default: "ask-human when unsure" },
+    })
+    deps.log({
+      ...base,
+      kind: "multichoice",
+      gateAction: decision.action,
+      reason: decision.reason,
+      confidence: decision.confidence,
+      model: decision.model,
+      pick: decision.pick ?? null,
+      elapsedMs: Date.now() - startedAt,
+      optionsCount: labels.length,
+      ...(retried ? { retry: 1 } : {}),
+      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+    })
+    const pick = decision.pick
+    if (decision.action !== "allow" || typeof pick !== "string" || !pick) {
+      deps.log({ ...base, gateAction: "ask-human", reason: "form-jev-not-allow" })
+      return null
+    }
+    const matches = originals.filter((o) => normalizedLabel(o) === pick)
+    if (matches.length === 0) {
+      deps.log({ ...base, gateAction: "ask-human", reason: "form-pick-not-offered", pick })
+      return null
+    }
+    if (new Set(matches).size > 1) {
+      deps.log({ ...base, gateAction: "ask-human", reason: "form-pick-ambiguous", pick })
+      return null
+    }
+    answers.push([matches[0] as string])
+  }
+  return answers
+}
+
 // Shared form poller (#59): setup() runs once per project directory, so a
 // process with N project directories used to run N identical 750ms
 // `opencode api GET /api/form` intervals (~20 CLI spawns/second idle, ~2
@@ -1200,12 +1323,9 @@ export interface PollHandler {
   endedSessions: Set<string>
 }
 
-const sharedPollHandlers = new Set<PollHandler>()
-const sharedPollDirRefs = new Map<string, number>()
-const sharedFormSeen = new Set<string>()
-let sharedPollTimer: ReturnType<typeof setInterval> | null = null
-let sharedPollInFlight = false
-let sharedPollCursor = 0
+const sharedPollHandlers = SHARED.pollHandlers
+const sharedPollDirRefs = SHARED.pollDirRefs
+const sharedFormSeen = SHARED.formSeen
 
 function addSharedPollDir(directory: string): void {
   sharedPollDirRefs.set(directory, (sharedPollDirRefs.get(directory) ?? 0) + 1)
@@ -1220,8 +1340,8 @@ function removeSharedPollDir(directory: string): void {
 function tickSharedPoller(): void {
   // One tick in flight at a time: if the previous round of CLI spawns has
   // not finished, skip this tick instead of stacking processes (#59).
-  if (sharedPollInFlight || sharedPollHandlers.size === 0) return
-  sharedPollInFlight = true
+  if (SHARED.pollInFlight || sharedPollHandlers.size === 0) return
+  SHARED.pollInFlight = true
   void (async () => {
     try {
       const handler = [...sharedPollHandlers][0] as PollHandler
@@ -1231,7 +1351,7 @@ function tickSharedPoller(): void {
       // form.created event, so N x 750ms of fallback latency is fine.
       // With none known, keep the bare endpoint (previous behavior).
       const known = [...sharedPollDirRefs.keys()]
-      const dirs: (string | undefined)[] = known.length > 0 ? [known[sharedPollCursor++ % known.length]] : [undefined]
+      const dirs: (string | undefined)[] = known.length > 0 ? [known[SHARED.pollCursor++ % known.length]] : [undefined]
       for (const dir of dirs) {
         const pending = await listPendingForms(dir)
         for (const item of pending) {
@@ -1246,7 +1366,7 @@ function tickSharedPoller(): void {
         }
       }
     } finally {
-      sharedPollInFlight = false
+      SHARED.pollInFlight = false
     }
   })()
 }
@@ -1256,10 +1376,10 @@ export function registerPoller(
   startInterval: typeof setInterval = setInterval,
 ): ReturnType<typeof setInterval> | null {
   sharedPollHandlers.add(handler)
-  if (sharedPollTimer === null) {
-    sharedPollTimer = startInterval(tickSharedPoller, 750)
+  if (SHARED.pollTimer === null) {
+    SHARED.pollTimer = startInterval(tickSharedPoller, 750)
   }
-  return sharedPollTimer
+  return SHARED.pollTimer
 }
 
 export function unregisterPoller(
@@ -1267,9 +1387,9 @@ export function unregisterPoller(
   clearTimer: typeof clearInterval = clearInterval,
 ): void {
   sharedPollHandlers.delete(handler)
-  if (sharedPollHandlers.size === 0 && sharedPollTimer !== null) {
-    clearTimer(sharedPollTimer)
-    sharedPollTimer = null
+  if (sharedPollHandlers.size === 0 && SHARED.pollTimer !== null) {
+    clearTimer(SHARED.pollTimer)
+    SHARED.pollTimer = null
   }
 }
 
@@ -1291,6 +1411,54 @@ export default Plugin.define({
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
     
+    // Answer the question tool in-process (#69): wrapping its execute means
+    // Jev's pick is returned as the tool result directly, with no form and
+    // no reply through `opencode api` (which only reaches the background
+    // service). When Jev cannot answer, the original execute opens the
+    // human form as before. The marker keeps sibling setup() instances
+    // from wrapping the same tool twice.
+    try {
+      await ctx.tool.transform((editor) => {
+        editor.update("question", (tool) => {
+          const t = tool as { execute: (input: unknown, context: unknown) => Promise<unknown>; __jevWrapped?: boolean }
+          if (t.__jevWrapped) return
+          const original = t.execute
+          t.__jevWrapped = true
+          t.execute = async (input: unknown, context: unknown) => {
+            const c = (context ?? {}) as { sessionID?: unknown; messageID?: unknown; id?: unknown }
+            const sessionID = String(c.sessionID ?? "")
+            const callKey = `${String(c.messageID ?? "")}:${String(c.id ?? "")}`
+            try {
+              const answers = await answerQuestionsWithJev(
+                {
+                  runGate,
+                  objective: () =>
+                    objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options))).catch(
+                      () => "Answer the agent's multiple-choice question to unblock the session",
+                    ),
+                  log: logEv,
+                  options,
+                },
+                sessionID,
+                callKey,
+                (input ?? {}) as QuestionToolInput,
+              )
+              if (answers) {
+                logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "allow", reason: "question-answered", phase: "question-tool", pick: answers.map((a) => a.join(", ")).join(" | ") })
+                return questionToolResult((input ?? {}) as QuestionToolInput, answers)
+              }
+            } catch (err) {
+              logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "fail-open", phase: "question-tool", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
+            }
+            capped(questionsLeftForHuman).add(callKey)
+            return original(input, context)
+          }
+        })
+      })
+    } catch (err) {
+      logEv({ reason: "question-tool-wrap-unavailable", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
+    }
+
     // Try to register the synchronous permission.evaluate hook (opencode v2.0.16+)
     // If unavailable, fall back to the permission.asked event path.
     let hookRegistration: { dispose: () => void } | null = null
@@ -1366,7 +1534,7 @@ export default Plugin.define({
     const pollDirStr = typeof pollDir === "string" && pollDir ? pollDir : null
     if (pollDirStr) addSharedPollDir(pollDirStr)
     registerPoller(pollHandler)
-    ;(sharedPollTimer as unknown as { unref?: () => void } | null)?.unref?.()
+    ;(SHARED.pollTimer as unknown as { unref?: () => void } | null)?.unref?.()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -1515,6 +1683,12 @@ export async function handleFormAsked(
   const formID = String(payload.id ?? "")
   if (!sessionID || !formID) {
     log({ sessionID: sessionID || null, requestID: formID || null, tool: "question", gateAction: "ask-human", reason: "missing-ids" })
+    return
+  }
+  const toolRef = (payload.metadata as { tool?: { messageID?: unknown; id?: unknown } } | undefined)?.tool
+  if (toolRef && questionsLeftForHuman.has(`${String(toolRef.messageID ?? "")}:${String(toolRef.id ?? "")}`)) {
+    // Jev already declined this question in the tool wrapper (#69); asking
+    // again here would just repeat the same call. It is the human's.
     return
   }
   const claim = claimReply(options, `form:${formID}`, inst)
