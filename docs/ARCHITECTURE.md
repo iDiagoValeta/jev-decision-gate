@@ -40,6 +40,15 @@ permission evaluate hook (ctx.permission.hook("evaluate"), opencode 2.0.16)
 Fallback (hook API missing, logged reason=hook-unavailable): the older
 permission.asked + `opencode api POST .../permission/{id}/reply` path.
 
+question tool (wrapped via ctx.tool.transform, #69)
+  → Jev answers each question in-process (multichoice + pick, labels
+    redacted on the way out, mapped back to the original label)
+  → all answered → the tool returns {output:{answers}, content, metadata}
+    itself: no form, no reply API, works in any opencode server
+  → any question unanswerable (ask-human, pick not offered, ambiguous,
+    no options) → the original execute opens the human form; the call is
+    marked so the form path below does not ask Jev again
+
 question tool → form (metadata.kind=question), listed at GET /api/form
   → ONE shared 750ms poller per process (not per setup() instance, #59),
     listing each known project directory via
@@ -67,6 +76,19 @@ Live autonomy check (non-interactive, against a running service):
 
 ## Key decisions (ADRs, short)
 
+- **Shared state lives on `globalThis`, not in module scope.** opencode
+  loads a separate copy of the plugin module for each `setup()` instance
+  (one per project directory). Measured live: module-level "shared"
+  state gave one form poller per directory (78 poll processes in 10 s
+  with 7 dirs). With `globalThis[Symbol.for("jev-decision-gate.shared.v1")]`
+  it is one poller per process (11 in 10 s with 6 dirs, round-robin).
+  A test imports two copies of the module and asserts they share one
+  interval.
+- **The question tool is answered inside the tool, not through its
+  form.** Wrapping `question`'s `execute` returns Jev's pick as the tool
+  result, so no reply has to reach the server, and it works outside the
+  background service (#69). The form path remains only for the human
+  fallback and for non-question forms.
 - **Permissions are decided in the `evaluate` hook, not by replying to
   `permission.asked`.** Live-verified on 2.0.16: opencode awaits the
   async hook (4 s delay tested), `effect=allow` runs the tool with no

@@ -7,6 +7,11 @@ versioning follows [SemVer](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The shared form poller is now actually shared (#59, reopened).**
+  #70 kept it in module scope, but opencode loads one module copy per
+  `setup()`, so there was still one poller per directory (measured: 78
+  poll processes in 10 s with 7 dirs). The state now lives on
+  `globalThis`: 11 in 10 s with 6 dirs.
 - **One shared form poller per process instead of one per project
   directory (#59).** `setup()` runs once per project directory (15–40
   instances in one process, live-verified on 2.0.16), and each instance

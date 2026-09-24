@@ -481,6 +481,23 @@ expected outcome). `duplicate-suppressed` in the log now means the
 permission (fallback) path only. `scripts/measure.py` already excludes
 it from rates either way.
 
+## Question answered without any form (`phase: question-tool`)
+
+Since #69 the plugin answers the `question` tool inside the tool call:
+log lines with `phase: "question-tool"` and `reason: "question-answered"`,
+and no form is created at all. If Jev can't answer (for example a free-text
+question has no options, logged as `form-unsupported-field`), the normal
+form opens for the human, and the form path deliberately stays silent
+for it.
+
+## Many `opencode api GET /api/form` processes
+
+There should be about one every 750 ms per opencode **process**,
+rotating over project directories. If you see one per directory, the
+shared state is not being shared: it must live on `globalThis` (see
+ARCHITECTURE "Key decisions"), because each `setup()` gets its own copy
+of the module.
+
 ## Which log file?
 
 Canonical: the path in `logFile` / `JEV_GATE_LOG`, default

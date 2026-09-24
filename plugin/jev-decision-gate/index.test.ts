@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
 import JevGate, {
+  answerQuestionsWithJev,
   capped,
   claimReply,
   editPatchesOf,
@@ -23,6 +24,7 @@ import JevGate, {
   looksLikeSessionGone,
   normalizeCommand,
   postApiReply,
+  questionToolResult,
   PollHandler,
   redactSecrets,
   registerPoller,
@@ -1561,4 +1563,95 @@ test("handleFormAsked: a losing claim logs nothing — it is the expected cross-
   } finally {
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
+})
+
+function fakeQuestionDeps(decisions: Array<Record<string, unknown>>) {
+  const calls: Array<Record<string, unknown>> = []
+  const logs: Array<Record<string, unknown>> = []
+  return {
+    calls,
+    logs,
+    deps: {
+      runGate: async (_o: Record<string, unknown>, ev: Record<string, unknown>) => {
+        calls.push(ev)
+        return { decision: decisions[calls.length - 1] ?? { action: "ask-human" }, retried: false }
+      },
+      objective: async () => "obj",
+      log: (e: Record<string, unknown>) => logs.push(e),
+      options: {},
+    },
+  }
+}
+
+test("questionToolResult: matches the built-in question tool's answered shape (#69)", () => {
+  const r = questionToolResult({ questions: [{ question: "¿fruta?" }, { question: "¿bebida?" }] }, [["uva"], ["zumo"]])
+  assert.deepEqual(r.output, { answers: [["uva"], ["zumo"]] })
+  assert.deepEqual(r.metadata, { answers: [["uva"], ["zumo"]] })
+  assert.equal(r.content, 'User has answered your questions: "¿fruta?"="uva", "¿bebida?"="zumo". You can now continue with the user\'s answers in mind.')
+})
+
+test("answerQuestionsWithJev: one allowed pick per question returns the original labels (#69)", async () => {
+  const f = fakeQuestionDeps([{ action: "allow", pick: "pera" }, { action: "allow", pick: "zumo" }])
+  const out = await answerQuestionsWithJev(f.deps, "s", "m:c", {
+    questions: [
+      { question: "q1", multiple: true, options: [{ label: "manzana" }, { label: "pera" }] },
+      { question: "q2", options: [{ label: "zumo" }, { label: "batido" }] },
+    ],
+  })
+  assert.deepEqual(out, [["pera"], ["zumo"]])
+  assert.equal(f.calls.length, 2)
+})
+
+test("answerQuestionsWithJev: ask-human, unoffered or ambiguous picks fall back to the human (#69)", async () => {
+  for (const [decision, opts, reason] of [
+    [{ action: "ask-human" }, [{ label: "a" }, { label: "b" }], "form-jev-not-allow"],
+    [{ action: "allow", pick: "zzz" }, [{ label: "a" }, { label: "b" }], "form-pick-not-offered"],
+    [{ action: "allow", pick: "token=[REDACTED]" }, [{ label: "token=abcd1234" }, { label: "token=efgh5678" }], "form-pick-ambiguous"],
+  ] as const) {
+    const f = fakeQuestionDeps([decision as Record<string, unknown>])
+    const out = await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "q", options: opts as unknown }] })
+    assert.equal(out, null)
+    assert.ok(f.logs.some((l) => l.reason === reason), `expected log reason ${reason}`)
+  }
+})
+
+test("answerQuestionsWithJev: a question with no options never calls Jev (#69)", async () => {
+  const f = fakeQuestionDeps([])
+  const out = await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "free text?" }] })
+  assert.equal(out, null)
+  assert.equal(f.calls.length, 0)
+  assert.equal(f.logs[0]?.reason, "form-unsupported-field")
+})
+
+test("answerQuestionsWithJev: Jev sees redacted labels but the answer is the original label (#69)", async () => {
+  const f = fakeQuestionDeps([{ action: "allow", pick: "use token=[REDACTED]" }])
+  const out = await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "q", options: [{ label: "use token=abcd1234" }, { label: "none" }] }] })
+  assert.deepEqual(out, [["use token=abcd1234"]])
+  assert.doesNotMatch(JSON.stringify(f.calls[0]), /abcd1234/)
+})
+
+test("registerPoller: two separate copies of the module share ONE interval (#59)", async () => {
+  // opencode loads a fresh copy of the plugin module per setup() instance;
+  // a query string forces Node to do the same here.
+  const spec: string = "./index.js"
+  const a = (await import(spec + "?copy=a")) as typeof import("./index.js")
+  const b = (await import(spec + "?copy=b")) as typeof import("./index.js")
+  assert.notEqual(a, b)
+  let started = 0
+  const fakeStart = ((() => {
+    started++
+    return { unref() {} }
+  }) as unknown) as typeof setInterval
+  const cleared: unknown[] = []
+  const fakeClear = ((t: unknown) => cleared.push(t)) as unknown as typeof clearInterval
+  const mk = () => ({ ctx: { session: { context: async () => [] } }, log: () => {}, inst: "x", options: {}, endedSessions: new Set<string>() })
+  const h1 = mk()
+  const h2 = mk()
+  a.registerPoller(h1, fakeStart)
+  b.registerPoller(h2, fakeStart)
+  assert.equal(started, 1)
+  a.unregisterPoller(h1, fakeClear)
+  assert.equal(cleared.length, 0)
+  b.unregisterPoller(h2, fakeClear)
+  assert.equal(cleared.length, 1)
 })
