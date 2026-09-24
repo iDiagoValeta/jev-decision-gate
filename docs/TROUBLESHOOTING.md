@@ -300,8 +300,9 @@ order: `--log` flag (if given), then `JEV_GATE_LOG` env, then
 `logFile` from `~/.config/opencode/opencode.json` (looks in the
 `plugins` array for an object whose `package` contains
 `jev-decision-gate` and uses `options.logFile` if present — tolerates
-a missing file or invalid JSON and falls through), then both
-`decisions-plugin.jsonl` / `decisions.jsonl` cwd fallbacks. The
+a missing file or invalid JSON and falls through). The first source
+found is the only one read; the `decisions-plugin.jsonl` /
+`decisions.jsonl` cwd files are read only when none is configured. The
 resolved path is printed as `log=<path>` (and included as `log` in
 `--json` output). The config path can be overridden with
 `OPENCODE_CONFIG_FILE` for tests. `scripts/verify_autonomy.py` does
