@@ -78,7 +78,7 @@ bug.
 | `src/jev_gate/cli.py` | stdin/stdout contract with `index.ts`, v2 JSONL log |
 | `src/jev_gate/doctor.py` | install diagnostics, no secrets printed |
 | `scripts/measure.py` | reads the JSONL log: rates, p95, cost, by-session |
-| `scripts/verify_autonomy.py` | non-interactive live check that the plugin owns permission + form answers |
+| `scripts/verify_autonomy.py` | non-interactive live check that the plugin answers the question tool (log resolved like `measure.py`) |
 | `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a decision-logic/kind change without a new case here is unreviewed |
 
 ## Non-negotiables (see `CONTRIBUTING.md` "Safety contract")
