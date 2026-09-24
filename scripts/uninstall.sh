@@ -29,9 +29,8 @@ with open(p) as f:
         cfg = json.load(f)
     except json.JSONDecodeError as e:
         # .jsonc invites comments/trailing commas; this uninstaller only
-        # speaks strict JSON (round 13 review, live-verified). The backup
-        # at p + ".bak" above is untouched and safe — nothing has been
-        # written back yet.
+        # speaks strict JSON. The backup at p + ".bak" above is untouched
+        # and safe — nothing has been written back yet.
         print(f"ERROR: {p} is not valid JSON ({e}). If it has comments or "
               "trailing commas, this uninstaller can't edit it "
               "automatically — remove the jev-decision-gate entry from "

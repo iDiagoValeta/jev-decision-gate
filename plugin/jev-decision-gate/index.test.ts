@@ -95,13 +95,13 @@ test("isCatastrophic: normalization defeats trivial obfuscation (quotes, IFS, se
   }
 })
 
-test("isCatastrophic: bare $IFS (no braces) and backslash-split obfuscation are caught (regression: security-review finding)", () => {
+test("isCatastrophic: bare $IFS (no braces) and backslash-split obfuscation are caught", () => {
   for (const cmd of ["rm$IFS-rf$IFS/", "r\\m -rf /", "rm -r\\f /", "rm\\ -rf\\ /"]) {
     assert.equal(isCatastrophic(cmd), true, `expected catastrophic: ${cmd}`)
   }
 })
 
-test("isCatastrophic: exact /home/<user>, /root, and bare .. are caught (regression: security-review finding)", () => {
+test("isCatastrophic: exact /home/<user>, /root, and bare .. are caught", () => {
   for (const cmd of ["rm -rf /home/idiaval", "rm -rf /home/root", "rm -rf /root", "rm -rf ..", "rm -rf ../"]) {
     assert.equal(isCatastrophic(cmd), true, `expected catastrophic: ${cmd}`)
   }
@@ -118,11 +118,10 @@ test("isCatastrophic: subpath deletes under /home/<user> or .. stay NOT caught (
   }
 })
 
-test("isCatastrophic: does not hang on a long adversarial string (regression: round 11 ReDoS finding)", () => {
+test("isCatastrophic: does not hang on a long adversarial string", () => {
   // Several patterns use `.*`/`(\S*\s+)*` before a literal target, so a
-  // string with many "rm -rf" occurrences and no real target forces
-  // repeated O(remaining-length) backtracking — live-verified pre-fix:
-  // ~1.6MB of this shape froze the event loop for ~19s.
+  // string with many "rm -rf" occurrences and no real target would force
+  // repeated O(remaining-length) backtracking if left unbounded.
   const adversarial = ("rm -rf " + "junkword ".repeat(50)).repeat(3500)
   const t0 = Date.now()
   const result = isCatastrophic(adversarial)
@@ -131,7 +130,7 @@ test("isCatastrophic: does not hang on a long adversarial string (regression: ro
   assert.equal(result, false) // no real target anywhere in the junk — must not false-positive either
 })
 
-test("isCatastrophic: a real target beyond the length cap is still not evaluated past it (documented trade-off, not a regression)", () => {
+test("isCatastrophic: a real target beyond the length cap is still not evaluated past it (documented trade-off)", () => {
   // Consistent with rawDetail's own 4000-char truncation, which already
   // bounds what Jev's judgment sees from the same `joined` string.
   const padded = "x".repeat(4100) + " rm -rf /"
@@ -145,7 +144,7 @@ test("normalizeCommand: strips backslashes and expands bare $IFS", () => {
   assert.equal(normalizeCommand("rm${IFS}-rf${IFS}/"), "rm -rf /")
 })
 
-test("isCatastrophic: ordinary subpath deletes are NOT caught (regression: false positive on rm -rf ./x, ~/x, $HOME/x)", () => {
+test("isCatastrophic: ordinary subpath deletes are NOT caught (no false positive on rm -rf ./x, ~/x, $HOME/x)", () => {
   for (const cmd of [
     "rm -rf ./build",
     "rm -rf ./node_modules",
@@ -193,16 +192,16 @@ test("redactSecrets: closes security-review gaps (compound key=value identifiers
     redactSecrets("postgresql://admin:hunter2VerySecret@db.internal:5432/prod"),
     "postgresql://admin:[REDACTED]@db.internal:5432/prod",
   )
-  // No prefix before the keyword must still work (regression check for the
-  // widened "keyword embedded in a longer identifier" pattern).
+  // No prefix before the keyword must still work: the "keyword embedded
+  // in a longer identifier" pattern must match without one.
   assert.match(redactSecrets("password: hunter2345"), /password:\s*\[REDACTED\]/)
   assert.match(redactSecrets("token=abcd1234"), /token=\[REDACTED\]/)
 })
 
-test("redactSecrets: does not hang on a long string with no scheme match (regression: round 11 ReDoS finding)", () => {
-  // The scheme://user:pass@ regex's `*`-repeated prefix had no bound, so a
-  // long string with no "://" anywhere forced a greedy-then-backtrack scan
-  // from every position — live-verified pre-fix: 100k chars took 6.3s.
+test("redactSecrets: does not hang on a long string with no scheme match", () => {
+  // The scheme://user:pass@ regex's `*`-repeated prefix must stay bounded:
+  // a long string with no "://" anywhere would otherwise force a
+  // greedy-then-backtrack scan from every position.
   const adversarial = "A".repeat(150000)
   const t0 = Date.now()
   const result = redactSecrets(adversarial)
@@ -211,7 +210,7 @@ test("redactSecrets: does not hang on a long string with no scheme match (regres
   assert.equal(result, adversarial) // no secret pattern present, must pass through unchanged
 })
 
-test("labelsFromFormField: does not hang on an oversized option before LABEL_MAX_CHARS truncation (regression: round 11 ReDoS finding)", () => {
+test("labelsFromFormField: does not hang on an oversized option before LABEL_MAX_CHARS truncation", () => {
   const t0 = Date.now()
   const out = labelsFromFormField({ options: ["pizza", "pasta", "A".repeat(150000)] })
   const elapsedMs = Date.now() - t0
@@ -284,7 +283,7 @@ test("claimReply: a requestID with path-unsafe characters is hashed, not used as
   }
 })
 
-test("claimReply: an overlong alnum requestID is hashed, not used as a raw (too-long) filename (round 8 finding: ENAMETOOLONG silently reopened the double-eval race)", () => {
+test("claimReply: an overlong alnum requestID is hashed, not used as a raw (too-long) filename (ENAMETOOLONG would otherwise reopen the double-eval race)", () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
   try {
     const longId = "a".repeat(5000)
@@ -295,7 +294,7 @@ test("claimReply: an overlong alnum requestID is hashed, not used as a raw (too-
   }
 })
 
-test("claimReply: the marker directory existing as a plain file reports error (not lost) for every requestID, forever (round 8 finding)", () => {
+test("claimReply: the marker directory existing as a plain file reports error (not lost) for every requestID, forever", () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-claim-"))
   try {
     fs.writeFileSync(path.join(gateDir, ".jev-gate-replied"), "")
@@ -342,7 +341,7 @@ test("postApiReply: a missing opencode binary rejects with the raw spawn (ENOENT
   }
 })
 
-test("labelsFromFormField: caps each label's length and redacts secrets (confirming-review finding: option labels are attacker-reachable, unlike OBJECTIVE they went unfenced/uncapped)", () => {
+test("labelsFromFormField: caps each label's length and redacts secrets (option labels are attacker-reachable, unlike OBJECTIVE, so they need the same fencing/capping)", () => {
   const longLabel = "a".repeat(300)
   const secretLabel = "token=abcd1234efgh5678"
   const field = { options: [longLabel, secretLabel, "Option C"] }
@@ -367,7 +366,7 @@ test("valueForPick: a pick that matches nothing offered falls back to the pick i
   assert.equal(valueForPick(field, "not-offered"), "not-offered")
 })
 
-test("valueForPick: returns null (ambiguous) when two different options collide after redaction, rather than silently picking the first (2nd confirming-review finding)", () => {
+test("valueForPick: returns null (ambiguous) when two different options collide after redaction, rather than silently picking the first", () => {
   const field = {
     options: [
       { label: "Use key sk-abc123def456ghijk", value: "account-A" },
@@ -408,13 +407,13 @@ test("fieldVisible: when eq holds only when the referenced answer strictly equal
   const field = { key: "q2", when: [{ key: "q0", op: "eq", value: "pizza" }] }
   assert.equal(fieldVisible(field, { q0: "pizza" }), true)
   assert.equal(fieldVisible(field, { q0: "sushi" }), false)
-  assert.equal(fieldVisible(field, {}), false, "unanswered referenced key: eq is false (issue #57)")
+  assert.equal(fieldVisible(field, {}), false, "unanswered referenced key: eq is false")
 })
 
 test("fieldVisible: when neq holds when the referenced answer differs or is unanswered", () => {
   const field = { key: "q2", when: [{ key: "q0", op: "neq", value: "pizza" }] }
   assert.equal(fieldVisible(field, { q0: "sushi" }), true)
-  assert.equal(fieldVisible(field, {}), true, "unanswered referenced key: neq is true (issue #57)")
+  assert.equal(fieldVisible(field, {}), true, "unanswered referenced key: neq is true")
   assert.equal(fieldVisible(field, { q0: "pizza" }), false)
 })
 
@@ -431,7 +430,7 @@ test("fieldVisible: when conditions are ANDed — one unmet condition hides the 
   assert.equal(fieldVisible(field, { q0: "sushi", q1: "extra" }), false)
 })
 
-test("encodeAnswer: multiselect wraps the pick's real option value in an array (issue #55)", () => {
+test("encodeAnswer: multiselect wraps the pick's real option value in an array", () => {
   const field = { type: "multiselect", options: [{ label: "Pizza", value: "pizza" }, "Sushi"] }
   assert.deepEqual(encodeAnswer(field, "Pizza"), ["pizza"])
   assert.deepEqual(encodeAnswer(field, "Sushi"), ["Sushi"])
@@ -459,7 +458,7 @@ test("encodeAnswer: an ambiguous pick (labels collide after redaction) returns n
   assert.equal(encodeAnswer(field, labels[0]), null)
 })
 
-test("capped: clears the collection once it reaches the size limit, otherwise leaves it alone (confirming-review finding: resolved/endedSessions/formSeen never evicted, unbounded over process lifetime)", () => {
+test("capped: clears the collection once it reaches the size limit, otherwise leaves it alone (resolved/endedSessions/formSeen are never evicted otherwise, unbounded over process lifetime)", () => {
   const m = new Map<string, number>([["a", 1], ["b", 2]])
   capped(m, 5).set("c", 3)
   assert.deepEqual([...m.keys()], ["a", "b", "c"], "under the limit: untouched")
@@ -473,7 +472,7 @@ test("capped: clears the collection once it reaches the size limit, otherwise le
   assert.deepEqual([...s], ["z"])
 })
 
-test("labelsFromFormField: a null/undefined entry in options is skipped, not a crash (5th confirming-review round)", () => {
+test("labelsFromFormField: a null/undefined entry in options is skipped, not a crash", () => {
   const field = { options: [null, "foo", undefined, "bar"] }
   assert.deepEqual(labelsFromFormField(field), ["foo", "bar"])
 })
@@ -482,7 +481,7 @@ test("looksLikeSessionGone: an SDK _tag of SessionNotFoundError is trusted direc
   assert.equal(looksLikeSessionGone({ _tag: "SessionNotFoundError", message: "whatever" }), true)
 })
 
-test("looksLikeSessionGone: unrelated *NotFoundError-shaped messages are NOT misclassified as the session ending (5th confirming-review round: bare /not found/i used to match all of these)", () => {
+test("looksLikeSessionGone: unrelated *NotFoundError-shaped messages are NOT misclassified as the session ending (a bare /not found/i regex would match all of these)", () => {
   for (const msg of [
     "Provider anthropic not found",
     "Agent foo not found",
@@ -507,12 +506,12 @@ test("looksLikeSessionGone: genuine session-gone phrasing still matches", () => 
   }
 })
 
-test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesafeKey) fails open with a log entry, not a silent blackhole (round 10 finding)", async () => {
+test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesafeKey) fails open with a log entry, not a silent blackhole", async () => {
   // spawnGate's spawn() call throws SYNCHRONOUSLY, not via a rejected
-  // promise, on an invalid env value. It used to sit outside handleOne's
-  // own try block, so the throw skipped every log() call in this function
-  // and was only caught by setup()'s bare event-loop catch — no log, and
-  // a false repliedOk:true that blocked any future retry for the same
+  // promise, on an invalid env value. If that throw escaped handleOne's
+  // own try block, it would skip every log() call in this function
+  // and only be caught by setup()'s bare event-loop catch — no log, and
+  // a false repliedOk:true that blocks any future retry for the same
   // requestID.
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-handleone-"))
   try {
@@ -535,13 +534,13 @@ test("handleOne: a synchronous spawn() throw (e.g. a NUL byte in options.typesaf
   }
 })
 
-test("spawnGate's cancel(): a child that ignores SIGTERM is still killed, via the same SIGKILL backstop the timeout path already has (round 13 finding)", async () => {
+test("spawnGate's cancel(): a child that ignores SIGTERM is still killed, via the same SIGKILL backstop the timeout path already has", async () => {
   // cancel() (called from handleOne when objectiveFor detects the session
-  // ended) only sent SIGTERM once, with no backstop — unlike the timeout
+  // ended) sends SIGTERM and needs its own backstop — like the timeout
   // path a few lines above it in spawnGate, which escalates to SIGKILL
   // after 2s if the child doesn't die. A child that ignores/misses SIGTERM
-  // (installed its own handler, scheduling hiccup) leaked forever: nothing
-  // else ever retries killing it.
+  // (installed its own handler, scheduling hiccup) would otherwise leak
+  // forever: nothing else retries killing it.
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-cancel-sigkill-"))
   const pidFile = path.join(gateDir, "child.pid")
   const fakePython = path.join(gateDir, "fake_python.py")
@@ -597,14 +596,14 @@ test("spawnGate's cancel(): a child that ignores SIGTERM is still killed, via th
   }
 })
 
-test("setup: schedules a periodic prune of the on-disk reply-marker directory, not just once at startup (round 12 finding)", async () => {
-  // pruneReplied() used to only run once, at setup() itself — a
+test("setup: schedules a periodic prune of the on-disk reply-marker directory, not just once at startup", async () => {
+  // pruneReplied() must run periodically, not just once at setup() — a
   // long-running opencode host (days/weeks, setup() never re-invoked)
-  // accumulated one marker file per permission/form forever (live-verified:
-  // 5000 claimReply calls -> 5000 unpruned files). Fixed by giving it its
-  // own setInterval, mirroring the existing form-poll timer. Assert the
-  // wiring directly (timer created + cleared) rather than waiting a real
-  // hour: setup() must now register 2 intervals (poll + prune), and
+  // would otherwise accumulate one marker file per permission/form
+  // forever (5000 claimReply calls means 5000 unpruned files). It gets
+  // its own setInterval, mirroring the existing form-poll timer. Assert
+  // the wiring directly (timer created + cleared) rather than waiting a
+  // real hour: setup() must register 2 intervals (poll + prune), and
   // teardown must clear both.
   const origSetInterval = global.setInterval
   const origClearInterval = global.clearInterval
@@ -638,15 +637,15 @@ test("setup: schedules a periodic prune of the on-disk reply-marker directory, n
   }
 })
 
-test("listPendingForms: a hung `opencode` CLI that ignores SIGTERM is still killed via a SIGKILL backstop (round 14 finding)", async () => {
-  // Same bug class round 13 fixed in spawnGate's timeout/cancel paths, but
-  // that audit only covered spawnGate itself — listPendingForms (called
-  // every 750ms by setup()'s poll timer) and postApiReply (every
-  // permission/form reply) were left with SIGTERM-only kills and no
-  // backstop, live-verified to leak indefinitely. postApiReply shares the
-  // identical fix and was verified manually (its own timeout is 10s,
-  // making an automated test here disproportionately slow); this test
-  // covers the pattern via listPendingForms's shorter 5s timeout.
+test("listPendingForms: a hung `opencode` CLI that ignores SIGTERM is still killed via a SIGKILL backstop", async () => {
+  // Same SIGKILL-backstop need as spawnGate's timeout/cancel paths applies
+  // here: listPendingForms (called every 750ms by setup()'s poll timer)
+  // and postApiReply (every permission/form reply) would otherwise leak a
+  // process indefinitely on a SIGTERM-only kill against a hung CLI.
+  // postApiReply shares the identical fix and is verified manually (its
+  // own timeout is 10s, making an automated test here disproportionately
+  // slow); this test covers the pattern via listPendingForms's shorter 5s
+  // timeout.
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-listforms-sigkill-bin-"))
   const pidFile = path.join(binDir, "child.pid")
   fs.writeFileSync(
@@ -691,14 +690,15 @@ test("listPendingForms: a hung `opencode` CLI that ignores SIGTERM is still kill
   }
 })
 
-test("setup: event-stream form path resolves a form id that only lives at the outer event payload, not just inside the nested form object (round 14 finding)", async () => {
+test("setup: event-stream form path resolves a form id that only lives at the outer event payload, not just inside the nested form object", async () => {
   // handleFormAsked re-derives its own formID from the object it's handed
   // (.id alone, no further fallback). The event-stream path itself already
   // falls back to the outer payload's .id when the nested form object
-  // lacks one (fid = form.id ?? payload.id, a few lines above), but used
-  // to hand handleFormAsked the unchanged nested object regardless — so a
-  // form whose id only lived at the outer level hit handleFormAsked's own
-  // missing-ids early return, claiming nothing on disk (claimReply never
+  // lacks one (fid = form.id ?? payload.id, a few lines above); it must
+  // hand handleFormAsked that resolved object, not the unchanged nested
+  // one — otherwise a form whose id only lived at the outer level hits
+  // handleFormAsked's own missing-ids early return, claiming nothing on
+  // disk (claimReply never
   // ran), while formSeen was already marked — permanently foreclosing the
   // poll path's own retry for a form nothing ever actually processed.
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formid-mismatch-"))
@@ -747,14 +747,14 @@ test("setup: event-stream form path resolves a form id that only lives at the ou
   }
 })
 
-test("textOfMessage: extracts assistant text from the real opencode 2.0.x message shape (round 15 finding)", () => {
+test("textOfMessage: extracts assistant text from the real opencode 2.0.x message shape", () => {
   // SessionMessageAssistant (the installed @opencode/client's real type)
   // has neither .text nor .parts — text lives in content[].text for
-  // "text"/"reasoning" items. Before this, every assistant turn silently
-  // vanished from OBJECTIVE (verified end-to-end via handleOne: the gate
-  // received only the user's messages, never anything the agent itself
-  // said or reasoned), contradicting objectiveFor's own comment that
-  // OBJECTIVE should reflect "what the agent has been doing."
+  // "text"/"reasoning" items. Without this, every assistant turn would
+  // silently vanish from OBJECTIVE (verified end-to-end via handleOne: the
+  // gate would see only the user's messages, never anything the agent
+  // itself said or reasoned), contradicting objectiveFor's own comment
+  // that OBJECTIVE should reflect "what the agent has been doing."
   const assistantMsg = {
     type: "assistant",
     id: "m2",
@@ -773,7 +773,7 @@ test("textOfMessage: extracts assistant text from the real opencode 2.0.x messag
   assert.doesNotMatch(result?.text ?? "", /"tool":"bash"/)
 })
 
-test("textOfMessage: still handles the v2 .text shape and the legacy .parts shape (no regression)", () => {
+test("textOfMessage: still handles the v2 .text shape and the legacy .parts shape", () => {
   assert.deepEqual(textOfMessage({ type: "user", text: "hello" }), { role: "user", text: "hello" })
   assert.deepEqual(textOfMessage({ role: "assistant", parts: [{ text: "hi" }, { text: "there" }] }), {
     role: "assistant",
@@ -784,7 +784,7 @@ test("textOfMessage: still handles the v2 .text shape and the legacy .parts shap
   assert.equal(textOfMessage({ type: "system" }), null)
 })
 
-test("subagentDetailFor: pulls agent/description/prompt from the matching tool-call in session context (regression: subagent's own `resources` is just the agent name, e.g. \"general\", never the dispatch content)", async () => {
+test("subagentDetailFor: pulls agent/description/prompt from the matching tool-call in session context (the subagent's own `resources` is just the agent name, e.g. \"general\", never the dispatch content)", async () => {
   const ctx = {
     session: {
       context: async () => [
@@ -821,7 +821,7 @@ test("subagentDetailFor: fails open to null (caller keeps the original thin reso
   assert.equal(await subagentDetailFor(throws, "sess1", { messageID: "msg_1", id: "call_1" }), null)
 })
 
-test("handleOne: subagent dispatch sends Jev the real description/prompt, not just the thin \"general\" agent-name resource (regression: near-blanket low-confidence subagent denial — live-observed resKinds \"text:7ch\", the exact length of \"general\", with no way for Jev to judge what the subagent would actually do)", async () => {
+test("handleOne: subagent dispatch sends Jev the real description/prompt, not just the thin \"general\" agent-name resource (without it, resKinds is just \"text:7ch\", the exact length of \"general\", with no way for Jev to judge what the subagent would actually do)", async () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-subagent-enrich-"))
   const capturedEventPath = path.join(gateDir, "captured-event.json")
   const fakePython = path.join(gateDir, "fake_python.py")
@@ -982,7 +982,7 @@ test("handleOne: error_detail from the python gate's JSON is logged alongside er
   }
 })
 
-test("redactSecrets: redacts CLI-flag credentials but keeps the flag/user visible (issue #63)", () => {
+test("redactSecrets: redacts CLI-flag credentials but keeps the flag/user visible", () => {
   // Secrets passed as CLI flag values, not KEY=VALUE. Mirrors the
   // Python-side test in tests/test_schemas.py — both layers must agree.
   const pw = "SuperSecretPw123"
@@ -1010,7 +1010,7 @@ test("redactSecrets: redacts CLI-flag credentials but keeps the flag/user visibl
   assert.ok(!redactSecrets(cases[9][0]).includes("wJalrXUtnFEMI"))
 })
 
-test("redactSecrets: leaves non-secret flags and prose untouched (issue #63)", () => {
+test("redactSecrets: leaves non-secret flags and prose untouched", () => {
   // -p means port/directory outside mysql/docker-login, and bare prose
   // keywords carry no value — none of these may change.
   for (const input of [
@@ -1023,7 +1023,7 @@ test("redactSecrets: leaves non-secret flags and prose untouched (issue #63)", (
   }
 })
 
-test("redactSecrets: stays linear on adversarial CLI-flag input (issue #63, round-11 rule)", () => {
+test("redactSecrets: stays linear on adversarial CLI-flag input", () => {
   // Underscore-dense input hung the first nested-star version, and
   // keyword-dense input with no separator hung even the pre-existing
   // key=value pattern before its flanking runs were bounded to 56.
@@ -1374,7 +1374,7 @@ test("evaluatePermission: gate throws logs fail-open and leaves effect as ask", 
 // Cross-instance dedup via claimReply is tested in claimReply tests (won/lost/error).
 // evaluatePermission uses the same claimReply internally.
 
-test("runGate: a gate killed by a signal is retried once and the retry's answer is used (#61)", async () => {
+test("runGate: a gate killed by a signal is retried once and the retry's answer is used", async () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-retry-"))
   const marker = path.join(gateDir, "first-run-done")
   const fakePython = path.join(gateDir, "fake_python.py")
@@ -1402,7 +1402,7 @@ test("runGate: a gate killed by a signal is retried once and the retry's answer 
   }
 })
 
-test("runGate: a non-zero exit is a real answer and is not retried (#61)", async () => {
+test("runGate: a non-zero exit is a real answer and is not retried", async () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-noretry-"))
   const count = path.join(gateDir, "runs")
   const fakePython = path.join(gateDir, "fake_python.py")
@@ -1427,14 +1427,14 @@ test("isRetryableGateError: signal deaths and transient spawn errors only", () =
   assert.equal(isRetryableGateError(Object.assign(new Error("spawn"), { code: "ENOENT" })), false)
 })
 
-test("editPatchesOf: collects each file's patch under a header; null when absent (#66)", () => {
+test("editPatchesOf: collects each file's patch under a header; null when absent", () => {
   assert.equal(editPatchesOf(undefined), null)
   assert.equal(editPatchesOf({ files: [{ file: "a.ts" }] }), null)
   const out = editPatchesOf({ files: [{ file: "a.ts", patch: "+x" }, { file: "b.ts", patch: "-y" }] })
   assert.equal(out, "--- patch for a.ts ---\n+x\n--- patch for b.ts ---\n-y")
 })
 
-test("evaluatePermission: an edit's patch reaches Jev's detail, redacted (#66)", async () => {
+test("evaluatePermission: an edit's patch reaches Jev's detail, redacted", async () => {
   let sent: Record<string, unknown> | null = null
   const deps: EvaluateDeps = {
     runGate: async (_o, ev) => {
@@ -1478,17 +1478,17 @@ test("formListPath: no directory lists the bare form endpoint (current behavior 
   assert.equal(formListPath(""), "/api/form")
 })
 
-test("formListPath: a project directory is passed as an encoded location query (#58)", () => {
+test("formListPath: a project directory is passed as an encoded location query", () => {
   assert.equal(formListPath("/home/idiaval/proj"), "/api/form?location[directory]=%2Fhome%2Fidiaval%2Fproj")
 })
 
-test("formListPath: spaces and special chars in the directory are encoded (#58)", () => {
+test("formListPath: spaces and special chars in the directory are encoded", () => {
   const dir = "/tmp/mi proyecto & cosas"
   assert.equal(formListPath(dir), `/api/form?location[directory]=${encodeURIComponent(dir)}`)
   assert.ok(!formListPath(dir).includes(" "), "raw spaces must not appear in the path")
 })
 
-test("listPendingForms: passes the encoded per-directory path to the CLI (#58)", async () => {
+test("listPendingForms: passes the encoded per-directory path to the CLI", async () => {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formpath-bin-"))
   const argsFile = path.join(binDir, "args.json")
   fs.writeFileSync(
@@ -1510,7 +1510,7 @@ test("listPendingForms: passes the encoded per-directory path to the CLI (#58)",
   }
 })
 
-test("shared poller: registering two instances starts a single interval; clearing the last one stops it (#59)", () => {
+test("shared poller: registering two instances starts a single interval; clearing the last one stops it", () => {
   let starts = 0
   let clears = 0
   const fakeStart = ((_fn: () => void, _ms: number) => {
@@ -1543,7 +1543,7 @@ test("shared poller: registering two instances starts a single interval; clearin
   }
 })
 
-test("handleFormAsked: a losing claim logs nothing — it is the expected cross-instance outcome, not an event (#59)", async () => {
+test("handleFormAsked: a losing claim logs nothing — it is the expected cross-instance outcome, not an event", async () => {
   const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formlost-"))
   try {
     const logs: Record<string, unknown>[] = []
@@ -1583,14 +1583,14 @@ function fakeQuestionDeps(decisions: Array<Record<string, unknown>>) {
   }
 }
 
-test("questionToolResult: matches the built-in question tool's answered shape (#69)", () => {
+test("questionToolResult: matches the built-in question tool's answered shape", () => {
   const r = questionToolResult({ questions: [{ question: "¿fruta?" }, { question: "¿bebida?" }] }, [["uva"], ["zumo"]])
   assert.deepEqual(r.output, { answers: [["uva"], ["zumo"]] })
   assert.deepEqual(r.metadata, { answers: [["uva"], ["zumo"]] })
   assert.equal(r.content, 'User has answered your questions: "¿fruta?"="uva", "¿bebida?"="zumo". You can now continue with the user\'s answers in mind.')
 })
 
-test("answerQuestionsWithJev: one allowed pick per question returns the original labels (#69)", async () => {
+test("answerQuestionsWithJev: one allowed pick per question returns the original labels", async () => {
   const f = fakeQuestionDeps([{ action: "allow", pick: "pera" }, { action: "allow", pick: "zumo" }])
   const out = await answerQuestionsWithJev(f.deps, "s", "m:c", {
     questions: [
@@ -1602,7 +1602,7 @@ test("answerQuestionsWithJev: one allowed pick per question returns the original
   assert.equal(f.calls.length, 2)
 })
 
-test("answerQuestionsWithJev: ask-human, unoffered or ambiguous picks fall back to the human (#69)", async () => {
+test("answerQuestionsWithJev: ask-human, unoffered or ambiguous picks fall back to the human", async () => {
   for (const [decision, opts, reason] of [
     [{ action: "ask-human" }, [{ label: "a" }, { label: "b" }], "form-jev-not-allow"],
     [{ action: "allow", pick: "zzz" }, [{ label: "a" }, { label: "b" }], "form-pick-not-offered"],
@@ -1615,7 +1615,7 @@ test("answerQuestionsWithJev: ask-human, unoffered or ambiguous picks fall back 
   }
 })
 
-test("answerQuestionsWithJev: a question with no options never calls Jev (#69)", async () => {
+test("answerQuestionsWithJev: a question with no options never calls Jev", async () => {
   const f = fakeQuestionDeps([])
   const out = await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "free text?" }] })
   assert.equal(out, null)
@@ -1623,14 +1623,14 @@ test("answerQuestionsWithJev: a question with no options never calls Jev (#69)",
   assert.equal(f.logs[0]?.reason, "form-unsupported-field")
 })
 
-test("answerQuestionsWithJev: Jev sees redacted labels but the answer is the original label (#69)", async () => {
+test("answerQuestionsWithJev: Jev sees redacted labels but the answer is the original label", async () => {
   const f = fakeQuestionDeps([{ action: "allow", pick: "use token=[REDACTED]" }])
   const out = await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "q", options: [{ label: "use token=abcd1234" }, { label: "none" }] }] })
   assert.deepEqual(out, [["use token=abcd1234"]])
   assert.doesNotMatch(JSON.stringify(f.calls[0]), /abcd1234/)
 })
 
-test("registerPoller: two separate copies of the module share ONE interval (#59)", async () => {
+test("registerPoller: two separate copies of the module share ONE interval", async () => {
   // opencode loads a fresh copy of the plugin module per setup() instance;
   // a query string forces Node to do the same here.
   const spec: string = "./index.js"

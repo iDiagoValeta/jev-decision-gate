@@ -86,24 +86,22 @@ export function redactSecrets(text: string): string {
   }
   // scheme://user:PASSWORD@host — redact only the password, keep the
   // rest (host/port/path) visible for debugging context. Scheme repetition
-  // bounded to 20 (real schemes are a handful of chars) — round 11 finding:
-  // an unbounded `*` here is O(n^2) on long input with no "://" anywhere,
-  // since the engine retries a greedy-then-backtrack search from every
-  // position (live-verified: 100k chars took 6.3s unbounded, 6ms bounded).
+  // is bounded to 20 (real schemes are a handful of chars): an unbounded
+  // `*` here is O(n^2) on long input with no "://" anywhere, since the
+  // engine retries a greedy-then-backtrack search from every position.
   out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]{0,20}:\/\/[^\s/:@]+):([^\s/@]{1,})@/g, "$1:[REDACTED]@")
   // Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
   // not just stand alone (password=...) — the keyword can appear anywhere
   // in the token, not only at its start. The flanking runs are bounded
-  // to 56 (round 11 rule): unbounded stars here are O(n^2) on
-  // keyword-dense input with no "=" anywhere (`PASSWORD` x 20000 took
-  // 38s on the Python side) — each mid-string keyword match re-scans an
-  // O(n) greedy tail looking for a separator that never comes.
+  // to 56: unbounded stars here are O(n^2) on keyword-dense input with no
+  // "=" anywhere, since each mid-string keyword match re-scans an O(n)
+  // greedy tail looking for a separator that never comes.
   out = out.replace(
     /(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s"']{4,})/gi,
     "$1[REDACTED]",
   )
-  // CLI-flag credentials (issue #63): secrets passed as flag values rather
-  // than KEY=VALUE. Every repetition below is bounded (round 11 rule).
+  // Secrets passed as CLI flag values rather than KEY=VALUE. Every
+  // repetition below is bounded, for the same O(n^2) reason as above.
   // curl -u/--user user:pass — keep the user, redact only the password.
   out = out.replace(/(--user\s+|-u\s+)([^\s:'"]{1,100}):([^\s'"`]{1,200})/g, "$1$2:[REDACTED]")
   // --password value / --password=value on any command (single-dash too).
@@ -112,10 +110,9 @@ export function redactSecrets(text: string): string {
   // `aws configure set aws_secret_access_key hunter2`). The name must be
   // env-var-shaped — ALL-CAPS or containing an underscore — so prose like
   // `fix password reset flow` or `grep -r token src/` is untouched.
-  // Shape note (round 11 rule): one bounded token run, with the
-  // keyword/caps/underscore checks in code — not nested
-  // `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars in the regex, which is O(n^2)
-  // on underscore-dense input (`a_` x 25000 hung the first version).
+  // One bounded token run, with the keyword/caps/underscore checks done
+  // in code rather than as nested `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*`
+  // stars in the regex, which is O(n^2) on underscore-dense input.
   // Overlapping candidates (`set aws_secret_access_key VALUE`: the
   // rejected `set ...` pair must not swallow the real token) rule out a
   // plain replace() — hence the manual scan, which advances one char on
@@ -164,7 +161,7 @@ export function sha256Hex(text: string): string {
 }
 
 // Several CATASTROPHIC patterns use `.*`/`(\S*\s+)*` before a literal
-// target (round 11 finding): on a long string with no real target, each
+// target: on a long string with no real target, each
 // occurrence of the pattern's trigger word forces its own O(remaining
 // length) backtrack search, so a string with many trigger occurrences is
 // O(n^2) overall — live-verified: ~1.6MB of "rm -rf junk..." froze the
@@ -243,25 +240,17 @@ function apiKeyOf(options: Record<string, unknown>): string {
   return process.env.TYPESAFE_API_KEY ?? ""
 }
 
-// Was 15000 until a production log showed p99=9295ms and max=13140ms for
-// successful calls (spawn-to-decision, 669 samples) even WITHOUT
-// concurrent load, and 11 real "gate timeout" fail-opens clustered
-// exactly in two windows (18:45:44-18:45:59 and 19:13:44-19:16:53) that
-// matched several concurrent opencode sessions — each fail-open silently
-// stalled its session with no self-heal. The *mechanism* is still open:
-// a follow-up controlled load test (80 concurrent `python3 -m
-// jev_gate.cli` calls, isolated from the opencode service) completed in
-// under 2.5s with zero errors, which rules out interpreter-spawn/CPU
-// contention among gate subprocesses as the cause — an earlier version
-// of this comment claimed that mechanism and was wrong to state it as
-// settled. The more likely explanation is the sequential event-loop
-// (see docs/ARCHITECTURE.md, "documented as an accepted limitation")
-// queueing several sessions' permissions behind one another, or
-// upstream API-side latency under real multi-session load that a
-// synthetic single-machine test doesn't reproduce — neither is
-// confirmed. Whatever the mechanism, more headroom is a safe mitigation
-// either way: 25000 gives ~2.7x over the observed p99 while staying
-// under the existing 30000 hard cap.
+// Successful gate calls (spawn-to-decision) can run close to 10s even
+// without concurrent load, and real multi-session load can push a
+// permission's gate call well past a tight timeout, stalling that
+// session with no self-heal. The likely driver is the sequential
+// event-loop (see docs/ARCHITECTURE.md, "documented as an accepted
+// limitation") queueing several sessions' permissions behind one
+// another, or upstream API-side latency under real load — neither
+// interpreter-spawn nor CPU contention among gate subprocesses explains
+// it (an isolated concurrent-spawn test showed no such contention).
+// 25000 gives headroom over observed p99 while staying under the
+// existing 30000 hard cap.
 export const DEFAULT_GATE_TIMEOUT_MS = 25000
 
 export function timeoutMsOf(options: Record<string, unknown>): number {
@@ -321,20 +310,19 @@ function repliedDirOf(options: Record<string, unknown>): string {
 export function claimReply(options: Record<string, unknown>, requestID: string, inst: string): "won" | "lost" | "error" {
   // Length-bound the fast path too, not just the charset: an all-alnum
   // requestID over Linux's 255-byte NAME_MAX hits ENAMETOOLONG on the
-  // write below, which used to land in the shared catch as generic
-  // "error" for BOTH racing claimants — silently reopening the exact
-  // double-evaluation race this function exists to close (round 8
-  // review, live-verified: two calls for an identical 5000-char ID both
-  // returned "error"). sha256Hex's fixed 64-char output is always safe.
+  // write below, which lands in the shared catch as generic "error" —
+  // if that happened for both racing claimants it would silently reopen
+  // the exact double-evaluation race this function exists to close.
+  // sha256Hex's fixed 64-char output is always safe.
   const name = /^[A-Za-z0-9_-]+$/.test(requestID) && requestID.length <= 200 ? requestID : sha256Hex(requestID)
   const dir = repliedDirOf(options)
   try {
     fs.mkdirSync(dir, { recursive: true })
   } catch {
-    // The marker directory path itself is unusable (round 8 review,
-    // live-verified: e.g. a plain file sitting where the directory
-    // should be) — a broken marker mechanism, never a legitimate claim
-    // conflict. Must not be reported as "lost" (which means "someone
+    // The marker directory path itself is unusable (e.g. a plain file
+    // sitting where the directory should be) — a broken marker
+    // mechanism, never a legitimate claim conflict. Must not be
+    // reported as "lost" (which means "someone
     // else owns it" and, applied here, would permanently ask-human
     // every single permission/form forever, logged as the misleading
     // "duplicate-suppressed" — implying a race with a live second
@@ -354,17 +342,16 @@ export function claimReply(options: Record<string, unknown>, requestID: string, 
 }
 
 // The in-memory dedup collections (resolved/endedSessions/formSeen) have
-// no eviction otherwise: confirmed by review that nothing ever calls
-// .delete() on the success path, so a long-lived process accumulates one
-// entry per ever-seen requestID/sessionID/formID for its whole uptime.
-// A size cap, checked before each insert, is a simpler and lower-risk
-// circuit breaker than retrofitting per-entry timestamps through every
-// signature that touches these maps. Confirmed by a second review: no
-// cross-request race (the event loop is sequential — see the ADR on that
-// in docs/ARCHITECTURE.md — and inFlight itself is never capped), but
-// clearing `resolved` early CAN drop the cached entry a late duplicate
-// permission.asked would have used to retry a previously-failed reply
-// (the issue #15 pattern) — that duplicate falls through to
+// no eviction otherwise: nothing ever calls .delete() on the success
+// path, so a long-lived process accumulates one entry per ever-seen
+// requestID/sessionID/formID for its whole uptime. A size cap, checked
+// before each insert, is a simpler and lower-risk circuit breaker than
+// retrofitting per-entry timestamps through every signature that
+// touches these maps. There is no cross-request race (the event loop is
+// sequential — see the ADR on that in docs/ARCHITECTURE.md — and
+// inFlight itself is never capped), but clearing `resolved` early CAN
+// drop the cached entry a late duplicate permission.asked would use to
+// retry a reply that had failed — that duplicate falls through to
 // duplicate-suppressed instead of retrying. Not a lost or silently-wrong
 // decision: the original reply-failed entry is already in the log with
 // its own error_class/error_detail, so the record survives either way.
@@ -420,9 +407,9 @@ export function labelsFromFormField(field: unknown): string[] {
     .map((item) => {
       if (typeof item === "string") return item
       // A JSON array can legally hold null/undefined entries; valueForPick
-      // already guards this (`item &&`) but this map didn't (4th
-      // confirming-review round: crashed the whole form's auto-answer on
-      // one bad entry instead of just skipping it).
+      // already guards this (`item &&`) and this map must too, or one bad
+      // entry crashes the whole form's auto-answer instead of just being
+      // skipped.
       if (!item || typeof item !== "object") return null
       const o = item as { label?: unknown; value?: unknown }
       if (typeof o.label === "string" && o.label) return o.label
@@ -438,7 +425,7 @@ export function labelsFromFormField(field: unknown): string[] {
 // normalized (redacted/truncated) to the same string, so which one Jev
 // "meant" can't be recovered — first-match-wins would silently apply a
 // different, still-valid option than the one actually intended, with no
-// signal anything went wrong (confirming-review finding). Callers must
+// signal anything went wrong. Callers must
 // treat null the same as "pick not offered": ask-human, don't guess.
 export function valueForPick(field: unknown, pick: string): string | null {
   if (!field || typeof field !== "object") return pick
@@ -463,7 +450,7 @@ export function valueForPick(field: unknown, pick: string): string | null {
   return matches.length > 0 ? matches[0] : pick
 }
 
-// Issue #57: a form field is only answerable when it's not hidden and all
+// A form field is only answerable when it's not hidden and all
 // its `when` conditions hold against the answers already decided for
 // earlier fields. `eq`/`neq` compare with `===` (the schema gives no
 // coercion rules; a numeric when-value won't match a string answer, which
@@ -495,7 +482,7 @@ export function fieldVisible(field: unknown, answers: Record<string, unknown>): 
   return true
 }
 
-// Issue #55: encodes Jev's pick into the value the form reply API expects
+// Encodes Jev's pick into the value the form reply API expects
 // for this field's type. multiselect fields take an array of option values
 // (Jev's single pick -> one-element array; a future list pick is mapped
 // element-wise by the caller). Every other field takes a plain string.
@@ -511,9 +498,9 @@ export function encodeAnswer(field: unknown, pick: string): string | string[] | 
 
 /** Path listing pending interactive forms. Without a project directory this
  * is the bare endpoint (the service's own directory only); with one it
- * scopes the listing to that project (#58: `GET /api/form` without a
+ * scopes the listing to that project: `GET /api/form` without a
  * location only ever lists forms of the service's own directory, so a
- * project session's forms were always `[]`). */
+ * project session's forms would otherwise always be `[]`. */
 export function formListPath(directory?: string): string {
   if (!directory) return "/api/form"
   return `/api/form?location[directory]=${encodeURIComponent(directory)}`
@@ -533,12 +520,10 @@ export function listPendingForms(directory?: string): Promise<Array<Record<strin
       } catch {
         // ignore
       }
-      // Same SIGKILL backstop spawnGate's timeout/cancel paths already have
-      // (round 13 review) — this call site was left out of that fix (round
-      // 14 review, live-verified: a hung `opencode` CLI that ignores
-      // SIGTERM stays alive indefinitely, and this runs on every 750ms
-      // poll tick with no backpressure, so a single hang leaks one
-      // orphaned process per tick).
+      // Same SIGKILL backstop as spawnGate's timeout/cancel paths: a hung
+      // `opencode` CLI that ignores SIGTERM stays alive indefinitely, and
+      // this runs on every 750ms poll tick with no backpressure, so a
+      // single hang leaks one orphaned process per tick.
       const killer = setTimeout(() => {
         try {
           child.kill("SIGKILL")
@@ -574,13 +559,14 @@ export function listPendingForms(directory?: string): Promise<Array<Record<strin
 }
 
 /** POST a reply to an OpenCode API endpoint via the CLI (`opencode api POST`), never
- * `ctx.permission.reply()`. Root cause of issue #15: live testing found a permission
- * the SDK method reported "Permission request not found" for was STILL listed as
- * pending via GET /api/session/{id}/permission minutes later, and a raw
- * `opencode api POST .../reply` on that exact requestID succeeded immediately — this
- * was never a server-side expiry/TTL race, the SDK method itself is what's unreliable
- * here (plausibly related to setup() running more than once per process — see
- * claimReply). Shared by replyFormAnswer and replyPermission below. */
+ * `ctx.permission.reply()`. The SDK method is unreliable: it can report
+ * "Permission request not found" for a permission that is STILL listed as
+ * pending via GET /api/session/{id}/permission, while a raw
+ * `opencode api POST .../reply` on that exact requestID succeeds
+ * immediately. This is not a server-side expiry/TTL race; the SDK
+ * method itself is what's unreliable (plausibly related to setup()
+ * running more than once per process — see claimReply). Shared by
+ * replyFormAnswer and replyPermission below. */
 export function postApiReply(apiPath: string, body: Record<string, unknown>, errPrefix: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("opencode", ["api", "POST", apiPath, "-d", JSON.stringify(body)], {
@@ -594,10 +580,8 @@ export function postApiReply(apiPath: string, body: Record<string, unknown>, err
       } catch {
         // ignore
       }
-      // Same SIGKILL backstop spawnGate's timeout/cancel paths already have
-      // (round 13 review) — this call site was left out of that fix
-      // (round 14 review, live-verified). Every permission/form reply goes
-      // through here.
+      // Same SIGKILL backstop as spawnGate's timeout/cancel paths. Every
+      // permission/form reply goes through here.
       const killer = setTimeout(() => {
         try {
           child.kill("SIGKILL")
@@ -679,7 +663,7 @@ function minimalEnv(options: Record<string, unknown>): Record<string, string | u
 // both costs back to back. Every permission.reply() this plugin makes
 // races a short, non-configurable server-side window (see
 // docs/TROUBLESHOOTING.md "Ordinary permission replies can silently miss
-// the window", issue #15) — this does not close that race, it narrows it.
+// the window") — this does not close that race, it narrows it.
 function spawnGate(options: Record<string, unknown>): {
   send: (event: Record<string, unknown>) => void
   cancel: () => void
@@ -758,9 +742,7 @@ function spawnGate(options: Record<string, unknown>): {
       // Same SIGKILL backstop as the timeout path above: without it, a
       // child that doesn't die on SIGTERM (installed its own handler, or
       // just misses the signal) leaks forever — cancel() has no other
-      // caller to retry it (round 13 review, live-verified: a child that
-      // ignores SIGTERM stayed alive at least 8s past cancel() with no
-      // fix, with nothing left anywhere to clean it up).
+      // caller to retry it, and nothing else cleans it up.
       const killer = setTimeout(() => {
         try {
           child.kill("SIGKILL")
@@ -781,7 +763,7 @@ function spawnGate(options: Record<string, unknown>): {
 // or could not be spawned for a transient resource reason is worth one
 // fresh attempt: the retry only re-asks Jev, it cannot allow anything by
 // itself. A non-zero exit, a timeout or unparseable output is a real
-// answer about this input and is not retried (#61).
+// answer about this input and is not retried.
 export function isRetryableGateError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err)
   if (msg.startsWith("gate killed by")) return true
@@ -824,8 +806,8 @@ export function textOfMessage(message: unknown): ConversationTurn | null {
       : null
   if (role === null) return null
   if (typeof msg.text === "string" && msg.text.trim()) return { role, text: msg.text }
-  // Real assistant-message shape (round 15 review, confirmed against the
-  // installed @opencode/client types, not just observed behavior):
+  // Real assistant-message shape, confirmed against the installed
+  // @opencode/client types, not just observed behavior:
   // SessionMessageAssistant has neither .text nor .parts at all — its text
   // lives in content[].text for "text"/"reasoning" items ("tool" items
   // have no plain text and are skipped, same reasoning as the .parts
@@ -1027,7 +1009,7 @@ export async function evaluatePermission(
   try {
     const objective = await deps.objectiveFor(deps.ctx, sessionID, deps.endedSessions, deps.objectiveBudgetOf(deps.options));
     // Edits carry their diff in metadata.files, not in resources (which is
-    // just the path): without it Jev judged every write blind (#66). Only
+    // just the path): without it Jev would judge every write blind. Only
     // the Jev payload gets it; the kill-list and kindFor stay on resources.
     const patches = editPatchesOf(input.metadata);
     const rawDetail = (patches ? `${joined}\n${patches}` : joined).slice(0, 4000);
@@ -1110,10 +1092,10 @@ function archivedAt(info: unknown): unknown {
 // wording with a dozen unrelated *NotFoundError types (ProviderNotFoundError,
 // AgentNotFoundError, SkillNotFoundError, McpServerNotFoundError,
 // CommandNotFoundError, FileNotFoundError, ...) — confirmed reachable: a
-// bare /not found/i (as this used to be) matches "Provider anthropic not
+// a bare /not found/i regex matches "Provider anthropic not
 // found" just as readily as an actual session error. Misclassifying one of
 // those as "session ended" is worse than it sounds: the session gets
-// permanently cached as ended (5th confirming-review round found this
+// permanently cached as ended, and this
 // just silently stops replying for that session, forever, violating
 // SECURITY.md's "never silently allows" guarantee in spirit even though
 // it denies rather than allows). Checking the SDK's own `_tag` first
@@ -1190,8 +1172,9 @@ async function objectiveFor(
 // skips those forms instead of asking Jev the same thing again.
 // opencode loads a separate copy of this module for every setup()
 // instance (one per project directory), so module-level state is NOT
-// shared between instances: #70's "one poller per process" measured as
-// one poller per directory. Process-wide state has to live on
+// shared between instances: a "one poller per process" design that
+// leaves this on module-level state ends up as one poller per
+// directory instead. Process-wide state has to live on
 // globalThis. The versioned key keeps a future incompatible shape from
 // colliding with an instance still running older code.
 type SharedState = {
@@ -1308,9 +1291,9 @@ export async function answerQuestionsWithJev(
   return answers
 }
 
-// Shared form poller (#59): setup() runs once per project directory, so a
-// process with N project directories used to run N identical 750ms
-// `opencode api GET /api/form` intervals (~20 CLI spawns/second idle, ~2
+// Shared form poller: setup() runs once per project directory, so a
+// process with N project directories would otherwise run N identical
+// 750ms `opencode api GET /api/form` intervals (~20 CLI spawns/second idle, ~2
 // cores). Module-level state means the first instance to set up starts the
 // single interval and later ones only register their handler; the last
 // cleanup stops it again. Any registered ctx works for the tick's
@@ -1339,17 +1322,17 @@ function removeSharedPollDir(directory: string): void {
 
 function tickSharedPoller(): void {
   // One tick in flight at a time: if the previous round of CLI spawns has
-  // not finished, skip this tick instead of stacking processes (#59).
+  // not finished, skip this tick instead of stacking processes.
   if (SHARED.pollInFlight || sharedPollHandlers.size === 0) return
   SHARED.pollInFlight = true
   void (async () => {
     try {
       const handler = [...sharedPollHandlers][0] as PollHandler
-      // #58: poll the known project directories location-scoped, ONE per
+      // Poll the known project directories location-scoped, ONE per
       // tick in round-robin: all of them per tick is still ~12 CLI
       // spawns/s with 40 directories. This poll only backs up the
       // form.created event, so N x 750ms of fallback latency is fine.
-      // With none known, keep the bare endpoint (previous behavior).
+      // With none known, keep the bare endpoint.
       const known = [...sharedPollDirRefs.keys()]
       const dirs: (string | undefined)[] = known.length > 0 ? [known[SHARED.pollCursor++ % known.length]] : [undefined]
       for (const dir of dirs) {
@@ -1411,7 +1394,7 @@ export default Plugin.define({
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
     
-    // Answer the question tool in-process (#69): wrapping its execute means
+    // Answer the question tool in-process: wrapping its execute means
     // Jev's pick is returned as the tool result directly, with no form and
     // no reply through `opencode api` (which only reaches the background
     // service). When Jev cannot answer, the original execute opens the
@@ -1510,8 +1493,8 @@ export default Plugin.define({
     }
     // pruneReplied only ran once, at setup() — a long-running opencode host
     // process (days/weeks, setup() never re-invoked) accumulates one marker
-    // file per permission/form forever (round 12 finding, live-verified:
-    // 5000 claimReply calls -> 5000 unpruned files). Same class of bug
+    // file per permission/form forever (unbounded: 5000 claimReply
+    // calls means 5000 unpruned files). Same class of bug
     // already fixed for the in-memory collections via capped(); this is
     // its on-disk sibling. Cadence matches pruneReplied's own maxAgeMs
     // default (1h) — no need to poll as often as the form-list.
@@ -1519,10 +1502,10 @@ export default Plugin.define({
     ;(pruneTimer as unknown as { unref?: () => void }).unref?.()
     const controller = new AbortController()
     const formSeen = new Set<string>()
-    // Shared poller (#58/#59): one 750ms interval per process (not per
-    // setup() instance) polling /api/form location-scoped per known
-    // project directory. This instance only registers its handler and
-    // its own project directory; cleanup unregisters both.
+    // Shared poller: one 750ms interval per process (not per setup()
+    // instance) polling /api/form location-scoped per known project
+    // directory. This instance only registers its handler and its own
+    // project directory; cleanup unregisters both.
     const pollHandler: PollHandler = {
       ctx: ctx as PollHandler["ctx"],
       log: logEv,
@@ -1563,13 +1546,13 @@ export default Plugin.define({
           // formID="" and hit its missing-ids early return, permanently
           // stuck: nothing gets claimed on disk (claimReply never runs),
           // yet formSeen is now marked forever, blocking the poll path's
-          // retry for a form nothing ever actually processed (round 14
-          // review). Hand it a form object whose .id already matches fid.
+          // retry for a form nothing ever actually processed.
+          // Hand it a form object whose .id already matches fid.
           const formForHandler = fid && !form.id ? { ...form, id: fid } : form
           const task = handleFormAsked(ctx, logEv, inst, options, formForHandler, endedSessions)
           void task.catch(() => {
             // Failures are logged inside the handler. Mirror the poll
-            // path's own cleanup (round 14 review): most failures inside
+            // path's own cleanup: most failures inside
             // handleFormAsked are swallowed by its own internal fail-open
             // catch and never reject here, but a throw BEFORE its
             // claimReply call (e.g. missing-ids on a malformed event) never
@@ -1687,7 +1670,7 @@ export async function handleFormAsked(
   }
   const toolRef = (payload.metadata as { tool?: { messageID?: unknown; id?: unknown } } | undefined)?.tool
   if (toolRef && questionsLeftForHuman.has(`${String(toolRef.messageID ?? "")}:${String(toolRef.id ?? "")}`)) {
-    // Jev already declined this question in the tool wrapper (#69); asking
+    // Jev already declined this question in the tool wrapper; asking
     // again here would just repeat the same call. It is the human's.
     return
   }
@@ -1695,8 +1678,8 @@ export async function handleFormAsked(
   if (claim === "lost") {
     // Expected cross-instance outcome (setup() runs once per project
     // directory, so 15+ siblings race every form): staying silent keeps
-    // the losers from flooding the log with duplicate-suppressed noise
-    // (#59 — it was ~90% of log rows). The winner logs the real outcome.
+    // the losers from flooding the log with duplicate-suppressed noise,
+    // which would otherwise dominate the log. The winner logs the real outcome.
     return
   }
   if (await sessionIsEnded(ctx, sessionID, endedSessions)) {
@@ -1724,7 +1707,7 @@ export async function handleFormAsked(
           : `q${fi}`
       const type = field && typeof field === "object" ? (field as { type?: unknown }).type : undefined
 
-      // Issue #57: conditional/hidden fields are skipped — no Jev call, no
+      // Conditional/hidden fields are skipped — no Jev call, no
       // answer entry — when their visibility doesn't hold against the
       // answers already decided. The server 400s on a reply that includes
       // a field whose `when` isn't satisfied, so this is not optional.
@@ -1745,7 +1728,7 @@ export async function handleFormAsked(
       const required =
         field && typeof field === "object" ? (field as { required?: unknown }).required === true : false
 
-      // Issue #57: a visible field with no options and a non-multiselect
+      // A visible field with no options and a non-multiselect
       // type (boolean/number/free-string) can't be answered by a pick —
       // there is nothing for Jev to choose from. Log before calling Jev
       // and don't call it. A non-required one is skipped (the form keeps
@@ -1810,9 +1793,9 @@ export async function handleFormAsked(
         phase: "form-answer",
       })
 
-      // Issue #57: no more silent early exits from the field loop — every
-      // one logs a distinct reason with gateAction "ask-human" (the field
-      // stays pending for the human) and this fieldKey.
+      // No silent early exits from the field loop — every one logs a
+      // distinct reason with gateAction "ask-human" (the field stays
+      // pending for the human) and this fieldKey.
       const rawPick = decision.pick
       if (decision.action !== "allow" || rawPick == null) {
         log({
@@ -1971,7 +1954,7 @@ export async function handleOne(
   source?: PermissionSource | null,
 ): Promise<{ decision: string; repliedOk: boolean }> {
   // From permission.asked to whenever we attempt (or give up on) a reply —
-  // used to diagnose the reply-vs-server-window race (issue #15), not just
+  // diagnoses the reply-vs-server-window race, distinct from
   // Jev's own call time (which runGate already measures separately).
   const receivedAt = Date.now()
   // Claim the whole request (evaluation + reply) before calling Jev, not
@@ -2056,8 +2039,8 @@ export async function handleOne(
 
   const kind = kindFor(action, resources)
 
-  // spawnGate is called INSIDE the try (round 10 review, live-verified):
-  // spawn() throws SYNCHRONOUSLY, not via a rejected promise, when an env
+  // spawnGate is called INSIDE the try: spawn() throws SYNCHRONOUSLY,
+  // not via a rejected promise, when an env
   // value derived from options (e.g. a NUL byte in a malformed
   // typesafeKey/logFile/gateDir) is invalid. Outside the try, that throw
   // propagated out of handleOne entirely, past every log() call in this
@@ -2072,7 +2055,7 @@ export async function handleOne(
     // resolves, not after: its cold start (interpreter init, typesafe_sdk
     // import) then overlaps with that RPC instead of adding to it serially.
     // Every millisecond here is one this permission's reply doesn't get to
-    // spend against the server's reply window (issue #15).
+    // spend against the server's reply window.
     const startedAt = Date.now()
     let objective: string
     // First spawn attempt
@@ -2116,9 +2099,8 @@ export async function handleOne(
       retried = true
     }
     // Spans spawn → decision (overlaps objectiveFor's RPC), not just the
-    // subprocess's own runtime — larger than pre-issue-#15-fix elapsedMs
-    // values for the same underlying Jev call; that's the full budget that
-    // matters for the reply-window race, not a regression.
+    // subprocess's own runtime: that's the full budget that matters for
+    // the reply-window race.
     const elapsedMs = Date.now() - startedAt
     log({
       sessionID,
@@ -2157,7 +2139,7 @@ export async function handleOne(
         // Jev decided, but the reply arrived after the server stopped
         // tracking the request — the tool call is likely hanging with no
         // other signal. See docs/TROUBLESHOOTING.md "Ordinary permission
-        // replies can silently miss the window" (issue #15).
+        // replies can silently miss the window".
       }
     }
     return { decision: String(decision.action), repliedOk }

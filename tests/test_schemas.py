@@ -37,11 +37,10 @@ def test_redact_secrets_is_safe_on_non_string_and_empty_input():
 
 
 def test_redact_secrets_does_not_hang_on_a_long_string_with_no_scheme_match():
-    # regression: round 11 ReDoS finding. The scheme://user:pass@ regex's
-    # `*`-repeated prefix had no bound, so a long string with no "://"
-    # anywhere forced a greedy-then-backtrack scan from every position
-    # (live-verified pre-fix: 50k chars took 1.15s, 5,000,000 chars fed to
-    # the standalone `python3 -m jev_gate.cli` froze it for 2.5+ minutes).
+    # The scheme://user:pass@ regex's `*`-repeated prefix must stay
+    # bounded: unbounded, a long string with no "://" anywhere forces a
+    # greedy-then-backtrack scan from every position, and the standalone
+    # `python3 -m jev_gate.cli` has no other length guard on stdin.
     import time
     from jev_gate.schemas import redact_secrets
     adversarial = "A" * 150000

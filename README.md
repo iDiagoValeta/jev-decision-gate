@@ -9,9 +9,8 @@ Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
 calls get approved automatically, anything Jev calls risky or
 uncertain falls back to your manual prompt. Every delegation is
 recorded in the JSONL decision log (`gateAction`, `reason`,
-`error_class`, `error_detail`); there is no desktop popup — one used
-to fire on ask-human/fail-open but proved actively disruptive on a
-host running several concurrent sessions, so it was removed.
+`error_class`, `error_detail`); there is no desktop popup for
+ask-human/fail-open, only the manual prompt and the log entry.
 
 > [!WARNING]
 > This plugin lets an LLM auto-approve OpenCode's tool-permission
@@ -39,8 +38,9 @@ opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ 
      │                                │ deny → reply reject
      │                                │ ask-human → silence, logged
      │
-     └──question form (GET /api/form)──▶ plugin/ ──▶ Jev pick
-            ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
+     └──question tool call──▶ plugin/ (in-process, Jev answers each field)
+            └─ if unanswerable ──▶ question form (GET /api/form) ──▶ Jev pick
+                   ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
 ```
 
 The plugin builds a curated brief per halt — objective, halt kind,
@@ -54,18 +54,16 @@ broken gate never silently allows.
 Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, force-push,
 `mkfs`, fork bombs, ...) are rejected instantly without calling Jev.
 
-Agent questions (multichoice) are auto-answered when Jev can pick:
-the permission to open the question tool is passthrough-allowed
-without session context; OpenCode then opens a **form**
-(`metadata.kind=question`). The plugin polls `GET /api/form` (and
-listens for `form.created` / legacy question events), asks Jev for a
-pick, and submits
+Agent questions (multichoice) are auto-answered when Jev can pick: the
+permission to open the question tool is passthrough-allowed without
+session context (no Jev call), and the question tool itself is
+wrapped so Jev answers each field in-process. When that can't answer,
+OpenCode opens a **form** (`metadata.kind=question`) instead. The
+plugin polls `GET /api/form` (and listens for `form.created` / legacy
+question events), asks Jev for a pick, and submits
 `POST /api/session/{sessionID}/form/{formID}/reply` with
 `{"answer":{"q0":"<pick>"}}`. If Jev is unsure or the submit fails,
-it stays pending for you to answer in the TUI. Live-verified on
-2.0.11 that form reply unblocks the question tool and the agent
-continued (`ELEGIDO=pizza`, idle succeeded) — not a claim that every
-hang case is fixed; see
+it stays pending for you to answer in the TUI; see
 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Requirements
@@ -116,12 +114,13 @@ Jev's brief" for what that fence does and doesn't guarantee.
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
-`detail_sha256`) with no secrets, mode `0600`. `setup()` runs twice per
-opencode process (an opencode quirk, not this plugin's) — every real
-permission is logged once for real and once as `duplicate-suppressed`
-(a no-op that never touched Jev); `scripts/measure.py` already excludes
-those from its rates, but a raw `grep gateAction` over the log will
-double-count them.
+`detail_sha256`) with no secrets, mode `0600`. `setup()` runs once per
+project directory, so several times per opencode process, and every
+instance sees the same process-wide event stream — every real
+permission is logged once for real and once (or more) as
+`duplicate-suppressed` (a no-op that never touched Jev);
+`scripts/measure.py` already excludes those from its rates, but a raw
+`grep gateAction` over the log will double-count them.
 
 ### Personal notes for Jev
 
@@ -157,5 +156,4 @@ python3 scripts/measure.py --by-session
 python3 -m jev_gate.doctor
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md),
-[SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
