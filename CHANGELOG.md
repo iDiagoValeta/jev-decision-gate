@@ -72,6 +72,20 @@ versioning follows [SemVer](https://semver.org/).
   `error_class`; both the standalone CLI log path and the
   plugin-spawned path (`index.ts`, permission and form-answer sites)
   record it.
+- **No more production-log truncation in `scripts/verify_autonomy.py` (#62).**
+  The script used `LOG.write_text("")` at start, wiping the live
+  decision log. Now it saves `LOG.stat().st_size` (or 0) at start and
+  in the poll loop reads only bytes from that offset via
+  `open("rb").seek(offset).read().decode()`, never writing to the log.
+- **`scripts/measure.py` no longer silently falls back to
+  `./decisions-plugin.jsonl` without saying which file it read (#62).**
+  Before cwd fallbacks it now tries `logFile` from
+  `~/.config/opencode/opencode.json` (searches `plugins` for an object
+  whose `package` contains `jev-decision-gate` and uses
+  `options.logFile` if present; tolerates missing/invalid JSON) and
+  always prints `log=<resolved>` (also as `log` in `--json`). Config
+  path overridable via `OPENCODE_CONFIG_FILE` for tests; see
+  `docs/TROUBLESHOOTING.md` "Which log file?".
 
 ### Added
 - **Personal/project notes Jev weighs as context.** Two optional

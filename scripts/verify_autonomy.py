@@ -51,8 +51,7 @@ def api(*args: str) -> str:
 
 def main() -> int:
     Path(TEST_DIR).mkdir(parents=True, exist_ok=True)
-    if LOG.exists():
-        LOG.write_text("")
+    offset = LOG.stat().st_size if LOG.exists() else 0
 
     created = json.loads(
         api(
@@ -104,7 +103,10 @@ def main() -> int:
     pick = None
     while time.time() < deadline:
         if LOG.exists():
-            for line in LOG.read_text().splitlines():
+            with LOG.open("rb") as _lf:
+                _lf.seek(offset)
+                _content = _lf.read().decode("utf-8", errors="replace")
+            for line in _content.splitlines():
                 if not line.strip():
                     continue
                 try:
