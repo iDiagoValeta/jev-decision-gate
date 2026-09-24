@@ -6,11 +6,40 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 def check(name, ok, hint=""):
     print(f"{'OK  ' if ok else 'FAIL'}  {name}" + (f" — {hint}" if hint and not ok else ""))
     return ok
+
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def plugin_log_path():
+    """The log the plugin writes: JEV_GATE_LOG, else `logFile` from the
+    opencode config (measure.py's lookup), else `<repo>/decisions-plugin.jsonl`."""
+    env = os.environ.get("JEV_GATE_LOG")
+    if env:
+        return env
+    cfg = None
+    try:
+        spec = importlib.util.spec_from_file_location("jev_measure", _REPO / "scripts" / "measure.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cfg = mod._config_logfile()
+    except Exception:
+        cfg = None
+    return cfg or str(_REPO / "decisions-plugin.jsonl")
+
+
+def _writable(path):
+    """Checks without creating the file: a stray empty log is a side effect."""
+    p = Path(path)
+    if p.exists():
+        return os.access(p, os.W_OK)
+    return p.parent.is_dir() and os.access(p.parent, os.W_OK)
 
 
 def main():
@@ -47,13 +76,8 @@ def main():
         ok_all &= check("opencode on PATH", False, "install opencode v2 (try `opencode-v2` or `opencode`)")
     key = os.environ.get("TYPESAFE_API_KEY", "")
     ok_all &= check("TYPESAFE_API_KEY set", bool(key), "export TYPESAFE_API_KEY=... (value never printed)")
-    log = os.environ.get("JEV_GATE_LOG", "decisions-plugin.jsonl")
-    try:
-        with open(log, "a", encoding="utf-8"):
-            pass
-        ok_all &= check(f"log writable ({log})", True)
-    except Exception as exc:
-        ok_all &= check(f"log writable ({log})", False, str(exc)[:100])
+    log = plugin_log_path()
+    ok_all &= check(f"log writable ({log})", _writable(log), "fix permissions or set logFile / JEV_GATE_LOG")
 
     # synthetic round-trip through decide_event (no network)
     try:
