@@ -114,7 +114,8 @@ Jev's state" for what that does and doesn't guarantee.
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
-`detail_sha256`) with no secrets, mode `0600`. `setup()` runs once per
+`detail_sha256`, and `usage` (Jev's token counts, which `measure.py`
+turns into tokens and cost) with no secrets, mode `0600`. `setup()` runs once per
 project directory, so several instances share one opencode process;
 when two of them see the same request, the loser logs
 `duplicate-suppressed` (a no-op that never touched Jev).
@@ -143,7 +144,7 @@ the notes say.
   `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps
-- `scripts/` — `install.sh`, `uninstall.sh`, `doctor.py` shim, `measure.py` v2,
+- `scripts/` — `install.sh`, `uninstall.sh`, `measure.py` v2,
   `verify_autonomy.py` (live autonomy check)
 - `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 

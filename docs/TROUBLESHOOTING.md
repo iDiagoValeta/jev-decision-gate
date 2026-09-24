@@ -63,9 +63,9 @@ since nothing else resolves the permission first.
 That IS the fail-open design — but find out why:
 
 ```bash
-python3 -m jev_gate.doctor
-tail -5 "${JEV_GATE_LOG:-decisions-plugin.jsonl}"
-python3 scripts/measure.py
+python3 -m jev_gate.doctor      # "log writable (<path>)" is the log the plugin writes
+python3 scripts/measure.py      # same path, printed as log=<path>
+tail -5 <that path>
 ```
 
 | Symptom in log | Cause | Fix |
@@ -305,7 +305,10 @@ found is the only one read; the `decisions-plugin.jsonl` /
 `decisions.jsonl` cwd files are read only when none is configured. The
 resolved path is printed as `log=<path>` (and included as `log` in
 `--json` output). The config path can be overridden with
-`OPENCODE_CONFIG_FILE` for tests. `scripts/verify_autonomy.py` does
+`OPENCODE_CONFIG_FILE` for tests. `scripts/verify_autonomy.py` reads the
+log the plugin writes (`JEV_GATE_LOG`, else config `logFile`, else
+`<repo>/decisions-plugin.jsonl`) and drives the session with
+`JEV_VERIFY_MODEL` (default `opencode/nemotron-3-ultra-free`). It does
 not truncate the production log; it saves the log's byte size at start
 (or 0 if absent) and in its poll loop reads only new bytes via
 `open("rb").seek(offset).read().decode()`.

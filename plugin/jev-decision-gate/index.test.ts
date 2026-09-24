@@ -1785,3 +1785,39 @@ test("redactSecrets: a quoted value stops at its closing quote, and quote-dense 
     assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0}ms`)
   }
 })
+
+test("answerQuestionsWithJev: logs Jev's token usage with the decision", async () => {
+  const f = fakeQuestionDeps([{ action: "allow", pick: "pera", usage: { input_tokens: 1234 } }])
+  await answerQuestionsWithJev(f.deps, "s", "m:c", { questions: [{ question: "q1", options: [{ label: "manzana" }, { label: "pera" }] }] })
+  const row = f.logs.find((l) => l.gateAction === "allow" && l.pick === "pera")
+  assert.deepEqual(row?.usage, { input_tokens: 1234 })
+})
+
+test("evaluatePermission: logs Jev's token usage, and omits it when absent", async () => {
+  for (const usage of [{ input_tokens: 987 }, undefined]) {
+    const logs: Record<string, unknown>[] = []
+    const deps = {
+      runGate: async () => ({ decision: { action: "allow", reason: "jev-allow", confidence: 0.9, model: "m", ...(usage ? { usage } : {}) }, retried: false }),
+      objectiveFor: async () => "obj",
+      kindFor: () => "read",
+      redactSecrets,
+      sha256Hex: () => "hash",
+      isCatastrophic: () => false,
+      subagentDetailFor: async () => null,
+      resourceKinds: () => "text",
+      DESTRUCTIVE_HINT: /\bnever-matches\b/,
+      COMMAND_SUBSTITUTION: /\bnever-matches\b/,
+      objectiveBudgetOf: () => 4000,
+      apiKeyOf: () => "key",
+      ctx: { session: { context: async () => [] } },
+      log: (e: Record<string, unknown>) => logs.push(e),
+      options: {},
+      endedSessions: new Set(),
+      inst: "inst1",
+    } as unknown as EvaluateDeps
+    const input: { sessionID: string; action: string; resources: string[]; effect: "allow" | "deny" | "ask" } = { sessionID: "s", action: "read", resources: ["a.txt"], effect: "ask" }
+    await evaluatePermission(deps, input)
+    assert.deepEqual(logs[0].usage, usage)
+    assert.equal("usage" in logs[0], usage !== undefined)
+  }
+})
