@@ -7,6 +7,8 @@ import { test } from "node:test"
 import JevGate, {
   capped,
   claimReply,
+  encodeAnswer,
+  fieldVisible,
   handleOne,
   isCatastrophic,
   kindFor,
@@ -375,6 +377,73 @@ test("valueForPick: returns null when two different labels collide only after th
   const labels = labelsFromFormField(field)
   assert.equal(labels[0], labels[1], "both labels must collide after truncation for this test to be meaningful")
   assert.equal(valueForPick(field, labels[0]), null)
+})
+
+test("fieldVisible: hidden:true is never visible, even when a when-condition would otherwise pass", () => {
+  assert.equal(fieldVisible({ key: "q1", hidden: true }, {}), false)
+  assert.equal(fieldVisible({ key: "q1", hidden: true, when: [{ key: "q0", op: "eq", value: "pizza" }] }, { q0: "pizza" }), false)
+})
+
+test("fieldVisible: no hidden/when means visible, including degenerate field shapes", () => {
+  assert.equal(fieldVisible({ key: "q1" }, {}), true)
+  assert.equal(fieldVisible(null, {}), true)
+  assert.equal(fieldVisible(undefined, {}), true)
+  assert.equal(fieldVisible({ key: "q1", when: "not-an-array" }, {}), true)
+})
+
+test("fieldVisible: when eq holds only when the referenced answer strictly equals the value", () => {
+  const field = { key: "q2", when: [{ key: "q0", op: "eq", value: "pizza" }] }
+  assert.equal(fieldVisible(field, { q0: "pizza" }), true)
+  assert.equal(fieldVisible(field, { q0: "sushi" }), false)
+  assert.equal(fieldVisible(field, {}), false, "unanswered referenced key: eq is false (issue #57)")
+})
+
+test("fieldVisible: when neq holds when the referenced answer differs or is unanswered", () => {
+  const field = { key: "q2", when: [{ key: "q0", op: "neq", value: "pizza" }] }
+  assert.equal(fieldVisible(field, { q0: "sushi" }), true)
+  assert.equal(fieldVisible(field, {}), true, "unanswered referenced key: neq is true (issue #57)")
+  assert.equal(fieldVisible(field, { q0: "pizza" }), false)
+})
+
+test("fieldVisible: when conditions are ANDed — one unmet condition hides the field", () => {
+  const field = {
+    key: "q3",
+    when: [
+      { key: "q0", op: "eq", value: "pizza" },
+      { key: "q1", op: "neq", value: "none" },
+    ],
+  }
+  assert.equal(fieldVisible(field, { q0: "pizza", q1: "extra" }), true)
+  assert.equal(fieldVisible(field, { q0: "pizza", q1: "none" }), false)
+  assert.equal(fieldVisible(field, { q0: "sushi", q1: "extra" }), false)
+})
+
+test("encodeAnswer: multiselect wraps the pick's real option value in an array (issue #55)", () => {
+  const field = { type: "multiselect", options: [{ label: "Pizza", value: "pizza" }, "Sushi"] }
+  assert.deepEqual(encodeAnswer(field, "Pizza"), ["pizza"])
+  assert.deepEqual(encodeAnswer(field, "Sushi"), ["Sushi"])
+})
+
+test("encodeAnswer: non-multiselect returns the plain string value", () => {
+  const field = { type: "string", options: [{ label: "Pizza", value: "pizza" }] }
+  assert.equal(encodeAnswer(field, "Pizza"), "pizza")
+})
+
+test("encodeAnswer: a field without options falls back to the pick itself", () => {
+  assert.equal(encodeAnswer({ type: "string" }, "free-text"), "free-text")
+})
+
+test("encodeAnswer: an ambiguous pick (labels collide after redaction) returns null", () => {
+  const field = {
+    type: "multiselect",
+    options: [
+      { label: "Use key sk-abc123def456ghijk", value: "account-A" },
+      { label: "Use key sk-xyz789ghi012jklmn", value: "account-B" },
+    ],
+  }
+  const labels = labelsFromFormField(field)
+  assert.equal(labels[0], labels[1], "both labels must collide after redaction for this test to be meaningful")
+  assert.equal(encodeAnswer(field, labels[0]), null)
 })
 
 test("capped: clears the collection once it reaches the size limit, otherwise leaves it alone (confirming-review finding: resolved/endedSessions/formSeen never evicted, unbounded over process lifetime)", () => {

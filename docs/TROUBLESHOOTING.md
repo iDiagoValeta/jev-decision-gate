@@ -205,6 +205,44 @@ question reply API were wrong for this line):
    invalid pick / reply failure, the form stays pending — logged, no
    desktop alert (removed) — and the human answers in the TUI.
 
+**Field-level behavior (issues #55/#57):**
+
+- `multiselect` fields are answered with an **array** of the picked
+  option values, not a string: `{"answer":{"q0":["pizza","sushi"]}}`.
+  Jev returns a single pick today, so the array has one element; if a
+  future Jev version returns a list of picks, each one is mapped to
+  its option value and the array grows accordingly.
+- `hidden: true` fields are never answered. A field with
+  `when: [{key, op: "eq"|"neq", value}]` is answered only when **all**
+  conditions hold against the answers already decided for earlier
+  fields, compared with `===` (no coercion — a numeric `value` won't
+  match a string answer, which is the safe direction). An
+  unreferenced `key` counts as unanswered: `eq` is false, `neq` is
+  true. A not-visible field is **omitted from the reply entirely** —
+  the server 400s on a reply that includes a field whose `when`
+  isn't satisfied.
+- A visible field with **no options and a non-multiselect type**
+  (boolean / number / free-string) can't be answered by a pick — Jev
+  is not called for it (logged before the call would happen). If it's
+  not `required` it's skipped and the rest of the form is still
+  auto-answered; if it is `required` the whole form stays pending for
+  the human.
+
+**Logged reasons inside the field loop (no more silent exits):**
+
+Every early exit while walking a form's fields logs a line with
+`tool: "question"`, `requestID` = formID, `fieldKey`, and one
+distinct `reason` (all `gateAction: "ask-human"` — the field/form
+stays pending for the human):
+
+| reason | meaning |
+| ------ | ------- |
+| `form-field-hidden` | conditional field not visible (skipped; form continues) |
+| `form-unsupported-field` | visible, no options, non-multiselect type; includes `required` (skipped if false, aborts the form if true) |
+| `form-jev-not-allow` | Jev didn't `allow`, or returned no / empty / non-string pick |
+| `form-pick-not-offered` | pick not among the offered labels |
+| `form-pick-ambiguous` | `valueForPick`/`encodeAnswer` resolved to null (labels collide after redaction/truncation) or several picks landed on a single-select field |
+
 **Live evidence (auto-answer):**
 
 - Log: `question-permission-passthrough` → `phase: form-answer` →
