@@ -6,6 +6,30 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **One shared form poller per process instead of one per project
+  directory (#59).** `setup()` runs once per project directory (15–40
+  instances in one process, live-verified on 2.0.16), and each instance
+  started its own 750ms `opencode api GET /api/form` interval — ~20 CLI
+  spawns/second at idle, ~2 cores. Module-level state
+  (`registerPoller`/`unregisterPoller`, unit-tested with an injectable
+  interval) now starts a single interval on the first `setup()` and
+  stops it when the last instance cleans up; at most one tick runs at a
+  time so slow listings can't stack processes.
+- **The form poller now lists each known project directory (#58).**
+  Bare `GET /api/form` only lists the service's own directory, so
+  project sessions' forms were always `[]` and never auto-answered.
+  Each `setup()` registers its `ctx.location.directory` (refcounted,
+  removed on cleanup) and every tick queries
+  `GET /api/form?location[directory]=<dir>` per directory
+  (`formListPath`, unit-tested including encoding), falling back to the
+  bare endpoint with no known directory.
+- **A losing form claim no longer logs `duplicate-suppressed` (#59).**
+  With 15+ sibling instances racing every form, the losers' rows were
+  ~90% of the log while carrying zero information. The winner still
+  logs the real outcome; the permission fallback path still logs its
+  own `duplicate-suppressed`.
+
 ### Changed
 - **Permissions are decided in opencode's `evaluate` hook instead of by
   replying to `permission.asked` (#56, #60).** `allow`/`deny` are set on

@@ -453,6 +453,34 @@ second consecutive death, or a timeout, falls open to ask-human.
 Before #61 this showed up as `error_class: "gate exit null "` with no
 retry, and the session stalled.
 
+## High idle CPU / a storm of `opencode api GET /api/form` (RESOLVED — #59)
+
+**Symptom:** ~20 `opencode` CLI processes per second (visible in
+`htop`/`ps`) and ~2 cores busy with no active session. Each `setup()`
+instance (one per project directory — 15+ in one process, see
+`claimReply`) ran its own 750ms `GET /api/form` poll interval.
+
+**Fix:** a single module-level poller per process
+(`registerPoller`/`unregisterPoller` in `index.ts`): the first instance
+starts it, the rest only register, the last cleanup stops it, and at
+most one tick runs at a time. If you still see per-instance polling,
+you are on a build before this fix.
+
+Related (#58): the bare `GET /api/form` only lists the service's own
+directory (`/home/idiaval`), so project sessions' forms were always
+`[]`. The shared poller lists each known project directory via
+`GET /api/form?location[directory]=<dir>`. A question form in a
+project that is never auto-answered (no `phase: form-answer` line at
+all, not even ask-human) on a current build means its directory never
+registered — check the service actually opened that project.
+
+**Log note:** on the form path a losing cross-instance claim no longer
+logs `duplicate-suppressed` at all — with 15+ siblings racing every
+form it was ~90% of log rows and carried no information (losing is the
+expected outcome). `duplicate-suppressed` in the log now means the
+permission (fallback) path only. `scripts/measure.py` already excludes
+it from rates either way.
+
 ## Which log file?
 
 Canonical: the path in `logFile` / `JEV_GATE_LOG`, default

@@ -12,6 +12,8 @@ import JevGate, {
   EvaluateDeps,
   evaluatePermission,
   fieldVisible,
+  formListPath,
+  handleFormAsked,
   handleOne,
   isCatastrophic,
   isRetryableGateError,
@@ -21,12 +23,15 @@ import JevGate, {
   looksLikeSessionGone,
   normalizeCommand,
   postApiReply,
+  PollHandler,
   redactSecrets,
+  registerPoller,
   runGate,
   sha256Hex,
   subagentDetailFor,
   textOfMessage,
   timeoutMsOf,
+  unregisterPoller,
   valueForPick,
 } from "./index.js"
 
@@ -1463,4 +1468,97 @@ test("evaluatePermission: an edit's patch reaches Jev's detail, redacted (#66)",
   assert.match(detail, /--- patch for config\.py ---/)
   assert.match(detail, /\+DEBUG=1/)
   assert.doesNotMatch(detail, /sk-abcdefghijklmnop/)
+})
+
+test("formListPath: no directory lists the bare form endpoint (current behavior fallback)", () => {
+  assert.equal(formListPath(), "/api/form")
+  assert.equal(formListPath(undefined), "/api/form")
+  assert.equal(formListPath(""), "/api/form")
+})
+
+test("formListPath: a project directory is passed as an encoded location query (#58)", () => {
+  assert.equal(formListPath("/home/idiaval/proj"), "/api/form?location[directory]=%2Fhome%2Fidiaval%2Fproj")
+})
+
+test("formListPath: spaces and special chars in the directory are encoded (#58)", () => {
+  const dir = "/tmp/mi proyecto & cosas"
+  assert.equal(formListPath(dir), `/api/form?location[directory]=${encodeURIComponent(dir)}`)
+  assert.ok(!formListPath(dir).includes(" "), "raw spaces must not appear in the path")
+})
+
+test("listPendingForms: passes the encoded per-directory path to the CLI (#58)", async () => {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formpath-bin-"))
+  const argsFile = path.join(binDir, "args.json")
+  fs.writeFileSync(
+    path.join(binDir, "opencode"),
+    `#!/usr/bin/env python3\nimport sys, json\nopen(${JSON.stringify(argsFile)}, "w").write(json.dumps(sys.argv[1:]))\nprint(json.dumps([]))\n`,
+    { mode: 0o755 },
+  )
+  const origPath = process.env.PATH
+  process.env.PATH = `${binDir}${path.delimiter}${origPath ?? ""}`
+  try {
+    const dir = "/tmp/mi proyecto"
+    const result = await listPendingForms(dir)
+    assert.deepEqual(result, [])
+    const argv = JSON.parse(fs.readFileSync(argsFile, "utf8")) as string[]
+    assert.deepEqual(argv, ["api", "GET", `/api/form?location[directory]=${encodeURIComponent(dir)}`])
+  } finally {
+    process.env.PATH = origPath
+    fs.rmSync(binDir, { recursive: true, force: true })
+  }
+})
+
+test("shared poller: registering two instances starts a single interval; clearing the last one stops it (#59)", () => {
+  let starts = 0
+  let clears = 0
+  const fakeStart = ((_fn: () => void, _ms: number) => {
+    starts++
+    return { __fakeTimer: starts }
+  }) as unknown as typeof setInterval
+  const fakeClear = ((_h: unknown) => {
+    clears++
+  }) as unknown as typeof clearInterval
+  const mkHandler = (id: string): PollHandler => ({
+    ctx: { session: { context: async () => [] } },
+    log: () => {},
+    inst: id,
+    options: {},
+    endedSessions: new Set(),
+  })
+  const handlerA = mkHandler("handler-A")
+  const handlerB = mkHandler("handler-B")
+  try {
+    registerPoller(handlerA, fakeStart)
+    registerPoller(handlerB, fakeStart)
+    assert.equal(starts, 1, "two instances must share one interval, not start two")
+    unregisterPoller(handlerA, fakeClear)
+    assert.equal(clears, 0, "interval must survive while one handler remains")
+    unregisterPoller(handlerB, fakeClear)
+    assert.equal(clears, 1, "interval must stop once no handlers remain")
+  } finally {
+    unregisterPoller(handlerA, fakeClear)
+    unregisterPoller(handlerB, fakeClear)
+  }
+})
+
+test("handleFormAsked: a losing claim logs nothing — it is the expected cross-instance outcome, not an event (#59)", async () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-formlost-"))
+  try {
+    const logs: Record<string, unknown>[] = []
+    const ctx = {
+      session: {
+        get: async () => {
+          throw new Error("Session sess1 not found")
+        },
+        context: async () => [],
+      },
+    }
+    const payload = { sessionID: "sess1", id: "form-lost-1", fields: [] }
+    await handleFormAsked(ctx, (e: Record<string, unknown>) => logs.push(e), "instA", { gateDir }, payload, new Set())
+    assert.equal(logs.length, 1, "winner logs its own session-ended outcome")
+    await handleFormAsked(ctx, (e: Record<string, unknown>) => logs.push(e), "instB", { gateDir }, payload, new Set())
+    assert.equal(logs.length, 1, "loser must stay silent: duplicate-suppressed is noise at 15+ instances")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
 })
