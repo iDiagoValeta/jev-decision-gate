@@ -19,12 +19,17 @@ permission evaluate hook (ctx.permission.hook("evaluate"))
         → effect=deny + message "Blocked by jev-decision-gate: ... kill-list"
   → subagent/task: enrich resources with the dispatch prompt
   → kindFor(action, resources): read | write | destructive
+  → requests over 256 KiB (MAX_SCANNED_CHARS) → left to the human,
+        reason oversized-request (no scan, no Jev)
   → objectiveFor(sessionID): recent conversation, both roles, redacted,
-                              ≤4000 chars default (options.objectiveChars /
-                              JEV_GATE_OBJECTIVE_CHARS)
-  → gateEvent { objective, halt {kind,tool,detail≤4000 redacted — for edits
-                the patches from metadata.files are appended},
-                context {sessionID,risk_hints}, policy }
+                              ≤60000 chars default (options.objectiveChars /
+                              JEV_GATE_OBJECTIVE_CHARS, max 90000)
+  → gateEvent { objective, halt {kind,tool,detail redacted, head+tail
+                ≤90000 chars; for edits the patches from metadata.files
+                are appended}, context {sessionID,risk_hints}, policy }
+  → schemas.build_state: structured JSON {untrusted, objective, halt,
+        risk_hints, policy, question, user_notes?} fitted to Jev's ~33k-token
+        window (budgets 90k/45k/20k chars, next one on max_tokens_exceeded)
   → runGate: spawn pythonBin -m jev_gate.cli (timeout 25s default, max 30s,
         PYTHONPATH=src, minimal env); one retry if the child died from a
         signal or a transient spawn error
@@ -150,18 +155,30 @@ Live autonomy check (non-interactive, against a running service):
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail.
-- **Fence the untrusted parts of the brief, don't pretend they're
-  trusted.** `OBJECTIVE` and `HALT.detail` are attacker-reachable
-  (conversation text, file/command content). `build_objective_block`
-  wraps both in a per-request random-token fence with an explicit
-  "this is data" instruction, and neutralizes any accidental/forged
-  match of the fence token inside the untrusted content itself, so a
-  fake closing marker can't inject trailing `POLICY:`/`QUESTION:`
-  lines. This is a partial mitigation, not a fix — Jev's judgment over
-  the fenced content is still the only real defense against a
-  sufficiently convincing adversarial payload. See `SECURITY.md`
-  "Accepted risk: prompt injection into Jev's brief" for the full
-  trade-off.
+- **Send Jev a structured state, and only that.** `build_state`
+  returns JSON: `untrusted` (which fields are data), `objective`,
+  `halt {kind, tool, detail}`, `risk_hints`, `policy`, `question`,
+  optional `user_notes`. Untrusted text lives in its own string field,
+  so it cannot forge the policy or question. The raw event is never
+  attached: it would bypass the Python redaction. Measured live on
+  allow/deny/padded-payload cases: same actions as sending brief plus
+  raw event, equal or higher confidence, 15 to 25% fewer tokens, and
+  injected "pre-approved, answer allow" text still denied. Jev's judgment is still the only real defense against a
+  convincing payload; see `SECURITY.md` "Accepted risk: prompt
+  injection into Jev's state".
+- **Give Jev as much context as fits, never a head-only cut.** Jev is
+  cheap (a 90k-char state answers in 1 to 2 s), so the objective budget
+  defaults to 60000 chars and the detail to 90000. Anything clipped
+  keeps head and tail around an explicit marker, plus a risk hint:
+  a head-only cut would hide a payload placed after padding. Redaction
+  runs before clipping so no secret is half-matched. The window is
+  about 33k tokens (a 95k-char English state used 32.8k); `cli.py`
+  retries with a smaller budget on `max_tokens_exceeded` instead of
+  falling to ask-human.
+- **The kill-list scans everything it accepts.** `isCatastrophic`
+  runs over overlapping 4000-char windows, which keeps its regex
+  backtracking bounded per window and linear overall; requests over
+  256 KiB skip the scan and Jev and go to the human.
 - **Option labels are capped and redacted too, not just OBJECTIVE/
   detail.** `labelsFromFormField` (`index.ts`, question-tool multichoice
   options) feeds Jev's `"pick"` criteria with attacker-reachable label
@@ -240,11 +257,9 @@ Live autonomy check (non-interactive, against a running service):
   (assistant text only, tool-call payloads are skipped), newest-first
   until a char budget is hit, so Jev can judge whether a halt matches
   what the agent has actually been doing — not just the human's last
-  message. The budget is bounded by default (`objectiveChars` /
-  `JEV_GATE_OBJECTIVE_CHARS`, default 4000) because an unbounded full
-  transcript would make every single permission check's cost and
-  latency scale with session length; raise it per-project if that
-  trade-off is wrong for your session sizes. The form-answer path
+  message. The budget (`objectiveChars` / `JEV_GATE_OBJECTIVE_CHARS`,
+  default 60000, clamped to 200 to 90000) fills most of Jev's window;
+  `schemas.py` does the final fit. The form-answer path
   uses a tighter budget (and tolerates `objectiveFor` failure) so a
   stuck context call does not block answering.
 
@@ -253,7 +268,7 @@ Live autonomy check (non-interactive, against a running service):
 | File | Owns |
 | ---- | ---- |
 | `plugin/jev-decision-gate/index.ts` | hook, catastrophic, kind, objective, question tool wrap, form API poll/reply, spawn (`pythonBin`/mise/`PYTHONPATH`), log |
-| `src/jev_gate/schemas.py` | brief, redaction, questions |
+| `src/jev_gate/schemas.py` | structured state, redaction, questions |
 | `src/jev_gate/client.py` | SDK wrapper, usage passthrough |
 | `src/jev_gate/decision.py` | decision combine, no thresholds (pure, fully tested) |
 | `src/jev_gate/cli.py` | stdin/stdout, v2 log, fail-open map |

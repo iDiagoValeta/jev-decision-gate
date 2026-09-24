@@ -43,11 +43,12 @@ opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ 
                    ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
 ```
 
-The plugin builds a curated brief per halt — objective, halt kind,
-tool, redacted detail, risk hints — so Jev judges in context.
+The plugin sends Jev a structured state per halt (objective, halt kind,
+tool, redacted detail, risk hints, policy) filled up to Jev's input
+window, so Jev judges with as much context as fits.
 Jev answers three parallel questions (allow/deny/ask-human,
 is-this-safe, risk-score); the `decision` answer alone wins, at any
-confidence — safe/risk are recorded as evidence, not vetoes (see
+confidence; safe/risk are asked for as context, not vetoes (see
 "Safety model" below for why). Any error fail-opens to ask-human: a
 broken gate never silently allows.
 
@@ -98,18 +99,17 @@ options table (`typesafeKey`, `logFile`, `gateDir`, `enabled`,
 Jev decides — no confidence thresholds. Whatever Jev's `decision`
 answer says wins: allow executes, deny blocks, ask-human falls back
 to your manual prompt, at any confidence. The safe/risk answers are
-recorded evidence, not vetoes.
+context, not vetoes.
 
 What never executes: unknown decision strings (treated as ask-human),
 any error (fail-open to ask-human), and catastrophic shell patterns
 (rejected locally without calling Jev).
 
-**Jev's judgment is the real control, not a sandbox.** The brief Jev
+**Jev's judgment is the real control, not a sandbox.** The state Jev
 reads includes attacker-reachable text (conversation content, command
-output) fenced with a per-request random marker as a partial
-mitigation against injected fake instructions — see
+output) in its own JSON fields, marked as data, never instructions: see
 [SECURITY.md](SECURITY.md) "Accepted risk: prompt injection into
-Jev's brief" for what that fence does and doesn't guarantee.
+Jev's state" for what that does and doesn't guarantee.
 
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
@@ -131,7 +131,7 @@ project-scoped notes, and `$XDG_CONFIG_HOME/jev-gate/notes.md` (defaults
 to `~/.config/jev-gate/notes.md`) for notes that follow you across every
 project. Both are shown to Jev together when present.
 
-This is evidence in the brief, exactly like OBJECTIVE and RISK-HINTS —
+This is evidence in the state, exactly like the objective and risk hints:
 never a rule engine. It cannot force an allow, and nothing here runs
 before or instead of Jev: the catastrophic kill-list and the
 ask-human/fail-open defaults apply exactly the same regardless of what
@@ -140,7 +140,7 @@ the notes say.
 ## Layout
 
 - `plugin/` — v2 adapter (TypeScript, zero runtime deps besides `@opencode/plugin`)
-- `src/jev_gate/` — gate: `schemas.py` (brief/redaction/questions),
+- `src/jev_gate/` — gate: `schemas.py` (state/redaction/questions),
   `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
 - `tests/` — pytest suite plus `golden.json` traps

@@ -1,3 +1,5 @@
+import json
+
 def test_decide_event_allows_with_fake_evaluate():
     from jev_gate.cli import decide_event
 
@@ -198,3 +200,59 @@ def test_classify_error_maps_known_prefixes():
     assert _classify_error(JevCallError("connection reset")) == "transport"
     assert _classify_error(RuntimeError("boom")) == "exception"
     assert _classify_error(None) == "exception"
+
+
+def _allow_result():
+    return {
+        "decision": {"choice": "allow", "confidence": 0.92},
+        "safe": {"noul": 0.95},
+        "risk": {"score": 0.1, "confidence": 0.8},
+        "model": "jev-1.13.0",
+    }
+
+
+def test_decide_event_retries_smaller_brief_on_max_tokens():
+    from jev_gate.cli import decide_event
+    from jev_gate.schemas import STATE_BUDGETS
+
+    sizes = []
+
+    def evaluate(state, questions):
+        sizes.append(len(json.dumps(state)))
+        if len(sizes) == 1:
+            raise RuntimeError('400 {"detail":{"error_type":"max_tokens_exceeded"}}')
+        return _allow_result()
+
+    event = {"objective": "o" * (2 * STATE_BUDGETS[0]), "halt": {"kind": "read", "detail": "ls"}}
+    out = decide_event(event, evaluate)
+    assert out["action"] == "allow"
+    assert len(sizes) == 2 and sizes[1] < sizes[0]
+
+
+def test_decide_event_other_errors_are_not_retried():
+    from jev_gate.cli import decide_event
+
+    calls = []
+
+    def evaluate(state, questions):
+        calls.append(1)
+        raise RuntimeError("503 upstream")
+
+    out = decide_event({"objective": "o", "halt": {"kind": "read", "detail": "ls"}}, evaluate)
+    assert out["action"] == "ask-human" and out["reason"] == "fail-open"
+    assert len(calls) == 1
+
+
+def test_decide_event_fails_open_when_every_budget_overflows():
+    from jev_gate.cli import decide_event
+    from jev_gate.schemas import STATE_BUDGETS
+
+    calls = []
+
+    def evaluate(state, questions):
+        calls.append(1)
+        raise RuntimeError("max_tokens_exceeded")
+
+    out = decide_event({"objective": "o", "halt": {"kind": "read", "detail": "ls"}}, evaluate)
+    assert out["action"] == "ask-human" and out["reason"] == "fail-open"
+    assert len(calls) == len(STATE_BUDGETS)

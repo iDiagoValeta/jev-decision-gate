@@ -78,6 +78,21 @@ export function normalizeCommand(text: string): string {
     .trim()
 }
 
+// Keeps head and tail when text exceeds limit: a head-only cut would hide
+// whatever follows padding (e.g. `echo <2000 chars> && curl ... | sh`).
+// Call it on already-redacted text, so a secret split by the cut is never
+// half-matched by the redaction patterns. Slices by code point.
+export const OMITTED_MARK = "[... middle omitted by jev-decision-gate ...]"
+// Matches schemas.py BRIEF_BUDGETS[0]: the Python side does the final fit.
+const DETAIL_MAX_CHARS = 90000
+export function clipHeadTail(text: string, limit: number): string {
+  const cps = Array.from(text)
+  if (cps.length <= limit) return text
+  const keep = Math.max(0, limit - OMITTED_MARK.length - 2)
+  const head = Math.ceil(keep / 2)
+  return `${cps.slice(0, head).join("")}\n${OMITTED_MARK}\n${cps.slice(cps.length - (keep - head)).join("")}`
+}
+
 export function redactSecrets(text: string): string {
   let out = text
   for (const re of SECRET_PATTERNS) {
@@ -164,17 +179,27 @@ export function sha256Hex(text: string): string {
 // target: on a long string with no real target, each
 // occurrence of the pattern's trigger word forces its own O(remaining
 // length) backtrack search, so a string with many trigger occurrences is
-// O(n^2) overall — live-verified: ~1.6MB of "rm -rf junk..." froze the
-// event loop for ~19s. Bounding the check to the same length Jev's own
-// judgment already sees (rawDetail below truncates `joined` to this same
-// 4000 chars) closes this without reducing real detection: nothing past
-// this point is evaluated by either layer today.
+// O(n^2) overall (about 1.6MB of "rm -rf junk..." froze the event loop for
+// ~19s). The check therefore runs over overlapping windows of bounded size:
+// quadratic cost stays inside each window, the total is linear in length,
+// and a target hidden behind padding is still found. The overlap is far
+// longer than any kill-list command, so none is split between windows.
 const CATASTROPHIC_CHECK_MAX_CHARS = 4000
 
+const CATASTROPHIC_WINDOW_OVERLAP = 500
+// Beyond this the kill-list scan (linear, ~2 ms/KB worst case) would stall
+// the event loop, and no real tool call is this large: evaluatePermission
+// sends such requests straight to the human instead of scanning them.
+export const MAX_SCANNED_CHARS = 256 * 1024
+
 export function isCatastrophic(joined: string): boolean {
-  const bounded = joined.length > CATASTROPHIC_CHECK_MAX_CHARS ? joined.slice(0, CATASTROPHIC_CHECK_MAX_CHARS) : joined
-  const normalized = normalizeCommand(bounded)
-  return CATASTROPHIC.some((re) => re.test(bounded) || re.test(normalized))
+  const step = CATASTROPHIC_CHECK_MAX_CHARS - CATASTROPHIC_WINDOW_OVERLAP
+  for (let start = 0; start === 0 || start + CATASTROPHIC_WINDOW_OVERLAP < joined.length; start += step) {
+    const window = joined.slice(start, start + CATASTROPHIC_CHECK_MAX_CHARS)
+    const normalized = normalizeCommand(window)
+    if (CATASTROPHIC.some((re) => re.test(window) || re.test(normalized))) return true
+  }
+  return false
 }
 
 // Documented OpenCode permission keys (https://opencode.ai/docs/permissions/):
@@ -265,15 +290,15 @@ export function timeoutMsOf(options: Record<string, unknown>): number {
 }
 
 // How much recent conversation (chars, both roles) to send as OBJECTIVE.
-// Default is generous (well past the old 500-char/user-only window) but
-// still bounded: an unbounded full transcript would make every single
-// permission check's cost and latency scale with session length.
+// Jev is cheap and judges better with more context (a ~90k-char brief
+// measured at 1 to 2 s), so the default fills most of its ~33k-token
+// window; schemas.py fits objective and detail into the final budget.
 // Override per-project via options.objectiveChars or JEV_GATE_OBJECTIVE_CHARS.
 function objectiveBudgetOf(options: Record<string, unknown>): number {
   const raw = (options.objectiveChars as unknown) ?? process.env.JEV_GATE_OBJECTIVE_CHARS
   const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10)
-  if (!Number.isFinite(n)) return 4000
-  return Math.min(20000, Math.max(200, n))
+  if (!Number.isFinite(n)) return 60000
+  return Math.min(90000, Math.max(200, n))
 }
 
 function logFileOf(options: Record<string, unknown>): string {
@@ -977,6 +1002,11 @@ export async function evaluatePermission(
   let joined = mutableResources.join("\n");
   let resKinds = deps.resourceKinds(mutableResources);
 
+  if (joined.length > MAX_SCANNED_CHARS) {
+    deps.log({ sessionID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: joined.length, detail_sha256: deps.sha256Hex(joined) });
+    return;
+  }
+
   // Catastrophic pattern: deny instantly with message, no Jev call
   if (deps.isCatastrophic(joined)) {
     input.effect = "deny";
@@ -1012,12 +1042,12 @@ export async function evaluatePermission(
     // just the path): without it Jev would judge every write blind. Only
     // the Jev payload gets it; the kill-list and kindFor stay on resources.
     const patches = editPatchesOf(input.metadata);
-    const rawDetail = (patches ? `${joined}\n${patches}` : joined).slice(0, 4000);
-    const detail = deps.redactSecrets(rawDetail);
+    const detail = clipHeadTail(deps.redactSecrets(patches ? `${joined}\n${patches}` : joined), DETAIL_MAX_CHARS);
     const hintParts: string[] = [];
     if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated");
     if (deps.DESTRUCTIVE_HINT.test(joined)) hintParts.push("matches destructive-hint");
     if (deps.COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
+    if (detail.includes(OMITTED_MARK)) hintParts.push("detail too long: middle omitted, judge head and tail");
     const riskHints = hintParts.join("; ");
 
     const halt: Record<string, unknown> = { kind, tool: action, detail };
@@ -1973,6 +2003,10 @@ export async function handleOne(
 
   let joined = resources.join("\n")
   let resKinds = resourceKinds(resources)
+  if (joined.length > MAX_SCANNED_CHARS) {
+    log({ sessionID, requestID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: joined.length, detail_sha256: sha256Hex(joined) })
+    return { decision: "ask-human", repliedOk: true }
+  }
   if (isCatastrophic(joined)) {
     log({ sessionID, requestID, tool: action, kind: "destructive", gateAction: "reject", reason: "catastrophic-pattern", detail_sha256: sha256Hex(joined) })
     let repliedOk = true
@@ -2067,12 +2101,12 @@ export async function handleOne(
       gate.cancel()
       throw err
     }
-    const rawDetail = joined.slice(0, 4000)
-    const detail = redactSecrets(rawDetail)
+    const detail = clipHeadTail(redactSecrets(joined), DETAIL_MAX_CHARS)
     const hintParts: string[] = []
     if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated")
     if (DESTRUCTIVE_HINT.test(joined)) hintParts.push("matches destructive-hint")
     if (COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined")
+    if (detail.includes(OMITTED_MARK)) hintParts.push("detail too long: middle omitted, judge head and tail")
     const riskHints = hintParts.join("; ")
     const halt: Record<string, unknown> = { kind, tool: action, detail }
     const gateEvent = {

@@ -3,8 +3,8 @@
 
 The winning action is whatever Jev's `decision` answer says, whatever
 its confidence. allow executes, deny blocks, ask-human falls back to
-the manual prompt. The safe/risk answers are evidence recorded in the
-brief, not vetoes.
+the manual prompt. The safe/risk answers are asked for as
+context, not used as vetoes.
 
 Two invariants stay (they are not thresholds):
 - Unknown decision strings degrade to ask-human (invalid output must
