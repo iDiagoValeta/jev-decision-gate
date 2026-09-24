@@ -106,3 +106,24 @@ def test_json_mode_output_is_pure_json_with_log_field(tmp_path, monkeypatch, cap
     _load_measure().main()
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["log"] == str(lg)
+
+
+def test_configured_log_ignores_stray_cwd_logs(tmp_path, monkeypatch, capsys):
+    custom = tmp_path / "custom3.jsonl"
+    custom.write_text(json.dumps({"gateAction": "allow"}) + "\n")
+    cfg = tmp_path / "opencode3.json"
+    cfg.write_text(
+        json.dumps(
+            {"plugins": [{"package": "jev-decision-gate", "options": {"logFile": str(custom)}}]}
+        )
+    )
+    stray = tmp_path / "decisions-plugin.jsonl"
+    stray.write_text("".join(json.dumps({"gateAction": "deny"}) + "\n" for _ in range(3)))
+    monkeypatch.setenv("OPENCODE_CONFIG_FILE", str(cfg))
+    monkeypatch.delenv("JEV_GATE_LOG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["measure.py"])
+    _load_measure().main()
+    out = capsys.readouterr().out
+    assert "total=1" in out
+    assert "deny" not in out

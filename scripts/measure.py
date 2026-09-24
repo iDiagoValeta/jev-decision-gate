@@ -118,14 +118,13 @@ def main():
         paths = args.log
     else:
         env_log = os.environ.get("JEV_GATE_LOG")
-        if env_log:
-            paths = [env_log, "decisions-plugin.jsonl", "decisions.jsonl"]
+        cfg_log = None if env_log else _config_logfile()
+        # An explicit source is exclusive: merging stray decisions*.jsonl
+        # from the cwd would silently add unrelated rows to the report.
+        if env_log or cfg_log:
+            paths = [env_log or cfg_log]
         else:
-            cfg_log = _config_logfile()
-            if cfg_log:
-                paths = [cfg_log, "decisions-plugin.jsonl", "decisions.jsonl"]
-            else:
-                paths = ["decisions-plugin.jsonl", "decisions.jsonl"]
+            paths = ["decisions-plugin.jsonl", "decisions.jsonl"]
     # dedupe, keep order
     seen, uniq = set(), []
     for p in paths:
