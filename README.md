@@ -114,7 +114,8 @@ Jev's state" for what that does and doesn't guarantee.
 Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
-`detail_sha256`) with no secrets, mode `0600`. `setup()` runs once per
+`detail_sha256`, and `usage` (Jev's token counts, which `measure.py`
+turns into tokens and cost) with no secrets, mode `0600`. `setup()` runs once per
 project directory, so several times per opencode process, and every
 instance sees the same process-wide event stream — every real
 permission is logged once for real and once (or more) as
