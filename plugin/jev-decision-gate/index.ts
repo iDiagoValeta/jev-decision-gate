@@ -509,10 +509,20 @@ export function encodeAnswer(field: unknown, pick: string): string | string[] | 
   return value
 }
 
+/** Path listing pending interactive forms. Without a project directory this
+ * is the bare endpoint (the service's own directory only); with one it
+ * scopes the listing to that project (#58: `GET /api/form` without a
+ * location only ever lists forms of the service's own directory, so a
+ * project session's forms were always `[]`). */
+export function formListPath(directory?: string): string {
+  if (!directory) return "/api/form"
+  return `/api/form?location[directory]=${encodeURIComponent(directory)}`
+}
+
 /** List pending interactive forms (question tool uses kind=question forms on 2.0.x). */
-export function listPendingForms(): Promise<Array<Record<string, unknown>>> {
+export function listPendingForms(directory?: string): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve) => {
-    const child = spawn("opencode", ["api", "GET", "/api/form"], {
+    const child = spawn("opencode", ["api", "GET", formListPath(directory)], {
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     })
@@ -1175,6 +1185,94 @@ async function objectiveFor(
   }
 }
 
+// Shared form poller (#59): setup() runs once per project directory, so a
+// process with N project directories used to run N identical 750ms
+// `opencode api GET /api/form` intervals (~20 CLI spawns/second idle, ~2
+// cores). Module-level state means the first instance to set up starts the
+// single interval and later ones only register their handler; the last
+// cleanup stops it again. Any registered ctx works for the tick's
+// session.context calls (process-wide RPC, not directory-scoped).
+export interface PollHandler {
+  ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } }
+  log: (entry: Record<string, unknown>) => void
+  inst: string
+  options: Record<string, unknown>
+  endedSessions: Set<string>
+}
+
+const sharedPollHandlers = new Set<PollHandler>()
+const sharedPollDirRefs = new Map<string, number>()
+const sharedFormSeen = new Set<string>()
+let sharedPollTimer: ReturnType<typeof setInterval> | null = null
+let sharedPollInFlight = false
+let sharedPollCursor = 0
+
+function addSharedPollDir(directory: string): void {
+  sharedPollDirRefs.set(directory, (sharedPollDirRefs.get(directory) ?? 0) + 1)
+}
+
+function removeSharedPollDir(directory: string): void {
+  const refs = (sharedPollDirRefs.get(directory) ?? 0) - 1
+  if (refs <= 0) sharedPollDirRefs.delete(directory)
+  else sharedPollDirRefs.set(directory, refs)
+}
+
+function tickSharedPoller(): void {
+  // One tick in flight at a time: if the previous round of CLI spawns has
+  // not finished, skip this tick instead of stacking processes (#59).
+  if (sharedPollInFlight || sharedPollHandlers.size === 0) return
+  sharedPollInFlight = true
+  void (async () => {
+    try {
+      const handler = [...sharedPollHandlers][0] as PollHandler
+      // #58: poll the known project directories location-scoped, ONE per
+      // tick in round-robin: all of them per tick is still ~12 CLI
+      // spawns/s with 40 directories. This poll only backs up the
+      // form.created event, so N x 750ms of fallback latency is fine.
+      // With none known, keep the bare endpoint (previous behavior).
+      const known = [...sharedPollDirRefs.keys()]
+      const dirs: (string | undefined)[] = known.length > 0 ? [known[sharedPollCursor++ % known.length]] : [undefined]
+      for (const dir of dirs) {
+        const pending = await listPendingForms(dir)
+        for (const item of pending) {
+          const id = String(item.id ?? "")
+          if (!id || sharedFormSeen.has(id)) continue
+          capped(sharedFormSeen).add(id)
+          try {
+            await handleFormAsked(handler.ctx, handler.log, handler.inst, handler.options, item, handler.endedSessions)
+          } catch {
+            sharedFormSeen.delete(id)
+          }
+        }
+      }
+    } finally {
+      sharedPollInFlight = false
+    }
+  })()
+}
+
+export function registerPoller(
+  handler: PollHandler,
+  startInterval: typeof setInterval = setInterval,
+): ReturnType<typeof setInterval> | null {
+  sharedPollHandlers.add(handler)
+  if (sharedPollTimer === null) {
+    sharedPollTimer = startInterval(tickSharedPoller, 750)
+  }
+  return sharedPollTimer
+}
+
+export function unregisterPoller(
+  handler: PollHandler,
+  clearTimer: typeof clearInterval = clearInterval,
+): void {
+  sharedPollHandlers.delete(handler)
+  if (sharedPollHandlers.size === 0 && sharedPollTimer !== null) {
+    clearTimer(sharedPollTimer)
+    sharedPollTimer = null
+  }
+}
+
 export default Plugin.define({
   id: "jev-decision-gate",
   async setup(ctx) {
@@ -1253,27 +1351,22 @@ export default Plugin.define({
     ;(pruneTimer as unknown as { unref?: () => void }).unref?.()
     const controller = new AbortController()
     const formSeen = new Set<string>()
-    // Poll pending forms: on opencode 2.0.x the question tool opens a
-    // form (metadata.kind=question). Event names vary; polling /api/form
-    // is the durable autonomy path.
-    const pollMs = 750
-    const pollTimer = setInterval(() => {
-      void (async () => {
-        const pending = await listPendingForms()
-        for (const item of pending) {
-          const id = String(item.id ?? "")
-          if (!id || formSeen.has(id)) continue
-          // Answer question-kind forms; other forms also get Jev if they have options.
-          capped(formSeen).add(id)
-          try {
-            await handleFormAsked(ctx as Parameters<typeof handleFormAsked>[0], logEv, inst, options, item, endedSessions)
-          } catch {
-            formSeen.delete(id)
-          }
-        }
-      })()
-    }, pollMs)
-    ;(pollTimer as unknown as { unref?: () => void }).unref?.()
+    // Shared poller (#58/#59): one 750ms interval per process (not per
+    // setup() instance) polling /api/form location-scoped per known
+    // project directory. This instance only registers its handler and
+    // its own project directory; cleanup unregisters both.
+    const pollHandler: PollHandler = {
+      ctx: ctx as PollHandler["ctx"],
+      log: logEv,
+      inst,
+      options,
+      endedSessions,
+    }
+    const pollDir = (ctx as { location?: { directory?: unknown } }).location?.directory
+    const pollDirStr = typeof pollDir === "string" && pollDir ? pollDir : null
+    if (pollDirStr) addSharedPollDir(pollDirStr)
+    registerPoller(pollHandler)
+    ;(sharedPollTimer as unknown as { unref?: () => void } | null)?.unref?.()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -1401,7 +1494,8 @@ export default Plugin.define({
       }
     })()
     return () => {
-      clearInterval(pollTimer)
+      unregisterPoller(pollHandler)
+      if (pollDirStr) removeSharedPollDir(pollDirStr)
       clearInterval(pruneTimer)
       controller.abort()
       hookRegistration?.dispose()
@@ -1409,7 +1503,7 @@ export default Plugin.define({
   },
 })
 
-async function handleFormAsked(
+export async function handleFormAsked(
   ctx: { session: { get?: (input: { sessionID: string }) => Promise<unknown>; context: (input: { sessionID: string }) => Promise<unknown> } },
   log: (entry: Record<string, unknown>) => void,
   inst: string,
@@ -1425,7 +1519,10 @@ async function handleFormAsked(
   }
   const claim = claimReply(options, `form:${formID}`, inst)
   if (claim === "lost") {
-    log({ sessionID, requestID: formID, tool: "question", gateAction: "ask-human", reason: "duplicate-suppressed" })
+    // Expected cross-instance outcome (setup() runs once per project
+    // directory, so 15+ siblings race every form): staying silent keeps
+    // the losers from flooding the log with duplicate-suppressed noise
+    // (#59 — it was ~90% of log rows). The winner logs the real outcome.
     return
   }
   if (await sessionIsEnded(ctx, sessionID, endedSessions)) {

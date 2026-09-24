@@ -41,8 +41,13 @@ Fallback (hook API missing, logged reason=hook-unavailable): the older
 permission.asked + `opencode api POST .../permission/{id}/reply` path.
 
 question tool → form (metadata.kind=question), listed at GET /api/form
-  → plugin polls /api/form (also listens form.created /
-    legacy question.v2.asked / question.asked)
+  → ONE shared 750ms poller per process (not per setup() instance, #59),
+    listing each known project directory via
+    GET /api/form?location[directory]=<dir> (#58 — the bare endpoint
+    only lists the service's own directory, so project forms were
+    always invisible to it); at most one tick in flight at a time
+    (also listens form.created / legacy question.v2.asked /
+    question.asked)
   → claim form:<formID> (same exclusive-marker pattern)
   → objectiveFor (bounded; failures fall back to a short default)
   → for each form field with options: runGate as multichoice (+ pick)
@@ -230,7 +235,28 @@ Live autonomy check (non-interactive, against a running service):
   attempt), the winner evaluates and replies once. Form answers use the
   same pattern with a `form:`-prefixed claim key. Within one
   instance, in-flight sharing + a resolved cache also dedupe cheaply;
-  late duplicates log `duplicate-suppressed`.
+  late duplicates log `duplicate-suppressed` — except on the form path
+  (#59), where a losing claim logs nothing at all: with 15+ sibling
+  instances racing every form, the losers' `duplicate-suppressed` rows
+  were ~90% of the log while carrying zero information (losing is the
+  expected outcome, not an event).
+- **One shared form poller per process, listing per project directory
+  (#58, #59).** Each `setup()` instance used to start its own 750ms
+  `opencode api GET /api/form` interval — with 15–40 project
+  directories in one process, ~20 CLI spawns/second at idle (~2 cores).
+  Module-level state (`registerPoller`/`unregisterPoller`, exported for
+  tests) now means the first instance starts the single interval and
+  later ones only register their handler; the last cleanup stops it.
+  Each `setup()` also registers its own `ctx.location.directory`
+  (refcounted, removed on cleanup) and every tick lists each known
+  directory via `GET /api/form?location[directory]=<dir>`
+  (`formListPath`, encoded with `encodeURIComponent`) — the bare
+  endpoint only lists the service's own directory, so project sessions'
+  forms were previously always `[]` and never auto-answered. With no
+  known directory it falls back to the bare endpoint. At most one tick
+  runs at a time (a still-running tick skips the next one) so slow
+  listings can't stack processes. The tick uses any one registered
+  handler's ctx (`session.context` is a process-wide RPC).
 - **Single-writer log.** The plugin logs every decision; the Python
   gate stays silent when spawned by the plugin (`JEV_GATE_CLI_LOG=0`)
   and logs only in standalone use.
