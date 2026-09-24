@@ -356,6 +356,15 @@ click).
 
 ## Ordinary permission replies (`read`/`edit`/`bash`/...) failed with "Permission request not found" (RESOLVED — was never a timing race)
 
+> **Update (2026-09-24):** permissions no longer use replies at all —
+> they are decided in the `evaluate` hook (see ARCHITECTURE "Key
+> decisions"). A `reply-failed` on a permission now only appears on the
+> `hook-unavailable` fallback. The 404s in this section's history were
+> largely #56: the plugin ran in a server other than the background
+> service, and `opencode api` replied to the wrong one. Form answers
+> still go through `opencode api`, so a form answer in any non-service
+> server still gets `form-reply-failed ... 404`.
+
 **Status (2026-09-21, OpenCode 2.0.11): fixed.** Was
 [issue #15](https://github.com/iDiagoValeta/jev-decision-gate/issues/15).
 
@@ -425,6 +434,24 @@ independent of the root cause being different than first thought —
 left in place. `reply-failed` should now be rare-to-never; if it
 recurs, re-open this investigation from "is the raw API call itself
 failing" rather than reassuming a timing race.
+
+## A denied tool call ended the whole session (before #60)
+
+A bare `reject` reply aborts the agent's whole turn ("The user
+declined this tool call"). Since the `evaluate` hook, a deny carries a
+`message` (`Blocked by jev-decision-gate: ...` for the kill-list,
+`Denied by jev-decision-gate (Jev): ...` for Jev), so only that tool
+call fails, and the agent sees why and continues. If you see
+`aborted` after a deny, check the log for `hook-unavailable`: you are
+on the reply fallback.
+
+## `fail-open` with `gate killed by SIGKILL` (#61)
+
+The gate subprocess died from a signal (OOM killer, a stray `pkill`).
+It is retried once automatically (`retry: 1` in the log line). Only a
+second consecutive death, or a timeout, falls open to ask-human.
+Before #61 this showed up as `error_class: "gate exit null "` with no
+retry, and the session stalled.
 
 ## Which log file?
 

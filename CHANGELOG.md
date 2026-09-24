@@ -6,7 +6,27 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Permissions are decided in opencode's `evaluate` hook instead of by
+  replying to `permission.asked` (#56, #60).** `allow`/`deny` are set on
+  the hook input, and a deny carries a `message`, so the agent sees why
+  and continues instead of having its whole turn aborted. Replies went
+  through `opencode api`, which always targets the background service,
+  so every decision 404'd in any other opencode server (OpenChamber,
+  `opencode serve --port`). Live-verified on an isolated server: zero
+  `reply-failed`, and agents continued after both a kill-list deny and
+  a Jev deny. Falls back to the old path (logged `hook-unavailable`)
+  when the hook API is missing. Form answers still use `opencode api`.
+
 ### Fixed
+- **A gate subprocess killed by a signal is retried once (#61).** The
+  log now says `gate killed by SIGKILL` instead of `gate exit null`, and
+  marks the retried decision with `retry: 1`. Non-zero exits, timeouts
+  and bad output are not retried.
+- **Jev now sees the patch of an edit, not just the file path (#66).**
+  `metadata.files[].patch` is appended to the redacted `halt.detail`,
+  within the 4000-char cap. Before this, edits averaged 0.56 confidence
+  (34% under 0.5) against 0.85 for shell.
 - **Form auto-answer now handles `multiselect` fields and conditional
   (`hidden`/`when`) fields correctly (issues #55, #57).** A
   `multiselect` field's reply value is an array of the picked option

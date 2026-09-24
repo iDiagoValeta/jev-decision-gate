@@ -13,10 +13,11 @@ phase (pending form via `GET /api/form` → form reply API). Two languages,
 one flow:
 
 ```
-opencode v2 → index.ts (permission.asked) → spawn python3 -m jev_gate.cli
+opencode v2 → index.ts ctx.permission.hook("evaluate") → spawn python3 -m jev_gate.cli
             → schemas.py builds the Jev brief → client.py calls Jev
             → decision.py combines the answer → cli.py prints JSON
-            → index.ts replies to opencode (or ask-human → silence + desktop alert)
+            → index.ts sets input.effect allow / deny+message / leaves "ask"
+              (ask → opencode prompts the human; no reply API involved)
 opencode v2 → question tool opens form (metadata.kind=question)
             → index.ts polls GET /api/form (also listens form.created /
               legacy question events) → Jev pick
@@ -40,8 +41,10 @@ install is one or the other, never both under the same binary.
 **Do not "simplify" by porting this gate to the 1.18.x line.** Its
 `permission.ask` hook is confirmed dead code since v1.3.0 (see
 `docs/TROUBLESHOOTING.md` for the issue links) — a plugin using it
-loads cleanly and is simply never called. As of 2026-09-20 this
-environment runs a single `opencode` install (2.0.11) after removing
+loads cleanly and is simply never called. As of 2026-09-24 this
+environment runs `opencode` 2.0.16 from `~/.opencode/bin/opencode` (the
+official installer's path; the earlier cleanup kept this one), and
+2026-09-20 notes below refer to the then-current 2.0.11 install after removing
 several redundant/stale installs (a separate `opencode-v2` binary copy,
 a pnpm global `opencode-ai@1.18.25`, a stale `~/.opencode/bin/opencode`,
 a desktop app) that had accumulated across sessions — keep it that way;
@@ -88,10 +91,10 @@ bug.
    `decision.py`'s combine logic or `kindFor` needs a new entry in
    `tests/golden.json`.
 4. **Question tool is two-phase — do not collapse it back into a
-   single `permission.asked` Jev+`session.context` path.** On
-   `permission.asked` with `action === "question"`: passthrough-allow
-   (`permission.reply` once) with **no** `ctx.session.context` and
-   **no** Jev call (`reason: "question-permission-passthrough"`).
+   single Jev+`session.context` permission path.** In the `evaluate`
+   hook, `action === "question"` gets `effect = "allow"` with **no**
+   `ctx.session.context` and **no** Jev call
+   (`reason: "question-permission-passthrough"`).
    On OpenCode 2.0.x the question tool then opens a **form**
    (`metadata.kind=question`, listed at `GET /api/form`). The plugin
    polls `/api/form` (and also listens for `form.created` / legacy
@@ -107,11 +110,17 @@ bug.
    do **not** generalize that to “hang fixed for all cases.” Read
    `docs/TROUBLESHOOTING.md` "Question dialog hangs" before changing
    this path again.
-5. **`setup()` runs more than once per opencode process.** Confirmed in
-   production logs (same `pid`, different `inst`). Any new code path
-   that evaluates or replies to a `permission.asked` event must claim
-   the requestID first (see `claimReply` in `index.ts`) — assume you are
-   racing a sibling instance, not assume you're the only handler.
+5. **`setup()` runs once per project directory, so many times per
+   opencode process.** Confirmed live on 2.0.16: a new `inst` appears
+   for each new session directory (15+ in one process), and every
+   instance sees the process-wide event stream. Any code path that
+   evaluates or replies must claim first (see `claimReply` in
+   `index.ts`); the `evaluate` hook claims on
+   `eval:<sessionID>:<source>:<action>:<sha>`. Assume you are racing
+   sibling instances.
+6. **Deny always carries a `message`.** A bare reject aborts the
+   agent's whole turn (#60). The `evaluate` hook sets `input.message`
+   on every deny.
 
 ## Finish on main, nowhere else
 
