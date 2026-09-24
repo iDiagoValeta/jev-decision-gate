@@ -3,39 +3,42 @@
 ## Flow
 
 Requires `"permission": "ask"` in opencode's config (global or
-project) — under `"allow"`, opencode 2.0.11 never emits
-`permission.asked` at all, so there is nothing for the gate to
-intercept. See `docs/TROUBLESHOOTING.md`.
+project) — under `"allow"` the evaluate hook sees `effect=allow`
+already and leaves it alone (and on 2.0.11 no `permission.asked` fired
+at all), so there is nothing for the gate to decide. See `docs/TROUBLESHOOTING.md`.
 
 ```
-permission.asked (opencode v2)
-  → claim requestID (exclusive marker, cross-instance/cross-process) — lose it, do nothing
-  → catastrophic check (local regex over normalized command, no network)
-  → if action === "question":
-        permission.reply once (passthrough-allow)
-        NO session.context, NO Jev on this path
+permission evaluate hook (ctx.permission.hook("evaluate"), opencode 2.0.16)
+  → input.effect already allow/deny (user config) → leave it, done
+  → claim eval:<sessionID>:<source>:<action>:<sha> (exclusive marker) — lose it, do nothing
+  → action === "question" → effect=allow (passthrough), NO Jev
         log reason=question-permission-passthrough
         (answering happens via form API — see below)
-  → else kindFor(action, resources):
-        read | write | destructive
-        (covers documented keys: read, edit/write/apply_patch, glob,
-         grep, bash, task, skill, lsp, webfetch, websearch,
-         external_directory, doom_loop → destructive; unknown → ask-human)
+  → catastrophic check (local regex over normalized command, no network)
+        → effect=deny + message "Blocked by jev-decision-gate: ... kill-list"
+  → subagent/task: enrich resources with the dispatch prompt
+  → kindFor(action, resources): read | write | destructive
   → objectiveFor(sessionID): recent conversation, both roles, redacted,
                               ≤4000 chars default (options.objectiveChars /
                               JEV_GATE_OBJECTIVE_CHARS)
-  → gateEvent { objective, halt {kind,tool,detail≤4000 redacted},
-                context {sessionID,requestID,risk_hints}, policy }
-  → spawn pythonBin -m jev_gate.cli (timeout 25s default, max 30s,
-        PYTHONPATH=src, minimal env)
-      → build_state: curated brief + detail_sha256
-      → build_questions: decision(choice) + safe(noul) + risk(score)
-      → client.evaluate → Jev API (system_one)
+  → gateEvent { objective, halt {kind,tool,detail≤4000 redacted — for edits
+                the patches from metadata.files are appended (#66)},
+                context {sessionID,risk_hints}, policy }
+  → runGate: spawn pythonBin -m jev_gate.cli (timeout 25s default, max 30s,
+        PYTHONPATH=src, minimal env); one retry if the child died from a
+        signal or a transient spawn error (#61)
+      → build_state / build_questions / client.evaluate → Jev (system_one)
       → decision.combine: pass through Jev's decision, no thresholds
-      → stdout {action, reason, confidence, model, usage?}
-  → plugin: allow→reply once, deny→reply reject,
-            ask-human→silence, logged (no desktop alert — removed)
+  → allow → effect=allow
+    deny  → effect=deny + message "Denied by jev-decision-gate (Jev): ..."
+            (the agent gets the reason and continues, #60)
+    ask-human / any error → effect stays "ask" → opencode emits
+            permission.asked and prompts the human; the plugin only logs
+            reason=asked-human for it (no Jev, no reply)
   → both sides append v2 JSONL (0600, no secrets)
+
+Fallback (hook API missing, logged reason=hook-unavailable): the older
+permission.asked + `opencode api POST .../permission/{id}/reply` path.
 
 question tool → form (metadata.kind=question), listed at GET /api/form
   → plugin polls /api/form (also listens form.created /
@@ -59,6 +62,19 @@ Live autonomy check (non-interactive, against a running service):
 
 ## Key decisions (ADRs, short)
 
+- **Permissions are decided in the `evaluate` hook, not by replying to
+  `permission.asked`.** Live-verified on 2.0.16: opencode awaits the
+  async hook (4 s delay tested), `effect=allow` runs the tool with no
+  prompt, `effect=deny` + `message` fails just that tool call with the
+  message and the agent continues, and leaving `ask` falls through to
+  the normal human prompt. The reply path had two structural defects
+  this removes: replies went through `opencode api`, which always
+  targets the background service, so every decision 404'd when the
+  plugin ran in any other server (#56: 13/13 and 5/5 in production);
+  and a bare `reject` aborted the whole agent turn (#60). It also
+  removes the reply-window/`reply-failed` class (#15) for permissions.
+  Forms still reply via `opencode api` (no form API in the plugin
+  context), so form answers still only work in the background service.
 - **`opencode run --auto` is out of scope — it bypasses the gate
   entirely, by design.** `--auto` is a client-side "auto-approve
   permissions not explicitly denied" behavior in opencode's own CLI; it
@@ -75,8 +91,9 @@ Live autonomy check (non-interactive, against a running service):
   sessions that need the gate's protection must go through the raw
   session API (`POST /api/session`, `POST /api/session/{id}/prompt`,
   poll `GET /api/session/{id}/message`) instead of `--auto`.
-- **Reply to permissions via `opencode api POST`, never
-  `ctx.permission.reply()`.** The SDK method was intermittently
+- **(Superseded for permissions by the `evaluate` hook above; still
+  how form answers and the fallback path reply.) Reply via `opencode
+  api POST`, never `ctx.permission.reply()`.** The SDK method was intermittently
   unreliable (`reply-failed: Permission request not found`) on
   permissions that were, live-verified, still pending server-side
   minutes later — never a timing race, despite an earlier same-day

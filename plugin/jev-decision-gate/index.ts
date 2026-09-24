@@ -715,10 +715,11 @@ function spawnGate(options: Record<string, unknown>): {
     clearTimeout(timer)
     settleReject(error)
   })
-  child.on("close", (code) => {
+  child.on("close", (code, signal) => {
     clearTimeout(timer)
     if (code !== 0) {
-      settleReject(new Error("gate exit " + String(code) + " " + stderr.slice(0, 200)))
+      const msg = signal ? `gate killed by ${signal}` : `gate exit ${code}`;
+      settleReject(new Error(msg + " " + stderr.slice(0, 200)))
       return
     }
     try {
@@ -766,10 +767,37 @@ function spawnGate(options: Record<string, unknown>): {
   }
 }
 
-function runGate(options: Record<string, unknown>, event: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const gate = spawnGate(options)
+// A gate subprocess that died from a signal (OOM killer, a stray pkill)
+// or could not be spawned for a transient resource reason is worth one
+// fresh attempt: the retry only re-asks Jev, it cannot allow anything by
+// itself. A non-zero exit, a timeout or unparseable output is a real
+// answer about this input and is not retried (#61).
+export function isRetryableGateError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  if (msg.startsWith("gate killed by")) return true
+  const code = (err as { code?: unknown } | null)?.code
+  return code === "EAGAIN" || code === "EMFILE" || code === "ENFILE" || code === "ENOMEM"
+}
+
+export async function runGate(options: Record<string, unknown>, event: Record<string, unknown>): Promise<{ decision: Record<string, unknown>; retried: boolean }> {
+  // First attempt
+  let gate = spawnGate(options)
   gate.send(event)
-  return gate.result
+  try {
+    const decision = await gate.result
+    return { decision, retried: false }
+  } catch (err) {
+    // Retry ONLY for signal kills or spawn errors (child 'error' event)
+    // Do NOT retry for timeouts or JSON parse errors
+    if (!isRetryableGateError(err)) {
+      throw err
+    }
+    // One retry with a fresh spawn
+    gate = spawnGate(options)
+    gate.send(event)
+    const decision = await gate.result
+    return { decision, retried: true }
+  }
 }
 
 type ConversationTurn = { role: "user" | "assistant"; text: string }
@@ -867,6 +895,190 @@ export async function subagentDetailFor(
     return parts.length ? parts.join("\n") : null
   } catch {
     return null
+  }
+}
+
+// Unified diffs from an edit permission's metadata.files, one per file,
+// each under a header naming the file. Null when there is nothing usable.
+export function editPatchesOf(metadata: unknown): string | null {
+  const files = (metadata as { files?: unknown } | null | undefined)?.files
+  if (!Array.isArray(files)) return null
+  const parts = files
+    .filter((f): f is { file?: unknown; patch?: unknown } => !!f && typeof f === "object")
+    .filter((f) => typeof f.patch === "string" && f.patch)
+    .map((f) => `--- patch for ${typeof f.file === "string" ? f.file : "?"} ---\n${f.patch as string}`)
+  return parts.length ? parts.join("\n") : null
+}
+
+/**
+ * Dependencies injected into evaluatePermission for testability.
+ */
+export interface EvaluateDeps {
+  runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>;
+  objectiveFor: (
+    ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+    sessionID: string,
+    ended: Set<string>,
+    budgetChars: number,
+  ) => Promise<string>;
+  kindFor: (action: string, resources: string[]) => string;
+  redactSecrets: (text: string) => string;
+  sha256Hex: (text: string) => string;
+  isCatastrophic: (joined: string) => boolean;
+  subagentDetailFor: (
+    ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+    sessionID: string,
+    source: PermissionSource | null | undefined,
+  ) => Promise<string | null>;
+  resourceKinds: (resources: string[]) => string;
+  DESTRUCTIVE_HINT: RegExp;
+  COMMAND_SUBSTITUTION: RegExp;
+  objectiveBudgetOf: (options: Record<string, unknown>) => number;
+  apiKeyOf: (options: Record<string, unknown>) => string;
+  ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } };
+  log: (entry: Record<string, unknown>) => void;
+  options: Record<string, unknown>;
+  endedSessions: Set<string>;
+  inst: string;
+}
+
+/**
+ * Synchronous hook callback for `permission.evaluate`.
+ * Mutates `input.effect` and optionally `input.message` to decide allow/deny/ask.
+ * This is exported for unit testing.
+ */
+export async function evaluatePermission(
+  deps: EvaluateDeps,
+  input: {
+    sessionID: string;
+    agent?: string;
+    action: string;
+    resources: ReadonlyArray<string>;
+    metadata?: Record<string, unknown>;
+    source?: PermissionSource;
+    effect: "allow" | "deny" | "ask";
+    message?: string;
+  },
+): Promise<void> {
+  const { sessionID, action, resources, source, effect } = input;
+
+  // Respect user's allow/deny config — only intercept when effect is "ask"
+  if (effect !== "ask") {
+    return;
+  }
+
+  // Question tool: passthrough-allow (form answers handled separately via form API)
+  if (action === "question") {
+    input.effect = "allow";
+    deps.log({
+      sessionID,
+      tool: action,
+      kind: "multichoice",
+      gateAction: "allow",
+      reason: "question-permission-passthrough",
+    });
+    return;
+  }
+
+  // Convert readonly array to mutable for enrichment
+  const mutableResources: string[] = Array.from(resources);
+  let joined = mutableResources.join("\n");
+  let resKinds = deps.resourceKinds(mutableResources);
+
+  // Catastrophic pattern: deny instantly with message, no Jev call
+  if (deps.isCatastrophic(joined)) {
+    input.effect = "deny";
+    input.message =
+      "Blocked by jev-decision-gate: matches the catastrophic-command kill-list. Do not retry this command or variants of it.";
+    deps.log({
+      sessionID,
+      tool: action,
+      kind: "destructive",
+      gateAction: "reject",
+      reason: "catastrophic-pattern",
+      detail_sha256: deps.sha256Hex(joined),
+    });
+    return;
+  }
+
+  // Subagent/task enrichment
+  if (action === "subagent" || action === "task") {
+    const enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source);
+    if (enriched) {
+      mutableResources[0] = enriched;
+      joined = enriched;
+      resKinds = deps.resourceKinds(mutableResources);
+    }
+  }
+
+  const kind = deps.kindFor(action, mutableResources);
+
+  // Build gate event and call Jev
+  try {
+    const objective = await deps.objectiveFor(deps.ctx, sessionID, deps.endedSessions, deps.objectiveBudgetOf(deps.options));
+    // Edits carry their diff in metadata.files, not in resources (which is
+    // just the path): without it Jev judged every write blind (#66). Only
+    // the Jev payload gets it; the kill-list and kindFor stay on resources.
+    const patches = editPatchesOf(input.metadata);
+    const rawDetail = (patches ? `${joined}\n${patches}` : joined).slice(0, 4000);
+    const detail = deps.redactSecrets(rawDetail);
+    const hintParts: string[] = [];
+    if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated");
+    if (deps.DESTRUCTIVE_HINT.test(joined)) hintParts.push("matches destructive-hint");
+    if (deps.COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
+    const riskHints = hintParts.join("; ");
+
+    const halt: Record<string, unknown> = { kind, tool: action, detail };
+    const gateEvent = {
+      objective,
+      halt,
+      context: { sessionID, requestID: "", risk_hints: riskHints },
+      policy: { default: "ask-human when unsure" },
+    };
+
+    const startedAt = Date.now();
+    const { decision, retried } = await deps.runGate(deps.options, gateEvent);
+    const elapsedMs = Date.now() - startedAt;
+
+    deps.log({
+      sessionID,
+      tool: action,
+      kind,
+      gateAction: decision.action,
+      reason: decision.reason,
+      confidence: decision.confidence,
+      model: decision.model,
+      pick: decision.pick ?? null,
+      elapsedMs,
+      objectiveChars: objective.length,
+      detail_sha256: deps.sha256Hex(joined),
+      hasKey: deps.apiKeyOf(deps.options) !== "",
+      resKinds,
+      ...(retried ? { retry: 1 } : {}),
+      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+    });
+
+    if (decision.action === "allow") {
+      input.effect = "allow";
+    } else if (decision.action === "deny") {
+      input.effect = "deny";
+      const reason = String(decision.reason ?? "jev-deny");
+      input.message = `Denied by jev-decision-gate (Jev): ${deps.redactSecrets(reason)}. Choose a safer alternative or explain why this is needed.`;
+    } else {
+      // ask-human or unknown -> leave effect as "ask"
+    }
+  } catch (err) {
+    // Fail-open: never silent allow, always leave effect as "ask"
+    deps.log({
+      sessionID,
+      tool: action,
+      kind,
+      gateAction: "ask-human",
+      reason: "fail-open",
+      error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+    });
+    // effect remains "ask"
   }
 }
 
@@ -968,6 +1180,7 @@ export default Plugin.define({
   async setup(ctx) {
     const options = ((ctx as { options?: unknown }).options ?? {}) as Record<string, unknown>
     if (!isEnabled(options)) return
+    
     // Dedupe: the server may emit the same permission request more than
     // once while it is pending. Evaluate once per requestID; concurrent
     // duplicates await the same promise, late duplicates reuse the cached
@@ -979,6 +1192,56 @@ export default Plugin.define({
     const logEv = (entry: Record<string, unknown>): void =>
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
+    
+    // Try to register the synchronous permission.evaluate hook (opencode v2.0.16+)
+    // If unavailable, fall back to the permission.asked event path.
+    let hookRegistration: { dispose: () => void } | null = null
+    let hookRegistered = false
+    try {
+      hookRegistration = await ctx.permission.hook("evaluate", async (input) => {
+        // Build claim key for cross-instance dedup
+        const sessionID = input.sessionID
+        const action = input.action
+        const resources = Array.from(input.resources)
+        const source = input.source
+        const joined = resources.join("\n")
+        const sourcePart = source ? `${source.messageID}:${source.id}` : `${sha256Hex(joined)}:${sessionID}:${Math.round(Date.now() / 2000) * 2000}`
+        const claimKey = `eval:${sessionID}:${sourcePart}:${action}:${sha256Hex(joined)}`
+        const claim = claimReply(options, claimKey, inst)
+        if (claim === "lost") {
+          logEv({ sessionID, tool: action, gateAction: "ask-human", reason: "duplicate-suppressed" })
+          return
+        }
+        
+        const deps: EvaluateDeps = {
+          runGate,
+          objectiveFor,
+          kindFor,
+          redactSecrets,
+          sha256Hex,
+          isCatastrophic,
+          subagentDetailFor,
+          resourceKinds,
+          DESTRUCTIVE_HINT,
+          COMMAND_SUBSTITUTION,
+          objectiveBudgetOf,
+          apiKeyOf,
+          ctx: { session: { context: ctx.session.context } },
+          log: logEv,
+          options,
+          endedSessions,
+          inst,
+        }
+        await evaluatePermission(deps, input)
+      })
+      hookRegistered = true
+    } catch (err) {
+      // Hook API not available (older opencode version) — fall back to permission.asked events
+      logEv({
+        reason: "hook-unavailable",
+        error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      })
+    }
     // pruneReplied only ran once, at setup() — a long-running opencode host
     // process (days/weeks, setup() never re-invoked) accumulates one marker
     // file per permission/form forever (round 12 finding, live-verified:
@@ -1061,6 +1324,12 @@ export default Plugin.define({
         const sessionID = String(data.sessionID ?? "")
         const requestID = String(data.id ?? "")
         const action = String((data as { action?: unknown }).action ?? "")
+        // If the hook is registered, permission.asked means we already decided ask-human
+        // or the config forced it. Just log as trace, no Jev call, no reply.
+        if (hookRegistered) {
+          logEv({ sessionID, requestID, tool: action, gateAction: "ask-human", reason: "asked-human" })
+          continue
+        }
         const resources = Array.isArray((data as { resources?: unknown }).resources)
           ? ((data as { resources: unknown[] }).resources.map(String))
           : []
@@ -1135,6 +1404,7 @@ export default Plugin.define({
       clearInterval(pollTimer)
       clearInterval(pruneTimer)
       controller.abort()
+      hookRegistration?.dispose()
     }
   },
 })
@@ -1241,7 +1511,7 @@ async function handleFormAsked(
         halt.numbered = numberedOptions(labels)
       }
       const startedAt = Date.now()
-      const decision = await runGate(options, {
+      const { decision, retried } = await runGate(options, {
         objective,
         halt,
         context: { sessionID, requestID: formID, risk_hints: "interactive-form-question", fieldIndex: fi },
@@ -1263,6 +1533,7 @@ async function handleFormAsked(
         hasKey: apiKeyOf(options) !== "",
         optionsCount: labels.length,
         fieldKey: key,
+        ...(retried ? { retry: 1 } : {}),
         ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
         ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
         phase: "form-answer",
@@ -1531,9 +1802,11 @@ export async function handleOne(
     // import) then overlaps with that RPC instead of adding to it serially.
     // Every millisecond here is one this permission's reply doesn't get to
     // spend against the server's reply window (issue #15).
-    const gate = spawnGate(options)
     const startedAt = Date.now()
     let objective: string
+    // First spawn attempt
+    let gate = spawnGate(options)
+    let retried = false
     try {
       objective = await objectiveFor(ctx, sessionID, endedSessions, objectiveBudgetOf(options))
     } catch (err) {
@@ -1554,8 +1827,23 @@ export async function handleOne(
       context: { sessionID, requestID, risk_hints: riskHints },
       policy: { default: "ask-human when unsure" },
     }
+    // First attempt
     gate.send(gateEvent)
-    const decision = await gate.result
+    let decision: Record<string, unknown>
+    try {
+      decision = await gate.result
+    } catch (err) {
+      // Retry ONLY for signal kills or spawn errors (child 'error' event)
+      // Do NOT retry for timeouts or JSON parse errors
+      if (!isRetryableGateError(err)) {
+        throw err
+      }
+      // One retry with a fresh spawn
+      gate = spawnGate(options)
+      gate.send(gateEvent)
+      decision = await gate.result
+      retried = true
+    }
     // Spans spawn → decision (overlaps objectiveFor's RPC), not just the
     // subprocess's own runtime — larger than pre-issue-#15-fix elapsedMs
     // values for the same underlying Jev call; that's the full budget that
@@ -1576,6 +1864,7 @@ export async function handleOne(
       detail_sha256: sha256Hex(joined),
       hasKey: apiKeyOf(options) !== "",
       resKinds,
+      ...(retried ? { retry: 1 } : {}),
       ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
       ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
     })

@@ -7,10 +7,14 @@ import { test } from "node:test"
 import JevGate, {
   capped,
   claimReply,
+  editPatchesOf,
   encodeAnswer,
+  EvaluateDeps,
+  evaluatePermission,
   fieldVisible,
   handleOne,
   isCatastrophic,
+  isRetryableGateError,
   kindFor,
   labelsFromFormField,
   listPendingForms,
@@ -18,6 +22,8 @@ import JevGate, {
   normalizeCommand,
   postApiReply,
   redactSecrets,
+  runGate,
+  sha256Hex,
   subagentDetailFor,
   textOfMessage,
   timeoutMsOf,
@@ -1047,4 +1053,414 @@ test("handleOne: a fail-open never spawns notify-send/zenity — the desktop-pop
     fs.rmSync(binDir, { recursive: true, force: true })
     fs.rmSync(gateDir, { recursive: true, force: true })
   }
+})
+
+test("evaluatePermission: effect already allow leaves effect intact", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => { throw new Error("should not be called") }
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input = {
+    sessionID: "sess1",
+    action: "bash",
+    resources: ["echo hi"],
+    effect: "allow" as const,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "allow")
+  assert.equal(logs.length, 0)
+})
+
+test("evaluatePermission: effect already deny leaves effect intact", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => { throw new Error("should not be called") }
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input = {
+    sessionID: "sess1",
+    action: "bash",
+    resources: ["echo hi"],
+    effect: "deny" as const,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "deny")
+  assert.equal(logs.length, 0)
+})
+
+test("evaluatePermission: question action sets effect to allow without calling gate", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => { throw new Error("should not be called") }
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input = {
+    sessionID: "sess1",
+    action: "question",
+    resources: ["pick one"],
+    effect: "ask" as const,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "allow")
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].reason, "question-permission-passthrough")
+  assert.equal(logs[0].gateAction, "allow")
+})
+
+test("evaluatePermission: catastrophic pattern sets deny with message without calling gate", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => { throw new Error("should not be called") }
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => true,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input: {
+    sessionID: string;
+    action: string;
+    resources: string[];
+    effect: "allow" | "deny" | "ask";
+    message?: string;
+    source?: { messageID: string; id: string };
+  } = {
+    sessionID: "sess1",
+    action: "bash",
+    resources: ["rm -rf /"],
+    effect: "ask" as const,
+    message: undefined,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "deny")
+  assert.ok(input.message?.includes("catastrophic-command kill-list"))
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].reason, "catastrophic-pattern")
+  assert.equal(logs[0].gateAction, "reject")
+})
+
+test("evaluatePermission: gate returns allow sets effect to allow", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => ({ decision: { action: "allow", reason: "jev-allow", confidence: 0.9, model: "test" }, retried: false })
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "read",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input = {
+    sessionID: "sess1",
+    action: "read",
+    resources: ["src/file.ts"],
+    effect: "ask" as const,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "allow")
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].gateAction, "allow")
+})
+
+test("evaluatePermission: gate returns deny sets effect to deny with message containing reason", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => ({ decision: { action: "deny", reason: "jev-deny: dangerous", confidence: 0.8, model: "test" }, retried: false })
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "destructive",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input: {
+    sessionID: string;
+    action: string;
+    resources: string[];
+    effect: "allow" | "deny" | "ask";
+    message?: string;
+    source?: { messageID: string; id: string };
+  } = {
+    sessionID: "sess1",
+    action: "bash",
+    resources: ["rm -rf /tmp/x"],
+    effect: "ask" as const,
+    message: undefined,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "deny")
+  assert.ok(input.message?.includes("jev-deny: dangerous"))
+  assert.ok(input.message?.includes("Choose a safer alternative"))
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].gateAction, "deny")
+})
+
+test("evaluatePermission: gate returns ask-human leaves effect as ask", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => ({ decision: { action: "ask-human", reason: "jev-asked-human", confidence: 0.5, model: "test" }, retried: false })
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input = {
+    sessionID: "sess1",
+    action: "edit",
+    resources: ["src/file.ts"],
+    effect: "ask" as const,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "ask")
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].gateAction, "ask-human")
+})
+
+test("evaluatePermission: gate throws logs fail-open and leaves effect as ask", async () => {
+  const logs: Record<string, unknown>[] = []
+  const log = (entry: Record<string, unknown>) => logs.push(entry)
+  const fakeRunGate = async () => { throw new Error("gate error") }
+  const deps: EvaluateDeps = {
+    runGate: fakeRunGate,
+    objectiveFor: async () => "obj",
+    kindFor: () => "write",
+    redactSecrets: (t) => t,
+    sha256Hex: (t) => "hash",
+    isCatastrophic: () => false,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text:10ch",
+    DESTRUCTIVE_HINT: /test/,
+    COMMAND_SUBSTITUTION: /test/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "key",
+    ctx: { session: { context: async () => [] } },
+    log,
+    options: {},
+    endedSessions: new Set(),
+    inst: "inst1",
+  }
+  const input: {
+    sessionID: string;
+    action: string;
+    resources: string[];
+    effect: "allow" | "deny" | "ask";
+    message?: string;
+    source?: { messageID: string; id: string };
+  } = {
+    sessionID: "sess1",
+    action: "bash",
+    resources: ["echo hi"],
+    effect: "ask" as const,
+    message: undefined,
+  }
+  await evaluatePermission(deps, input)
+  assert.equal(input.effect, "ask")
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].reason, "fail-open")
+  assert.equal(logs[0].gateAction, "ask-human")
+  assert.ok(String(logs[0].error_class).includes("gate error"))
+})
+
+// Cross-instance dedup via claimReply is tested in claimReply tests (won/lost/error).
+// evaluatePermission uses the same claimReply internally.
+
+test("runGate: a gate killed by a signal is retried once and the retry's answer is used (#61)", async () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-retry-"))
+  const marker = path.join(gateDir, "first-run-done")
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    [
+      "#!/usr/bin/env python3",
+      "import os, signal, sys, json",
+      "sys.stdin.read()",
+      `m = ${JSON.stringify(marker)}`,
+      "if not os.path.exists(m):",
+      "    open(m, 'w').close()",
+      "    os.kill(os.getpid(), signal.SIGKILL)",
+      "print(json.dumps({'action': 'allow', 'reason': 'jev-allow'}))",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    const out = await runGate({ gateDir, pythonBin: fakePython }, { objective: "x", halt: { kind: "read" } })
+    assert.equal(out.retried, true)
+    assert.equal(out.decision.action, "allow")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("runGate: a non-zero exit is a real answer and is not retried (#61)", async () => {
+  const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), "jev-noretry-"))
+  const count = path.join(gateDir, "runs")
+  const fakePython = path.join(gateDir, "fake_python.py")
+  fs.writeFileSync(
+    fakePython,
+    ["#!/usr/bin/env python3", "import sys", `open(${JSON.stringify(count)}, 'a').write('x')`, "sys.exit(3)", ""].join("\n"),
+    { mode: 0o755 },
+  )
+  try {
+    await assert.rejects(runGate({ gateDir, pythonBin: fakePython }, { objective: "x", halt: { kind: "read" } }), /gate exit 3/)
+    assert.equal(fs.readFileSync(count, "utf8"), "x")
+  } finally {
+    fs.rmSync(gateDir, { recursive: true, force: true })
+  }
+})
+
+test("isRetryableGateError: signal deaths and transient spawn errors only", () => {
+  assert.equal(isRetryableGateError(new Error("gate killed by SIGKILL ")), true)
+  assert.equal(isRetryableGateError(Object.assign(new Error("spawn"), { code: "EAGAIN" })), true)
+  assert.equal(isRetryableGateError(new Error("gate exit 1 boom")), false)
+  assert.equal(isRetryableGateError(new Error("gate timeout")), false)
+  assert.equal(isRetryableGateError(Object.assign(new Error("spawn"), { code: "ENOENT" })), false)
+})
+
+test("editPatchesOf: collects each file's patch under a header; null when absent (#66)", () => {
+  assert.equal(editPatchesOf(undefined), null)
+  assert.equal(editPatchesOf({ files: [{ file: "a.ts" }] }), null)
+  const out = editPatchesOf({ files: [{ file: "a.ts", patch: "+x" }, { file: "b.ts", patch: "-y" }] })
+  assert.equal(out, "--- patch for a.ts ---\n+x\n--- patch for b.ts ---\n-y")
+})
+
+test("evaluatePermission: an edit's patch reaches Jev's detail, redacted (#66)", async () => {
+  let sent: Record<string, unknown> | null = null
+  const deps: EvaluateDeps = {
+    runGate: async (_o, ev) => {
+      sent = ev
+      return { decision: { action: "allow", reason: "jev-allow" }, retried: false }
+    },
+    objectiveFor: async () => "obj",
+    kindFor,
+    redactSecrets,
+    sha256Hex,
+    isCatastrophic,
+    subagentDetailFor: async () => null,
+    resourceKinds: () => "text",
+    DESTRUCTIVE_HINT: /$^/,
+    COMMAND_SUBSTITUTION: /$^/,
+    objectiveBudgetOf: () => 4000,
+    apiKeyOf: () => "k",
+    ctx: { session: { context: async () => [] } },
+    log: () => {},
+    options: {},
+    endedSessions: new Set(),
+    inst: "i",
+  }
+  const input = {
+    sessionID: "s",
+    action: "edit",
+    resources: ["config.py"],
+    metadata: { files: [{ file: "config.py", patch: "+API_KEY=sk-abcdefghijklmnop\n+DEBUG=1" }] },
+    effect: "ask" as const,
+  }
+  await evaluatePermission(deps, input)
+  const detail = String(((sent as unknown as { halt: { detail: string } }).halt).detail)
+  assert.match(detail, /--- patch for config\.py ---/)
+  assert.match(detail, /\+DEBUG=1/)
+  assert.doesNotMatch(detail, /sk-abcdefghijklmnop/)
 })
