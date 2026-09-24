@@ -6,6 +6,35 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Secret redaction now covers credentials passed as CLI flags
+  (issue #63).** Both layers (`redactSecrets` in
+  `plugin/jev-decision-gate/index.ts` and `redact_secrets` in
+  `src/jev_gate/schemas.py`, tested in parallel so they can't drift)
+  additionally redact: `curl -u/--user user:pass` (user kept, password
+  redacted), MySQL/MariaDB `-pSecret`/`-p Secret` (only on lines
+  invoking `mysql`/`mariadb`/`mysqldump` — `-p` stays untouched
+  elsewhere, e.g. `ssh -p 2222` or `mkdir -p`), `docker login
+  -p/--password Secret` (only on `docker login` lines, so `docker run
+  -p 8080:80` is untouched), generic `--password Secret` /
+  `--password=Secret` on any command, `aws configure set
+  aws_secret_access_key VALUE`, and env-style `VAR VALUE` with no `=`
+  (only when the name is env-var-shaped — ALL-CAPS or containing an
+  underscore — so `fix password reset flow` or `grep -r token src/`
+  are untouched).
+- **Two ReDoS bugs found while fixing the above.** The first version
+  of the new `VAR VALUE` pattern (nested `[A-Za-z0-9_]*keyword...`
+  stars) hung on underscore-dense input (`a_` × 25000); worse, the
+  same nested-star shape already existed in the pre-existing
+  `key=value` pattern, which hung 38s on `PASSWORD` × 20000 with no
+  separator anywhere (the old round-11 test only used keyword-free
+  input, so it never caught this). Fixed by restructuring the new
+  pattern to one bounded token run plus code-side checks (with a
+  manual scan so overlapping candidates like `set
+  aws_secret_access_key VALUE` can't swallow the real token), and by
+  bounding the pre-existing pattern's flanking runs to 56 chars.
+  New timing regression tests on both sides.
+
 ### Removed
 - **The desktop popup (`notify-send`/`zenity`) on ask-human/fail-open is
   gone.** Live-verified as actively disruptive during an extended

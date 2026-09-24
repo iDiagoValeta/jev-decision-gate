@@ -30,9 +30,67 @@ _SECRET_PATTERNS = [
     re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]{0,20}://[^\s/:@]+):([^\s/@]{1,})@"),
     # Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
     # not just stand alone (password=...) — the keyword can appear anywhere
-    # in the token, not only at its start.
-    re.compile(r"(?i)(\b[a-z0-9_]*(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]*\s*[:=]\s*)([^\s\"']{4,})"),
+    # in the token, not only at its start. The flanking runs are bounded
+    # to 56 (round 11 rule): unbounded stars here are O(n^2) on
+    # keyword-dense input with no "=" anywhere (live-verified:
+    # `PASSWORD` * 20000 took 38s) — each mid-string keyword match
+    # re-scans an O(n) greedy tail looking for a separator that never
+    # comes. Real identifiers are far shorter than 56+8+56 chars.
+    re.compile(r"(?i)(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s\"']{4,})"),
 ]
+
+# CLI-flag credentials (issue #63): secrets passed as flag values rather
+# than KEY=VALUE. Every repetition below is bounded (round 11 rule).
+# curl -u/--user user:pass — keep the user, redact only the password.
+_CLI_USER_RE = re.compile(r"(--user\s+|-u\s+)([^\s:'\"]{1,100}):([^\s'\"`]{1,200})")
+# --password value / --password=value on any command (single-dash too).
+_CLI_PASSWORD_FLAG_RE = re.compile(r"(^|[\s;|&({['\"`])(-{1,2}password)(=|\s+)([^\s'\"`]{1,200})", re.IGNORECASE)
+# VAR VALUE with no "=" (env-style: PGPASSWORD hunter2, or
+# `aws configure set aws_secret_access_key hunter2`). The name must be
+# env-var-shaped — ALL-CAPS or containing an underscore — so prose like
+# `fix password reset flow` or `grep -r token src/` is untouched.
+# Shape note (round 11 rule): ONE bounded token run, with the
+# keyword/caps/underscore checks in Python code — not nested
+# `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars in the regex, which is O(n^2)
+# on underscore-dense input (live-verified: `a_` * 25000 hung).
+# Overlapping candidates (`set aws_secret_access_key VALUE`: the rejected
+# `set ...` pair must not swallow the real token) rule out a plain
+# sub() — hence the manual scan, which advances one char on reject
+# (bounded re-scan, still O(n) overall).
+_CLI_ENV_SPACE_PAIR_RE = re.compile(r"\b([A-Za-z0-9_]{1,64})\s+([^\s'\"`]{4,200})")
+
+
+def _is_env_secret_name(token):
+    lowered = token.lower()
+    has_keyword = (
+        "password" in lowered or "passwd" in lowered or "secret" in lowered or "token" in lowered
+    )
+    return has_keyword and ("_" in token or token.isupper())
+
+
+def _redact_env_space(text):
+    parts = []
+    pos = 0
+    while True:
+        match = _CLI_ENV_SPACE_PAIR_RE.search(text, pos)
+        if match is None:
+            break
+        if _is_env_secret_name(match.group(1)):
+            parts.append(text[pos:match.start()])
+            parts.append(match.group(1) + " [REDACTED]")
+            pos = match.end()
+        else:
+            parts.append(text[pos:match.start() + 1])
+            pos = match.start() + 1
+    parts.append(text[pos:])
+    return "".join(parts)
+# -p VALUE / -pVALUE only belong to mysql/mariadb/mysqldump and
+# `docker login` (-p is --port or mkdir's parents flag elsewhere), so
+# they are only touched on lines invoking the owning command.
+_MYSQL_LINE_RE = re.compile(r"\b(?:mysql|mariadb|mysqldump)\b", re.IGNORECASE)
+_MYSQL_P_ATTACHED_RE = re.compile(r"(?<![\w-])-p(?!assword)([^\s'\"`]{1,200})")
+_MYSQL_P_SEPARATE_RE = re.compile(r"(?<![\w-])-p(\s+)([^\s'\"`]{1,200})")
+_DOCKER_LOGIN_LINE_RE = re.compile(r"\bdocker\b.{0,500}?\blogin\b", re.IGNORECASE)
 
 
 def redact_secrets(text):
@@ -48,7 +106,18 @@ def redact_secrets(text):
     out = _SECRET_PATTERNS[5].sub("[REDACTED-JWT]", out)
     out = _SECRET_PATTERNS[6].sub(r"\1:[REDACTED]@", out)
     out = _SECRET_PATTERNS[7].sub(r"\1[REDACTED]", out)
-    return out
+    out = _CLI_USER_RE.sub(r"\1\2:[REDACTED]", out)
+    out = _CLI_PASSWORD_FLAG_RE.sub(r"\1\2\3[REDACTED]", out)
+    out = _redact_env_space(out)
+    redacted_lines = []
+    for line in out.split("\n"):
+        if _MYSQL_LINE_RE.search(line):
+            line = _MYSQL_P_ATTACHED_RE.sub("-p[REDACTED]", line)
+            line = _MYSQL_P_SEPARATE_RE.sub(r"-p\1[REDACTED]", line)
+        if _DOCKER_LOGIN_LINE_RE.search(line):
+            line = _MYSQL_P_SEPARATE_RE.sub(r"-p\1[REDACTED]", line)
+        redacted_lines.append(line)
+    return "\n".join(redacted_lines)
 
 
 def sha256_hex(text):
