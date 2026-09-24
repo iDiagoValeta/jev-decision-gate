@@ -31,9 +31,17 @@ def decide_event(event, evaluate_fn, _error_box=None):
         context = event.get("context", {})
         policy = event.get("policy", {})
         user_notes = schemas_mod.load_user_notes()
-        state = schemas_mod.build_state(objective, halt, context, policy, user_notes)
         questions = schemas_mod.build_questions(halt)
-        result = evaluate_fn(state, questions)
+        for budget in schemas_mod.STATE_BUDGETS:
+            state = schemas_mod.build_state(objective, halt, context, policy, user_notes, budget)
+            try:
+                result = evaluate_fn(state, questions)
+                break
+            except Exception as exc:
+                # Dense text can overflow Jev's window even within the
+                # char budget: retry smaller rather than ask a human.
+                if "max_tokens_exceeded" not in str(exc) or budget == schemas_mod.STATE_BUDGETS[-1]:
+                    raise
         combined = decision_mod.combine(
             result["decision"]["choice"],
             float(result["decision"]["confidence"]),

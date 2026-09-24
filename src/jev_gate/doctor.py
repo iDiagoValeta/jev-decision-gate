@@ -60,7 +60,7 @@ def main():
         from jev_gate.cli import decide_event
 
         def fake(state, questions):
-            assert "brief" in state, "state missing curated brief"
+            assert state.get("halt", {}).get("detail") == "Read x", "state missing structured halt"
             return {"decision": {"choice": "allow", "confidence": 0.9},
                     "safe": {"noul": 0.9}, "risk": {"score": 0.1, "confidence": 0.8},
                     "model": "doctor"}

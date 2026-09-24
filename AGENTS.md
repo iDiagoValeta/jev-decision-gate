@@ -14,7 +14,7 @@ one flow:
 
 ```
 opencode v2 → index.ts ctx.permission.hook("evaluate") → spawn python3 -m jev_gate.cli
-            → schemas.py builds the Jev brief → client.py calls Jev
+            → schemas.py builds the structured Jev state → client.py calls Jev
             → decision.py combines the answer → cli.py prints JSON
             → index.ts sets input.effect allow / deny+message / leaves "ask"
               (ask → opencode prompts the human; no reply API involved)
@@ -72,7 +72,7 @@ bug.
 | Path | Owns |
 | ---- | ---- |
 | `plugin/jev-decision-gate/index.ts` | opencode hook: catastrophic-pattern kill list, `kindFor`, conversation-context gathering, form-API answers (`/api/form` poll + reply), human alert popup, spawn (`pythonBin` / mise / `PYTHONPATH`), cross-instance dedup, logging |
-| `src/jev_gate/schemas.py` | Jev prompt brief, redaction, question shapes |
+| `src/jev_gate/schemas.py` | structured Jev state (budget fit), redaction, question shapes |
 | `src/jev_gate/client.py` | TypeSafe SDK wrapper, error mapping |
 | `src/jev_gate/decision.py` | pure allow/deny/ask-human combine logic (fully unit tested) |
 | `src/jev_gate/cli.py` | stdin/stdout contract with `index.ts`, v2 JSONL log |

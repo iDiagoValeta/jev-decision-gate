@@ -97,20 +97,21 @@ def test_redact_secrets_closes_security_review_gaps():
 
 
 def test_redact_secrets():
-    from jev_gate.schemas import build_objective_block, redact_secrets
+    import json
+    from jev_gate.schemas import build_state, redact_secrets
     assert "[REDACTED" in redact_secrets("Bearer abcdefgh1234")
     assert "[REDACTED" in redact_secrets("key=ghp_12345678901234567890")
     assert "BEGIN RSA" not in redact_secrets("-----BEGIN RSA PRIVATE KEY-----")
-    brief = build_objective_block("Fix x with ghp_12345678901234567890",
-                                  {"kind": "read", "tool": "read", "detail": "Read f"})
-    assert "ghp_" not in brief
-    assert brief.startswith("OBJECTIVE:")
+    st = build_state("Fix x with ghp_12345678901234567890",
+                     {"kind": "read", "tool": "read", "detail": "Read f"}, {}, {})
+    assert "ghp_" not in json.dumps(st)
+    assert st["objective"].startswith("Fix x with")
 
 
-def test_brief_state_has_hash():
+def test_state_has_hash():
     from jev_gate.schemas import build_state, sha256_hex
     st = build_state("Do x", {"kind": "write", "detail": "echo hi"}, {}, {})
-    assert "brief" in st and "OBJECTIVE:" in st["brief"]
+    assert st["halt"]["detail"] == "echo hi" and st["objective"] == "Do x"
     assert st["detail_sha256"] == sha256_hex("echo hi")
 
 
