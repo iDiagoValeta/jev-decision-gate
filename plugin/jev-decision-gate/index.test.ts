@@ -1046,6 +1046,49 @@ test("redactSecrets: stays linear on adversarial CLI-flag input", () => {
   }
 })
 
+test("redactSecrets: redacts quoted values (double/single quotes) in KEY=VALUE, KEY VALUE, JSON/YAML, and CLI flags — issue #77", () => {
+  // Quoted secret values must be redacted in both layers. Mirrors the
+  // Python-side test in tests/test_schemas.py.
+  const cases: Array<[string, string]> = [
+    // Double-quoted value in KEY=VALUE
+    [`PGPASSWORD="s3cretpw" psql`, "PGPASSWORD=[REDACTED] psql"],
+    // Single-quoted value in KEY=VALUE
+    [`DB_PASSWORD='s3cretpw'`, "DB_PASSWORD=[REDACTED]"],
+    // YAML-style with quoted value
+    [`password: "hunter22"`, "password: [REDACTED]"],
+    // JSON with quoted key and quoted value
+    [`{"api_key": "abcd1234efgh"}`, `{"api_key": [REDACTED]}`],
+    // MySQL -p with attached quoted value
+    [`mysql -p"s3cretpw"`, "mysql -p[REDACTED]"],
+    // Quoted value with spaces
+    [`SECRET="two words here"`, "SECRET=[REDACTED]"],
+    [`SECRET='two words here'`, "SECRET=[REDACTED]"],
+    // MySQL -p with separate quoted value
+    [`mysql -p "s3cretpw"`, "mysql -p [REDACTED]"],
+    // curl -u with quoted password
+    [`curl -u admin:"secret123" http://x`, "curl -u admin:[REDACTED] http://x"],
+    // --password flag with quoted value
+    [`deploy --password="secret123"`, "deploy --password=[REDACTED]"],
+    // aws configure with quoted value
+    [
+      'aws configure set aws_secret_access_key "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"',
+      "aws configure set aws_secret_access_key [REDACTED]",
+    ],
+    // Env-style VAR VALUE with quoted value
+    [`PGPASSWORD "s3cretpw" psql`, "PGPASSWORD [REDACTED] psql"],
+  ]
+  for (const [input, expected] of cases) {
+    const result = redactSecrets(input)
+    assert.equal(result, expected, `redactSecrets(${JSON.stringify(input)})`)
+    assert.ok(!result.includes("s3cretpw"), `secret leaked in ${JSON.stringify(result)}`)
+    assert.ok(!result.includes("hunter22"), `secret leaked in ${JSON.stringify(result)}`)
+    assert.ok(!result.includes("abcd1234efgh"), `secret leaked in ${JSON.stringify(result)}`)
+    assert.ok(!result.includes("two words here"), `secret leaked in ${JSON.stringify(result)}`)
+    assert.ok(!result.includes("secret123"), `secret leaked in ${JSON.stringify(result)}`)
+    assert.ok(!result.includes("wJalrXUtnFEMI"), `secret leaked in ${JSON.stringify(result)}`)
+  }
+})
+
 test("handleOne: a fail-open never spawns notify-send/zenity — the desktop-popup feature was removed, not just defaulted off", async () => {
   // Regression guard for the removal itself, at the real integration
   // point (handleOne's catch-all fail-open), not just "the deleted
@@ -1732,6 +1775,15 @@ test("evaluatePermission: a request over MAX_SCANNED_CHARS goes to the human, ne
   assert.equal(input.effect, "ask")
   assert.equal(gateCalls, 0)
   assert.equal(logs[0].reason, "oversized-request")
+})
+
+test("redactSecrets: a quoted value stops at its closing quote, and quote-dense input stays fast", () => {
+  assert.equal(redactSecrets("P_TOKEN='a1b2c3' && echo 'b'"), "P_TOKEN=[REDACTED] && echo 'b'")
+  for (const adversarial of ['password="'.repeat(20000), "api_key: '".repeat(20000), 'mysql -p"'.repeat(20000), 'X_TOKEN "'.repeat(20000)]) {
+    const t0 = Date.now()
+    redactSecrets(adversarial)
+    assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0}ms`)
+  }
 })
 
 test("answerQuestionsWithJev: logs Jev's token usage with the decision", async () => {

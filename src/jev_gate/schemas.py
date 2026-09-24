@@ -34,19 +34,40 @@ _SECRET_PATTERNS = [
     # no "=" anywhere, since each mid-string keyword match re-scans an
     # O(n) greedy tail looking for a separator that never comes. Real
     # identifiers are far shorter than 56+8+56 chars.
-    re.compile(r"(?i)(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s\"']{4,})"),
+    # Value can be unquoted ([^\s"']{4,}), double-quoted ("[^"\n]{1,200}"),
+    # or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+    # The key may also be quoted (JSON/YAML: "api_key": "value").
+    # The alternation is ordered so quoted forms are tried first.
+    re.compile(
+        r"(?i)([\"']?\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)"
+        r"[a-z0-9_]{0,56}\b[\"']?\s*[:=]\s*)"
+        r"(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s\"']{4,}))"
+    ),
 ]
 
 # Secrets passed as CLI flag values rather than KEY=VALUE. Every
 # repetition below is bounded, for the same O(n^2) reason as above.
 # curl -u/--user user:pass — keep the user, redact only the password.
-_CLI_USER_RE = re.compile(r"(--user\s+|-u\s+)([^\s:'\"]{1,100}):([^\s'\"`]{1,200})")
+# Password can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+# or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+_CLI_USER_RE = re.compile(
+    r"(--user\s+|-u\s+)([^\s:'\"]{1,100}):"
+    r"(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s'\"`]{1,200}))"
+)
 # --password value / --password=value on any command (single-dash too).
-_CLI_PASSWORD_FLAG_RE = re.compile(r"(^|[\s;|&({['\"`])(-{1,2}password)(=|\s+)([^\s'\"`]{1,200})", re.IGNORECASE)
+# Value can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+# or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+_CLI_PASSWORD_FLAG_RE = re.compile(
+    r"(^|[\s;|&({['\"`])(-{1,2}password)(=|\s+)"
+    r"(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s'\"`]{1,200}))",
+    re.IGNORECASE,
+)
 # VAR VALUE with no "=" (env-style: PGPASSWORD hunter2, or
 # `aws configure set aws_secret_access_key hunter2`). The name must be
 # env-var-shaped — ALL-CAPS or containing an underscore — so prose like
 # `fix password reset flow` or `grep -r token src/` is untouched.
+# Value can be unquoted ([^\s'"`]{4,200}), double-quoted ("[^"\n]{1,200}"),
+# or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
 # ONE bounded token run, with the keyword/caps/underscore checks done
 # in Python code — not nested `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars
 # in the regex, which is O(n^2) on underscore-dense input.
@@ -54,7 +75,10 @@ _CLI_PASSWORD_FLAG_RE = re.compile(r"(^|[\s;|&({['\"`])(-{1,2}password)(=|\s+)([
 # `set ...` pair must not swallow the real token) rule out a plain
 # sub() — hence the manual scan, which advances one char on reject
 # (bounded re-scan, still O(n) overall).
-_CLI_ENV_SPACE_PAIR_RE = re.compile(r"\b([A-Za-z0-9_]{1,64})\s+([^\s'\"`]{4,200})")
+_CLI_ENV_SPACE_PAIR_RE = re.compile(
+    r"\b([A-Za-z0-9_]{1,64})\s+"
+    r"(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s'\"`]{4,200}))"
+)
 
 
 def _is_env_secret_name(token):
@@ -84,9 +108,15 @@ def _redact_env_space(text):
 # -p VALUE / -pVALUE only belong to mysql/mariadb/mysqldump and
 # `docker login` (-p is --port or mkdir's parents flag elsewhere), so
 # they are only touched on lines invoking the owning command.
+# Value can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+# or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
 _MYSQL_LINE_RE = re.compile(r"\b(?:mysql|mariadb|mysqldump)\b", re.IGNORECASE)
-_MYSQL_P_ATTACHED_RE = re.compile(r"(?<![\w-])-p(?!assword)([^\s'\"`]{1,200})")
-_MYSQL_P_SEPARATE_RE = re.compile(r"(?<![\w-])-p(\s+)([^\s'\"`]{1,200})")
+_MYSQL_P_ATTACHED_RE = re.compile(
+    r"(?<![\w-])-p(?!assword)(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s'\"`]{1,200}))"
+)
+_MYSQL_P_SEPARATE_RE = re.compile(
+    r"(?<![\w-])-p(\s+)(?:\"([^\"\n]{1,200})\"|'([^'\n]{1,200})'|([^\s'\"`]{1,200}))"
+)
 _DOCKER_LOGIN_LINE_RE = re.compile(r"\bdocker\b.{0,500}?\blogin\b", re.IGNORECASE)
 
 

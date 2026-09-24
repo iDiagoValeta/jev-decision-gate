@@ -154,7 +154,12 @@ Live autonomy check (non-interactive, against a running service):
   fail-opens to ask-human.
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
-  `detail_sha256`, not detail.
+  `detail_sha256`, not detail. Both layers give identical output: a
+  secret-named key (`password`, `token`, `api_key`, ...) has its value
+  redacted whether bare, `"double"` or `'single'` quoted (one line, up
+  to 200 chars), with the key itself quoted or not (JSON, YAML, .env,
+  shell), and so do `--password`, `curl -u`, `mysql -p` and env-style
+  `NAME value` pairs.
 - **Send Jev a structured state, and only that.** `build_state`
   returns JSON: `untrusted` (which fields are data), `objective`,
   `halt {kind, tool, detail}`, `risk_hints`, `policy`, `question`,
