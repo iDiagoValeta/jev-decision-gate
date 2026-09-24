@@ -12,6 +12,7 @@ import math
 import os
 import sys
 from collections import Counter
+from pathlib import Path
 
 TRAP_REASONS = {"catastrophic-pattern"}
 DENY_REASONS = {"jev-deny"}
@@ -52,6 +53,33 @@ def _safe_int(x, default=0):
         return default
 
 
+def _config_logfile() -> str | None:
+    cfg_path = os.environ.get("OPENCODE_CONFIG_FILE")
+    if cfg_path is None:
+        cfg_path = str(Path.home() / ".config/opencode/opencode.json")
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        return None
+    for entry in plugins:
+        if not isinstance(entry, dict):
+            continue
+        pkg = entry.get("package")
+        if isinstance(pkg, str) and "jev-decision-gate" in pkg:
+            opts = entry.get("options")
+            if isinstance(opts, dict):
+                lf = opts.get("logFile")
+                if isinstance(lf, str) and lf:
+                    return lf
+    return None
+
+
 def load(paths):
     rows = []
     corrupt = 0
@@ -87,14 +115,26 @@ def main():
     ap.add_argument("--by-session", action="store_true")
     ap.add_argument("--price-per-1k", type=float, default=0.0)
     args = ap.parse_args()
-    paths = args.log or [os.environ.get("JEV_GATE_LOG", "decisions-plugin.jsonl"),
-                         "decisions-plugin.jsonl", "decisions.jsonl"]
+    if args.log:
+        paths = args.log
+    else:
+        env_log = os.environ.get("JEV_GATE_LOG")
+        if env_log:
+            paths = [env_log, "decisions-plugin.jsonl", "decisions.jsonl"]
+        else:
+            cfg_log = _config_logfile()
+            if cfg_log:
+                paths = [cfg_log, "decisions-plugin.jsonl", "decisions.jsonl"]
+            else:
+                paths = ["decisions-plugin.jsonl", "decisions.jsonl"]
     # dedupe, keep order
     seen, uniq = set(), []
     for p in paths:
         if p not in seen:
             seen.add(p)
             uniq.append(p)
+    # resolved log: first existing file among candidates, else first candidate
+    resolved_log = next((p for p in uniq if Path(p).exists()), uniq[0] if uniq else "")
     all_rows, corrupt = load(uniq)
     rows = [r for r in all_rows if r.get("reason") != DUPLICATE_SUPPRESSED]
     duplicates_suppressed = len(all_rows) - len(rows)
@@ -123,6 +163,7 @@ def main():
         "est_cost_usd": round(cost, 4),
         "corrupt_lines": corrupt,
         "duplicates_suppressed": duplicates_suppressed,
+        "log": resolved_log,
     }
     if args.by_session:
         by = {}
@@ -142,8 +183,11 @@ def main():
                 b["fail_open"] += 1
         out["by_session"] = by
     if args.json:
+        # The resolved path travels inside the JSON ("log"); a separate
+        # log= line here would make the output invalid JSON.
         print(json.dumps(out, indent=2))
     else:
+        print(f"log={resolved_log}")
         print(f"total={total} actions={dict(actions)}")
         print(f"allow_rate={out['allow_rate']:.2f} traps_blocked={traps} "
               f"fail_open={failopen} ({out['fail_open_rate']:.2f}) errors={dict(errcls)}")
