@@ -900,6 +900,59 @@ test("handleOne: error_detail from the python gate's JSON is logged alongside er
   }
 })
 
+test("redactSecrets: redacts CLI-flag credentials but keeps the flag/user visible (issue #63)", () => {
+  // Secrets passed as CLI flag values, not KEY=VALUE. Mirrors the
+  // Python-side test in tests/test_schemas.py — both layers must agree.
+  const pw = "SuperSecretPw123"
+  const cases: Array<[string, string]> = [
+    [`curl -u admin:${pw} http://x`, "curl -u admin:[REDACTED] http://x"],
+    [`curl --user admin:${pw} http://x`, "curl --user admin:[REDACTED] http://x"],
+    [`mysql -uroot -p${pw}`, "mysql -uroot -p[REDACTED]"],
+    [`mysql -u root -p ${pw} db`, "mysql -u root -p [REDACTED] db"],
+    [`mysqldump -p${pw} db > out.sql`, "mysqldump -p[REDACTED] db > out.sql"],
+    [`docker login -p ${pw} reg`, "docker login -p [REDACTED] reg"],
+    ["docker login --password " + pw, "docker login --password [REDACTED]"],
+    [`deploy --password ${pw}`, "deploy --password [REDACTED]"],
+    [`deploy --password=${pw}`, "deploy --password=[REDACTED]"],
+    [
+      "aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "aws configure set aws_secret_access_key [REDACTED]",
+    ],
+    [`PGPASSWORD ${pw} psql`, "PGPASSWORD [REDACTED] psql"],
+  ]
+  for (const [input, expected] of cases) {
+    const result = redactSecrets(input)
+    assert.equal(result, expected, `redactSecrets(${JSON.stringify(input)})`)
+    assert.ok(!result.includes(pw), `secret leaked in ${JSON.stringify(result)}`)
+  }
+  assert.ok(!redactSecrets(cases[9][0]).includes("wJalrXUtnFEMI"))
+})
+
+test("redactSecrets: leaves non-secret flags and prose untouched (issue #63)", () => {
+  // -p means port/directory outside mysql/docker-login, and bare prose
+  // keywords carry no value — none of these may change.
+  for (const input of [
+    "ssh -p 2222 host",
+    "mkdir -p a/b",
+    'git commit -m "fix password reset flow"',
+    "grep -r token src/",
+  ]) {
+    assert.equal(redactSecrets(input), input, `redactSecrets changed ${JSON.stringify(input)}`)
+  }
+})
+
+test("redactSecrets: stays linear on adversarial CLI-flag input (issue #63, round-11 rule)", () => {
+  // Underscore-dense input hung the first nested-star version, and
+  // keyword-dense input with no separator hung even the pre-existing
+  // key=value pattern before its flanking runs were bounded to 56.
+  for (const adversarial of ["a_".repeat(75000), "PASSWORD".repeat(20000), "password ".repeat(20000)]) {
+    const t0 = Date.now()
+    redactSecrets(adversarial)
+    const elapsedMs = Date.now() - t0
+    assert.ok(elapsedMs < 500, `redactSecrets took ${elapsedMs}ms, expected < 500ms`)
+  }
+})
+
 test("handleOne: a fail-open never spawns notify-send/zenity — the desktop-popup feature was removed, not just defaulted off", async () => {
   // Regression guard for the removal itself, at the real integration
   // point (handleOne's catch-all fail-open), not just "the deleted

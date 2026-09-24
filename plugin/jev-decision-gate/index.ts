@@ -93,11 +93,70 @@ export function redactSecrets(text: string): string {
   out = out.replace(/([a-zA-Z][a-zA-Z0-9+.-]{0,20}:\/\/[^\s/:@]+):([^\s/@]{1,})@/g, "$1:[REDACTED]@")
   // Keyword may be embedded in a longer identifier (AWS_SECRET_ACCESS_KEY=...),
   // not just stand alone (password=...) — the keyword can appear anywhere
-  // in the token, not only at its start.
-  return out.replace(
-    /(\b[a-z0-9_]*(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]*\s*[:=]\s*)([^\s"']{4,})/gi,
+  // in the token, not only at its start. The flanking runs are bounded
+  // to 56 (round 11 rule): unbounded stars here are O(n^2) on
+  // keyword-dense input with no "=" anywhere (`PASSWORD` x 20000 took
+  // 38s on the Python side) — each mid-string keyword match re-scans an
+  // O(n) greedy tail looking for a separator that never comes.
+  out = out.replace(
+    /(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s"']{4,})/gi,
     "$1[REDACTED]",
   )
+  // CLI-flag credentials (issue #63): secrets passed as flag values rather
+  // than KEY=VALUE. Every repetition below is bounded (round 11 rule).
+  // curl -u/--user user:pass — keep the user, redact only the password.
+  out = out.replace(/(--user\s+|-u\s+)([^\s:'"]{1,100}):([^\s'"`]{1,200})/g, "$1$2:[REDACTED]")
+  // --password value / --password=value on any command (single-dash too).
+  out = out.replace(/(^|[\s;|&({['"`])(-{1,2}password)(=|\s+)([^\s'"`]{1,200})/gi, "$1$2$3[REDACTED]")
+  // VAR VALUE with no "=" (env-style: PGPASSWORD hunter2, or
+  // `aws configure set aws_secret_access_key hunter2`). The name must be
+  // env-var-shaped — ALL-CAPS or containing an underscore — so prose like
+  // `fix password reset flow` or `grep -r token src/` is untouched.
+  // Shape note (round 11 rule): one bounded token run, with the
+  // keyword/caps/underscore checks in code — not nested
+  // `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*` stars in the regex, which is O(n^2)
+  // on underscore-dense input (`a_` x 25000 hung the first version).
+  // Overlapping candidates (`set aws_secret_access_key VALUE`: the
+  // rejected `set ...` pair must not swallow the real token) rule out a
+  // plain replace() — hence the manual scan, which advances one char on
+  // reject (bounded re-scan, still O(n) overall).
+  const pairRe = /\b([A-Za-z0-9_]{1,64})\s+([^\s'"`]{4,200})/g
+  let scanned = ""
+  let pos = 0
+  pairRe.lastIndex = 0
+  let pm: RegExpExecArray | null
+  while ((pm = pairRe.exec(out)) !== null) {
+    const token = pm[1] as string
+    const lowered = token.toLowerCase()
+    const hasKeyword =
+      lowered.includes("password") || lowered.includes("passwd") || lowered.includes("secret") || lowered.includes("token")
+    if (hasKeyword && (token.includes("_") || token === token.toUpperCase())) {
+      scanned += out.slice(pos, pm.index) + token + " [REDACTED]"
+      pos = pm.index + pm[0].length
+    } else {
+      scanned += out.slice(pos, pm.index + 1)
+      pos = pm.index + 1
+      pairRe.lastIndex = pos
+    }
+  }
+  out = scanned + out.slice(pos)
+  // -p VALUE / -pVALUE only belong to mysql/mariadb/mysqldump and
+  // `docker login` (-p is --port or mkdir's parents flag elsewhere), so
+  // they are only touched on lines invoking the owning command.
+  out = out
+    .split("\n")
+    .map((line) => {
+      if (/\b(?:mysql|mariadb|mysqldump)\b/i.test(line)) {
+        line = line.replace(/(?<![\w-])-p(?!assword)([^\s'"`]{1,200})/g, "-p[REDACTED]")
+        line = line.replace(/(?<![\w-])-p(\s+)([^\s'"`]{1,200})/g, "-p$1[REDACTED]")
+      }
+      if (/\bdocker\b.{0,500}?\blogin\b/i.test(line)) {
+        line = line.replace(/(?<![\w-])-p(\s+)([^\s'"`]{1,200})/g, "-p$1[REDACTED]")
+      }
+      return line
+    })
+    .join("\n")
+  return out
 }
 
 export function sha256Hex(text: string): string {

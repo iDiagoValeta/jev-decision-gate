@@ -206,3 +206,60 @@ def test_load_user_notes_respects_xdg_config_home(tmp_path):
     (xdg / "jev-gate" / "notes.md").write_text("xdg-scoped preference")
     notes = load_user_notes({"HOME": str(tmp_path / "unused-home"), "XDG_CONFIG_HOME": str(xdg)})
     assert notes["global"] == "xdg-scoped preference"
+
+
+def test_redact_secrets_redacts_cli_flag_credentials_issue_63():
+    # Secrets passed as CLI flag values (not KEY=VALUE) must redact the
+    # value but keep the flag/user visible. Mirrors the TS-side test.
+    from jev_gate.schemas import redact_secrets
+    pw = "SuperSecretPw123"
+    cases = [
+        (f"curl -u admin:{pw} http://x", "curl -u admin:[REDACTED] http://x"),
+        (f"curl --user admin:{pw} http://x", "curl --user admin:[REDACTED] http://x"),
+        (f"mysql -uroot -p{pw}", "mysql -uroot -p[REDACTED]"),
+        (f"mysql -u root -p {pw} db", "mysql -u root -p [REDACTED] db"),
+        (f"mysqldump -p{pw} db > out.sql", "mysqldump -p[REDACTED] db > out.sql"),
+        (f"docker login -p {pw} reg", "docker login -p [REDACTED] reg"),
+        ("docker login --password " + pw, "docker login --password [REDACTED]"),
+        (f"deploy --password {pw}", "deploy --password [REDACTED]"),
+        (f"deploy --password={pw}", "deploy --password=[REDACTED]"),
+        (
+            "aws configure set aws_secret_access_key "
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws configure set aws_secret_access_key [REDACTED]",
+        ),
+        (f"PGPASSWORD {pw} psql", "PGPASSWORD [REDACTED] psql"),
+    ]
+    for text, expected in cases:
+        result = redact_secrets(text)
+        assert result == expected, f"redact_secrets({text!r}) = {result!r}, expected {expected!r}"
+        assert pw not in result
+    assert "wJalrXUtnFEMI" not in redact_secrets(cases[9][0])
+
+
+def test_redact_secrets_leaves_non_secret_flags_and_prose_untouched_issue_63():
+    # -p means port/directory elsewhere, and bare prose keywords carry
+    # no value — none of these may change.
+    from jev_gate.schemas import redact_secrets
+    for text in [
+        "ssh -p 2222 host",
+        "mkdir -p a/b",
+        'git commit -m "fix password reset flow"',
+        "grep -r token src/",
+    ]:
+        assert redact_secrets(text) == text, f"redact_secrets changed {text!r}"
+
+
+def test_redact_secrets_stays_linear_on_adversarial_cli_flag_input():
+    # Locks in the round-11 rule for the new shapes: underscore-dense
+    # input (`a_` * N hung the first nested-star version) and
+    # keyword-dense input with no separator (`PASSWORD` * N hung even
+    # the pre-existing key=value pattern — 38s — before its flanking
+    # runs were bounded to 56).
+    import time
+    from jev_gate.schemas import redact_secrets
+    for adversarial in ["a_" * 75000, "PASSWORD" * 20000, "password " * 20000]:
+        t0 = time.monotonic()
+        redact_secrets(adversarial)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5, f"redact_secrets took {elapsed:.2f}s, expected < 0.5s"
