@@ -115,12 +115,11 @@ Every decision is appended to a JSONL log (v2 schema:
 `at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
 `reason`, `confidence`, `model`, `pick`, `elapsedMs`,
 `detail_sha256`) with no secrets, mode `0600`. `setup()` runs once per
-project directory, so several times per opencode process, and every
-instance sees the same process-wide event stream — every real
-permission is logged once for real and once (or more) as
-`duplicate-suppressed` (a no-op that never touched Jev);
-`scripts/measure.py` already excludes those from its rates, but a raw
-`grep gateAction` over the log will double-count them.
+project directory, so several instances share one opencode process;
+when two of them see the same request, the loser logs
+`duplicate-suppressed` (a no-op that never touched Jev).
+`scripts/measure.py` excludes those rows from its rates; a raw
+`grep gateAction` over the log would count them.
 
 ### Personal notes for Jev
 

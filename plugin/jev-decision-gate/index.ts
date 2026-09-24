@@ -111,20 +111,35 @@ export function redactSecrets(text: string): string {
   // to 56: unbounded stars here are O(n^2) on keyword-dense input with no
   // "=" anywhere, since each mid-string keyword match re-scans an O(n)
   // greedy tail looking for a separator that never comes.
+  // Value can be unquoted ([^\s"']{4,}), double-quoted ("[^"\n]{1,200}"),
+  // or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+  // The key may also be quoted (JSON/YAML: "api_key": "value").
   out = out.replace(
-    /(\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\s*[:=]\s*)([^\s"']{4,})/gi,
+    /(["']?\b[a-z0-9_]{0,56}(?:api[_-]?key|password|passwd|secret|token)[a-z0-9_]{0,56}\b["']?\s*[:=]\s*)(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s"']{4,}))/gi,
     "$1[REDACTED]",
   )
   // Secrets passed as CLI flag values rather than KEY=VALUE. Every
   // repetition below is bounded, for the same O(n^2) reason as above.
   // curl -u/--user user:pass — keep the user, redact only the password.
-  out = out.replace(/(--user\s+|-u\s+)([^\s:'"]{1,100}):([^\s'"`]{1,200})/g, "$1$2:[REDACTED]")
+  // Password can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+  // or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+  out = out.replace(
+    /(--user\s+|-u\s+)([^\s:'"]{1,100}):(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{1,200}))/g,
+    "$1$2:[REDACTED]",
+  )
   // --password value / --password=value on any command (single-dash too).
-  out = out.replace(/(^|[\s;|&({['"`])(-{1,2}password)(=|\s+)([^\s'"`]{1,200})/gi, "$1$2$3[REDACTED]")
+  // Value can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+  // or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
+  out = out.replace(
+    /(^|[\s;|&({['"`])(-{1,2}password)(=|\s+)(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{1,200}))/gi,
+    "$1$2$3[REDACTED]",
+  )
   // VAR VALUE with no "=" (env-style: PGPASSWORD hunter2, or
   // `aws configure set aws_secret_access_key hunter2`). The name must be
   // env-var-shaped — ALL-CAPS or containing an underscore — so prose like
   // `fix password reset flow` or `grep -r token src/` is untouched.
+  // Value can be unquoted ([^\s'"`]{4,200}), double-quoted ("[^"\n]{1,200}"),
+  // or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
   // One bounded token run, with the keyword/caps/underscore checks done
   // in code rather than as nested `[A-Za-z0-9_]*keyword[A-Za-z0-9_]*`
   // stars in the regex, which is O(n^2) on underscore-dense input.
@@ -132,7 +147,7 @@ export function redactSecrets(text: string): string {
   // rejected `set ...` pair must not swallow the real token) rule out a
   // plain replace() — hence the manual scan, which advances one char on
   // reject (bounded re-scan, still O(n) overall).
-  const pairRe = /\b([A-Za-z0-9_]{1,64})\s+([^\s'"`]{4,200})/g
+  const pairRe = /\b([A-Za-z0-9_]{1,64})\s+(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{4,200}))/g
   let scanned = ""
   let pos = 0
   pairRe.lastIndex = 0
@@ -155,15 +170,17 @@ export function redactSecrets(text: string): string {
   // -p VALUE / -pVALUE only belong to mysql/mariadb/mysqldump and
   // `docker login` (-p is --port or mkdir's parents flag elsewhere), so
   // they are only touched on lines invoking the owning command.
+  // Value can be unquoted ([^\s'"`]{1,200}), double-quoted ("[^"\n]{1,200}"),
+  // or single-quoted ('[^'\n]{1,200}'). Quoted values may contain spaces.
   out = out
     .split("\n")
     .map((line) => {
       if (/\b(?:mysql|mariadb|mysqldump)\b/i.test(line)) {
-        line = line.replace(/(?<![\w-])-p(?!assword)([^\s'"`]{1,200})/g, "-p[REDACTED]")
-        line = line.replace(/(?<![\w-])-p(\s+)([^\s'"`]{1,200})/g, "-p$1[REDACTED]")
+        line = line.replace(/(?<![\w-])-p(?!assword)(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{1,200}))/g, "-p[REDACTED]")
+        line = line.replace(/(?<![\w-])-p(\s+)(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{1,200}))/g, "-p$1[REDACTED]")
       }
       if (/\bdocker\b.{0,500}?\blogin\b/i.test(line)) {
-        line = line.replace(/(?<![\w-])-p(\s+)([^\s'"`]{1,200})/g, "-p$1[REDACTED]")
+        line = line.replace(/(?<![\w-])-p(\s+)(?:("([^"\n]{1,200})")|('([^'\n]{1,200})')|([^\s'"`]{1,200}))/g, "-p$1[REDACTED]")
       }
       return line
     })
