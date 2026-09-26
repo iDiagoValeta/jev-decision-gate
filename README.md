@@ -52,7 +52,7 @@ confidence; safe/risk are asked for as context, not vetoes (see
 "Safety model" below for why). Any error fail-opens to ask-human: a
 broken gate never silently allows.
 
-Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, force-push,
+Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, remote code run through `$(curl ...)` or `<(curl ...)`, force-push,
 `mkfs`, fork bombs, ...) are rejected instantly without calling Jev.
 
 Agent questions (multichoice) are auto-answered when Jev can pick: the
