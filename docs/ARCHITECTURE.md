@@ -26,7 +26,9 @@ permission evaluate hook (ctx.permission.hook("evaluate"))
                               JEV_GATE_OBJECTIVE_CHARS, max 90000)
   → gateEvent { objective, halt {kind,tool,detail redacted, head+tail
                 ≤90000 chars; for edits the patches from metadata.files
-                are appended}, context {sessionID,risk_hints}, policy }
+                are appended, for grep/glob/list the path/include from
+                metadata are appended as "path: ..." lines}, context
+                {sessionID,risk_hints}, policy }
   → schemas.build_state: structured JSON {untrusted, objective, halt,
         risk_hints, policy, question, user_notes?} fitted to Jev's ~33k-token
         window (budgets 90k/45k/20k chars, next one on max_tokens_exceeded)
@@ -152,6 +154,36 @@ Live autonomy check (non-interactive, against a running service):
   `webfetch`, `websearch`, …), `doom_loop` → destructive, `question`
   → multichoice (permission path only; see above). Anything else
   fail-opens to ask-human.
+- **`curl`/`wget` are destructive only when they act like a write, not
+  because they exist.** `DESTRUCTIVE_HINT` used to match a bare
+  `curl|wget`, so a read-only `curl -s URL` scored identically to
+  `rm -rf /`. `hasDestructiveCurlOrWget` (`index.ts`) now looks for a
+  write/output flag (`-o`, `-O`, `--output`, `--remote-name`), a
+  body-sending flag (`-d`, `--data*`, `-F`, `--form`, `-T`,
+  `--upload-file`), a non-GET/HEAD `-X`/`--request` method, or another
+  pipeline segment that is an interpreter (`sh`, `bash`, `zsh`, `python`,
+  `python3`, `node`, `perl`, `ruby`, or any `sudo ...`). OpenCode may hand
+  a piped bash command as one resource per segment
+  (`["curl -s URL", "sh"]`) or as a single string (`"curl -s URL | sh"`),
+  so every resource is also split on `|` before the check. `kindFor`
+  falls to `read` for a fetch that clears this check (not the generic
+  write default), and both `kindFor` and the risk-hint computation in
+  `evaluatePermission`/`handleOne` call the same function, so the two
+  never drift apart. The kill-list is untouched: a `curl`/`wget` piped
+  straight into a shell already matches a kill-list pattern and is denied
+  before `kindFor` ever runs.
+- **grep/glob/list get their path back before Jev sees them.** On
+  opencode 2.0.x, a `grep`/`glob` permission's `resources` carries only
+  the search pattern (e.g. a grep's `resources` is just the regex, never
+  the directory); the target path lives in `metadata.path` instead
+  (`metadata.include`/`metadata.glob` also travel there when present).
+  Judging a bare pattern with no path gives Jev nothing to anchor risk on.
+  `metadataDetailFor` (`index.ts`) appends `key: value` lines built from
+  `metadata` to Jev's `halt.detail` only, the same way `editPatchesOf`
+  appends a diff for edits: the kill-list and `kindFor` keep evaluating
+  the original, unenriched `resources`. Wired into both the `evaluate`
+  hook and the `permission.asked` fallback path, since a plugin loaded
+  on an older opencode without the hook API needs the same enrichment.
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail. Both layers give identical output: a
