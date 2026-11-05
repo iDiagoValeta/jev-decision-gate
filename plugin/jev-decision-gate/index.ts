@@ -9,30 +9,28 @@ import { fileURLToPath } from "node:url"
 // Checked against a NORMALIZED command string (lowercased, quotes/
 // separators collapsed) so trivial obfuscation does not bypass them.
 //
-// Known, accepted false-positive trade-off (present since quote-stripping
-// was added, widened by backslash-stripping): stripping quotes/backslashes
-// to defeat obfuscation also means descriptive text that merely MENTIONS a
-// dangerous command inside quotes can normalize into something that matches
-// — e.g. `echo "talk about rm -rf / here"` or `echo "rm -r\f / in docs"`
-// both normalize to a string containing `rm -rf /`. This fails closed (the
-// command is rejected, not silently allowed) so it's a usability cost, not
-// a security hole, and there is no narrower fix available: restricting
-// backslash-stripping to avoid this would reopen the r\m obfuscation bypass
-// it exists to close (confirmed — `r\m` has a backslash between two
-// letters, same shape as the false-positive case). A real shell parser
-// could tell prose from syntax; a regex-based kill-list can't.
+// Only what a regex can decide stays here. rm, find, power-off and the
+// fetch-to-interpreter rules are token rules over a parsed command (see
+// `parseShell`): their old regexes spanned statements (`rm -rf dist && tsc -p .`
+// matched `.` as a target), matched a word anywhere (`git commit -m "handle
+// reboot"`) and backtracked exponentially on a long script.
+//
+// Known, accepted false-positive trade-off for the patterns below: stripping
+// quotes/backslashes to defeat obfuscation also means descriptive text that
+// merely MENTIONS a dangerous command inside quotes can normalize into
+// something that matches, e.g. `echo "DROP TABLE users"`. This fails closed
+// (the command is rejected, not silently allowed) so it's a usability cost,
+// not a security hole. A real shell parser could tell prose from syntax; a
+// regex kill-list can't, and the rules that matter most to everyday commands
+// have moved to the token rules for that reason.
 const CATASTROPHIC = [
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\/home\/[^/\s]+(?!\S)|\/root(?!\S)|\.(?!\S)|\.\/(?!\S)|\.\.(?!\S)|\.\.\/(?!\S))/,
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+.*--no-preserve-root/,
   /\bmkfs\b/,
   /\bdd\b\s+.*\bof=\/dev\//,
   />\s*\/dev\/(sd[a-z]|nvme\d+n\d+|vd[a-z]|hd[a-z])/,
-  /\b(shutdown|reboot|halt|poweroff|init\s+[06])\b/,
   /\bchmod\s+(-R\s+)?777\s+(\/|~|\$home|\${home}|\/home|\/etc|\/usr)/,
   /\bchown\s+-R\s+\S+\s+(\/|~|\/etc|\/usr)/,
   /:\(\)\s*\{\s*:\|\:&\s*\}\s*;/,
   /\bsudo\s+rm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+/,
-  /\bfind\s+\/\S*\s+.*-delete\b/,
   /\bcurl\b.*\|\s*(sh|bash|sudo\s+bash)\b/,
   /\bwget\b.*\|\s*(sudo\s+bash|sh|bash)\b/,
   /\bbase64\s+(-d|--decode)\b.*\|\s*(sh|bash)\b/,
@@ -340,21 +338,6 @@ export const MAX_SCANNED_CHARS = 256 * 1024
 // decode stage followed by a LATER interpreter that reads its program
 // from stdin. Not requiring the pipe is deliberate — the splitter already
 // dropped it, so "later segment" is the only evidence left.
-const STDIN_INTERPRETERS = new Set([
-  "sh",
-  "bash",
-  "zsh",
-  "dash",
-  "ksh",
-  "fish",
-  "python",
-  "python2",
-  "python3",
-  "perl",
-  "ruby",
-  "node",
-  "php",
-])
 const FETCH_COMMANDS = new Set(["curl", "wget"])
 
 // Leading wrappers run the command that follows them, so the command word is
@@ -362,13 +345,17 @@ const FETCH_COMMANDS = new Set(["curl", "wget"])
 // all end in an interpreter. Their options are skipped too. The map names the
 // options that take a separate value (`sudo -u root`, `env -u NAME`,
 // `nice -n 10`, `timeout -s KILL`): without it the value would be read as the
-// command word. A Map, not an object, so a command named like an Object
-// prototype property is not mistaken for a wrapper.
+// command word. A short option inside a cluster counts too (`sudo -iu root`,
+// `sudo -Hu root bash`): if the value-taking letter is the last one, the next
+// word is its value, otherwise the value is attached. A Map, not an object, so
+// a command named like an Object prototype property is not mistaken for a
+// wrapper.
 const WRAPPER_ARG_OPTIONS = new Map<string, ReadonlySet<string>>([
   ["sudo", new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "--user", "--group", "--other-user", "--chdir", "--host", "--prompt", "--role", "--type"])],
   ["doas", new Set(["-u", "-C"])],
   ["env", new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"])],
   ["nice", new Set(["-n"])],
+  ["ionice", new Set(["-c", "-n", "-p", "-P", "-u"])],
   ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
   // xargs runs the words after its options as a command, so `xargs rm -r -f ~`
   // is an rm. Only the options that take a separate value are listed.
@@ -376,7 +363,7 @@ const WRAPPER_ARG_OPTIONS = new Map<string, ReadonlySet<string>>([
   ["stdbuf", new Set(["-i", "-o", "-e", "--input", "--output", "--error"])],
 ])
 // `busybox rm ...` runs the applet named next, like any other wrapper.
-const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time", "busybox"])
+const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time", "busybox", "setsid"])
 // `sudo -s` / `sudo -i` with nothing after them start a shell that reads its
 // program from stdin, exactly like a bare `bash`.
 const SHELL_FLAG_WRAPPERS = new Set(["sudo", "doas"])
@@ -387,11 +374,24 @@ const SHELL_FLAG = /^-[a-z]*[si]/i
 // and what follows is never read as one.)
 const COMMAND_LOOKUP_FLAG = /^-[a-zA-Z]*[vV][a-zA-Z]*$/
 
-// Tokens of one segment with its leading wrappers and VAR=value assignments
-// removed. Wrappers can nest (`sudo env bash`), so each one is entered in
-// turn and its options are skipped as they come.
-function commandTokens(segment: string): string[] {
-  const tokens = segment.trim().split(/\s+/).filter(Boolean)
+// True when the wrapper's option `opt` is followed by its value as a
+// separate word. `--user root` and `-u root` do; `--user=root`, `-uroot` and
+// a cluster whose value letter is not last (`-n10`) carry the value inside.
+function optionConsumesNext(wrapper: string, opt: string): boolean {
+  const withValue = WRAPPER_ARG_OPTIONS.get(wrapper)
+  if (!withValue) return false
+  if (opt.startsWith("--")) return withValue.has(opt)
+  const letters = opt.slice(1)
+  for (let k = 0; k < letters.length; k++) {
+    if (withValue.has("-" + letters[k])) return k === letters.length - 1
+  }
+  return false
+}
+
+// Words of one simple command with its leading wrappers and VAR=value
+// assignments removed. Wrappers can nest (`sudo env bash`), so each one is
+// entered in turn and its options are skipped as they come.
+function commandTokens(tokens: string[]): string[] {
   let i = 0
   let wrapper: string | null = null
   let shellFlag = false
@@ -416,7 +416,7 @@ function commandTokens(segment: string): string[] {
       if (SHELL_FLAG_WRAPPERS.has(wrapper) && (SHELL_FLAG.test(token) || token === "--shell" || token === "--login")) {
         shellFlag = true
       }
-      i += WRAPPER_ARG_OPTIONS.get(wrapper)?.has(token) ? 2 : 1
+      i += optionConsumesNext(wrapper, token) ? 2 : 1
       continue
     }
     // timeout's first operand is the duration, not the command.
@@ -440,6 +440,355 @@ function commandName(word: string): string {
   return (bare.split("/").pop() ?? bare).toLowerCase()
 }
 
+// A shell word as the shell would hand it to the command: quotes removed,
+// backslash escapes resolved. Used where the CONTENT of a word is read as
+// another command line (`bash -c '...'`, `eval ...`).
+function unquoteWord(word: string): string {
+  let out = ""
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i]
+    if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      const stop = end === -1 ? word.length : end
+      out += word.slice(i + 1, stop)
+      i = stop
+    } else if (c === '"') {
+      for (i++; i < word.length && word[i] !== '"'; i++) {
+        if (word[i] === "\\" && i + 1 < word.length && '"\\$`'.includes(word[i + 1])) i++
+        out += word[i]
+      }
+    } else if (c === "\\") {
+      i++
+      if (i < word.length) out += word[i]
+    } else {
+      out += c
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// A small shell reader. Every token rule below used to split the text on
+// `[;&|]` or read it word by word with a regex, which cannot tell an operator
+// from a quoted one, a group from its contents, or a statement from the next.
+// This one pass (linear, no backtracking) gives them the structure instead:
+// statements split on `;` `&&` `||` `&` and newlines, pipeline stages split on
+// `|`, quotes kept inside their word, redirections taken out of the words, and
+// `( ... )`, `{ ...; }`, `$( ... )`, backticks and `<( ... )` read as nested
+// bodies. It is not a full shell grammar (no heredoc bodies, no `case`, no
+// keywords such as `then`/`do`): it reads what the kill-list needs.
+// ---------------------------------------------------------------------------
+interface Stage {
+  // Words of the simple command, quotes kept, redirections removed.
+  words: string[]
+  // The whole stage is a `( ... )` or `{ ...; }` group.
+  group: Body | null
+  // Substitutions and subshells met inside the stage's words.
+  subs: Body[]
+  // Stdin comes from a file or here-string, not from the pipeline.
+  inputRedirect: boolean
+}
+type Body = Stage[][]
+
+// Beyond this nesting `(` and `$(` are plain characters, so adversarial input
+// cannot overflow the stack and the cost stays linear.
+const MAX_GROUP_DEPTH = 32
+const PLAIN_RUN = /[^\\'"$`(){}\s;&|<>#]+/y
+
+function parseShell(input: string): Body {
+  // `${IFS}` and `$IFS` are whitespace to the shell, so `rm${IFS}-rf${IFS}/`
+  // is an ordinary rm.
+  const text = input.replace(/\$\{ifs\}/gi, " ").replace(/\$ifs\b/gi, " ")
+  const n = text.length
+  let pos = 0
+
+  function parseBody(depth: number, closer: ")" | "}" | "`" | null): Body {
+    const body: Body = []
+    let stages: Stage[] = []
+    let stage: Stage = { words: [], group: null, subs: [], inputRedirect: false }
+    let word = ""
+    let inWord = false
+    let redirectPending = false
+
+    const endWord = () => {
+      if (!inWord) return
+      inWord = false
+      const done = word
+      word = ""
+      // The target of a bare `>` / `<` is not an argument of the command.
+      if (redirectPending) redirectPending = false
+      else stage.words.push(done)
+    }
+    const endStage = () => {
+      endWord()
+      redirectPending = false
+      if (stage.words.length > 0 || stage.group || stage.subs.length > 0) stages.push(stage)
+      stage = { words: [], group: null, subs: [], inputRedirect: false }
+    }
+    const endStatement = () => {
+      endStage()
+      if (stages.length > 0) body.push(stages)
+      stages = []
+    }
+    const atCommandStart = () => !inWord && stage.words.length === 0 && !stage.group
+    // Reads a nested body whose opener is already consumed; its raw text stays
+    // in the enclosing word so `bash -c "..."` can be read back later.
+    const nested = (start: number, nestedCloser: ")" | "`"): void => {
+      stage.subs.push(parseBody(depth + 1, nestedCloser))
+      word += text.slice(start, pos)
+      inWord = true
+    }
+
+    while (pos < n) {
+      const c = text[pos]
+      switch (c) {
+        case "\\": {
+          const next = text[pos + 1]
+          if (next === undefined) pos++
+          // A line continuation joins the lines.
+          else if (next === "\n") pos += 2
+          // `rm\ -rf\ /` is one word to a real shell. normalizeCommand reads it
+          // as the spaced command, and so does this, so an escaped space ends
+          // the word instead of hiding the wipe inside it.
+          else if (next === " " || next === "\t") {
+            endWord()
+            pos += 2
+          } else {
+            word += c + next
+            inWord = true
+            pos += 2
+          }
+          break
+        }
+        case "'": {
+          const end = text.indexOf("'", pos + 1)
+          const stop = end === -1 ? n : end + 1
+          word += text.slice(pos, stop)
+          inWord = true
+          pos = stop
+          break
+        }
+        case '"': {
+          word += c
+          inWord = true
+          pos++
+          while (pos < n) {
+            const d = text[pos]
+            if (d === '"') {
+              word += d
+              pos++
+              break
+            }
+            if (d === "\\") {
+              word += text.slice(pos, pos + 2)
+              pos += 2
+            } else if (d === "$" && text[pos + 1] === "(" && depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos += 2
+              nested(start, ")")
+            } else if (d === "`" && closer !== "`" && depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos++
+              nested(start, "`")
+            } else if (d === "`") {
+              break
+            } else {
+              word += d
+              pos++
+            }
+          }
+          break
+        }
+        case "$":
+          if (text[pos + 1] === "(" && depth < MAX_GROUP_DEPTH) {
+            const start = pos
+            pos += 2
+            nested(start, ")")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "`":
+          if (closer === "`") {
+            endStatement()
+            pos++
+            return body
+          }
+          if (depth < MAX_GROUP_DEPTH) {
+            const start = pos
+            pos++
+            nested(start, "`")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "(":
+          if (depth >= MAX_GROUP_DEPTH) {
+            word += c
+            inWord = true
+            pos++
+          } else if (atCommandStart()) {
+            pos++
+            stage.group = parseBody(depth + 1, ")")
+          } else {
+            pos++
+            stage.subs.push(parseBody(depth + 1, ")"))
+          }
+          break
+        case ")":
+          if (closer === ")") {
+            endStatement()
+            pos++
+            return body
+          }
+          endWord()
+          pos++
+          break
+        case "{":
+          if (depth < MAX_GROUP_DEPTH && atCommandStart() && (pos + 1 >= n || /\s/.test(text[pos + 1]))) {
+            pos++
+            stage.group = parseBody(depth + 1, "}")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "}":
+          if (closer === "}" && atCommandStart()) {
+            endStatement()
+            pos++
+            return body
+          }
+          word += c
+          inWord = true
+          pos++
+          break
+        case ";":
+        case "\n":
+          endStatement()
+          pos++
+          break
+        case "&":
+          if (text[pos + 1] === "&") {
+            endStatement()
+            pos += 2
+          } else if (text[pos + 1] === ">") {
+            // `&>file` / `&>>file`
+            endWord()
+            pos += text[pos + 2] === ">" ? 3 : 2
+            redirectPending = true
+          } else {
+            endStatement()
+            pos++
+          }
+          break
+        case "|":
+          if (text[pos + 1] === "|") {
+            endStatement()
+            pos += 2
+          } else {
+            endStage()
+            pos += text[pos + 1] === "&" ? 2 : 1
+          }
+          break
+        case "<":
+        case ">": {
+          if (text[pos + 1] === "(") {
+            // Process substitution: the fetched file is an argument.
+            if (depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos += 2
+              nested(start, ")")
+            } else {
+              word += c
+              inWord = true
+              pos++
+            }
+            break
+          }
+          // `2>file`: the leading digits are the descriptor, not a word.
+          if (inWord && /^\d+$/.test(word)) {
+            inWord = false
+            word = ""
+          } else {
+            endWord()
+          }
+          let end = pos
+          while (end < n && (text[end] === "<" || text[end] === ">")) end++
+          if (text[end - 1] === ">" && text[end] === "|") end++
+          if (text[end] === "&") {
+            // `2>&1`, `<&0`: a descriptor, no file target follows.
+            end++
+            while (end < n && /[0-9-]/.test(text[end])) end++
+          } else {
+            redirectPending = true
+            if (c === "<") stage.inputRedirect = true
+          }
+          pos = end
+          break
+        }
+        case "#":
+          if (!inWord) {
+            while (pos < n && text[pos] !== "\n") pos++
+          } else {
+            word += c
+            pos++
+          }
+          break
+        case " ":
+        case "\t":
+        case "\r":
+          endWord()
+          pos++
+          break
+        default: {
+          PLAIN_RUN.lastIndex = pos
+          const match = PLAIN_RUN.exec(text)
+          if (match) {
+            word += match[0]
+            pos += match[0].length
+          } else {
+            word += c
+            pos++
+          }
+          inWord = true
+        }
+      }
+    }
+    endStatement()
+    return body
+  }
+
+  return parseBody(0, null)
+}
+
+// Visits every stage of a body, nested groups and substitutions included,
+// and stops at the first one `visit` accepts.
+function walkStages(body: Body, visit: (stage: Stage) => boolean): boolean {
+  for (const stages of body) {
+    for (const stage of stages) {
+      if (visit(stage)) return true
+      if (stage.group && walkStages(stage.group, visit)) return true
+      for (const sub of stage.subs) if (walkStages(sub, visit)) return true
+    }
+  }
+  return false
+}
+
+// True when `hit` accepts the command (wrappers already removed) of any
+// simple command in any of the segments.
+function someCommand(segments: string[], hit: (tokens: string[]) => boolean): boolean {
+  for (const segment of segments) {
+    if (walkStages(parseShell(segment), (stage) => !stage.group && hit(commandTokens(stage.words)))) return true
+  }
+  return false
+}
+
 function isFetchOrDecode(tokens: string[]): boolean {
   if (tokens.length === 0) return false
   const name = commandName(tokens[0])
@@ -450,52 +799,94 @@ function isFetchOrDecode(tokens: string[]): boolean {
   return false
 }
 
-const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"])
-// Long flags that print something or hand the interpreter its program, so no
-// program is read from stdin (`python3 --version`, `node --test`).
-const NO_STDIN_LONG = new Set(["--version", "--help", "--test", "--eval", "--print", "--command"])
-// Short-flag letters with the same meaning for the non-shell interpreters:
-// -c/-e/-E/-r/-p give the program, -m runs a module, -v/-V/-h print and exit.
-const NO_STDIN_SHORT = /[cmeEpvVhr]/
-// Shell options whose value is a separate word, not a script path.
-const SHELL_OPTIONS_WITH_VALUE = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"])
-const PYTHON_OPTIONS_WITH_VALUE = new Set(["-W", "-X"])
+// What each interpreter does with its options, so that only a command that
+// really reads its program from stdin counts. `stop` letters and `stopLong`
+// options supply the program or print and exit (`-c`, `-e`, `-m`, `--version`);
+// every other option leaves it reading stdin (`python3 -E`, `node --inspect`,
+// `perl -I/tmp/lib`). `value` letters take a value that is either the rest of
+// the cluster (`-rjson`) or the next word (`-r json`), `attached` letters only
+// the rest of the cluster (`perl -i.bak`), `valueLong` options a next word
+// unless written `--opt=value`. The value is never read as a script path.
+interface InterpreterSpec {
+  stop: string
+  stopLong: ReadonlySet<string>
+  value: string
+  valueLong: ReadonlySet<string>
+  attached: string
+  // Shells only: `-s` reads stdin, and `+o` style options exist.
+  shell: boolean
+}
+const NO_OPTIONS: ReadonlySet<string> = new Set()
+const SHELL_SPEC: InterpreterSpec = {
+  stop: "c",
+  stopLong: new Set(["--version", "--help", "--command"]),
+  value: "oO",
+  valueLong: new Set(["--rcfile", "--init-file"]),
+  attached: "",
+  shell: true,
+}
+const PYTHON_SPEC: InterpreterSpec = { stop: "cmVh", stopLong: new Set(["--version", "--help"]), value: "WXQ", valueLong: NO_OPTIONS, attached: "", shell: false }
+const NODE_SPEC: InterpreterSpec = {
+  stop: "epvch",
+  stopLong: new Set(["--eval", "--print", "--version", "--test", "--help", "--check"]),
+  value: "rC",
+  valueLong: new Set(["--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"]),
+  attached: "",
+  shell: false,
+}
+// `ruby -v` prints the version and then still reads the program from stdin.
+const RUBY_SPEC: InterpreterSpec = { stop: "eh", stopLong: new Set(["--version", "--help"]), value: "rICEF", valueLong: NO_OPTIONS, attached: "KWx0i", shell: false }
+const PERL_SPEC: InterpreterSpec = { stop: "eEvVh", stopLong: NO_OPTIONS, value: "IMm", valueLong: NO_OPTIONS, attached: "FCixdD", shell: false }
+const PHP_SPEC: InterpreterSpec = { stop: "rvh", stopLong: new Set(["--version", "--help"]), value: "dcz", valueLong: NO_OPTIONS, attached: "", shell: false }
+
+const SHELL_NAMES = ["sh", "bash", "zsh", "dash", "ksh", "fish", "$shell", "${shell}"]
+const SHELL_INTERPRETERS = new Set(SHELL_NAMES)
+const INTERPRETER_SPECS = new Map<string, InterpreterSpec>([
+  ...SHELL_NAMES.map((name): [string, InterpreterSpec] => [name, SHELL_SPEC]),
+  ["python", PYTHON_SPEC],
+  ["python2", PYTHON_SPEC],
+  ["python3", PYTHON_SPEC],
+  ["node", NODE_SPEC],
+  ["ruby", RUBY_SPEC],
+  ["perl", PERL_SPEC],
+  ["php", PHP_SPEC],
+])
 
 // An interpreter reads its program from stdin only when nothing else supplies
-// one: no arguments at all, `-` or /dev/stdin as the first positional, or
-// `-s` on a shell. A flag that gives the program or prints and exits (`-c`,
-// `-e`, `-m`, `-r...`, `-v`, `--version`, `--help`, `--test`) means it does not,
-// and a script path (`bash setup.sh`) runs local code, not the fetch. Plain
-// option flags (`bash -x`, `python3 -u`) keep it reading stdin.
+// one: no arguments at all, `-` or /dev/stdin as the first positional, `-s` on
+// a shell, or only options that neither supply a program nor print and exit.
+// A script path (`bash setup.sh`) runs local code, not the fetch.
 function interpreterReadsStdin(tokens: string[]): boolean {
   if (tokens.length === 0) return false
-  const name = commandName(tokens[0])
-  if (!STDIN_INTERPRETERS.has(name)) return false
+  const spec = INTERPRETER_SPECS.get(commandName(tokens[0]))
+  if (!spec) return false
   const args = tokens.slice(1).map((a) => a.replace(/["'\\]/g, ""))
-  const shell = SHELL_INTERPRETERS.has(name)
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]
     if (arg === "--") return args[i + 1] === undefined || args[i + 1] === "-" || args[i + 1] === "/dev/stdin"
     if (arg === "-" || arg === "/dev/stdin") return true
     if (arg.startsWith("--")) {
-      if (NO_STDIN_LONG.has(arg.split("=")[0])) return false
-      if (shell && SHELL_OPTIONS_WITH_VALUE.has(arg)) i++
+      const eq = arg.indexOf("=")
+      const long = eq === -1 ? arg : arg.slice(0, eq)
+      if (spec.stopLong.has(long)) return false
+      if (eq === -1 && spec.valueLong.has(long)) i++
       continue
     }
-    if (shell && SHELL_OPTIONS_WITH_VALUE.has(arg)) {
-      i++
-      continue
-    }
-    if (arg.startsWith("-") || (shell && arg.startsWith("+"))) {
+    if (arg.startsWith("-") || (spec.shell && arg.startsWith("+"))) {
       const letters = arg.slice(1)
-      if (shell) {
+      if (spec.shell) {
         // getopt-style cluster: `-c` supplies the program, `-s`/`-es` reads stdin.
         if (letters.includes("c")) return false
         if (letters.includes("s")) return true
-      } else if (NO_STDIN_SHORT.test(letters)) {
-        return false
-      } else if (PYTHON_OPTIONS_WITH_VALUE.has(arg)) {
-        i++
+      }
+      for (let k = 0; k < letters.length; k++) {
+        const letter = letters[k]
+        if (spec.stop.includes(letter)) return false
+        if (spec.attached.includes(letter)) break
+        if (spec.value.includes(letter)) {
+          if (k === letters.length - 1) i++
+          break
+        }
       }
       continue
     }
@@ -505,22 +896,50 @@ function interpreterReadsStdin(tokens: string[]): boolean {
   return true
 }
 
-// opencode drops the operators when it splits, but a recovered or unsplit
-// command still has them. Statements end at ; && || & or a newline (a `&`
-// that belongs to `2>&1`, `&>file` or `|&` is not one); inside a statement a
-// single `|` feeds the next stage.
-const STATEMENT_BREAK = /;|&&|\|\||\n|(?<![<>&|])&(?![>&|])/
-const PIPE = /\|&?/
-// Grouping characters would otherwise stick to a command word (`(curl`,
-// `bash)`, `$(wget`) and hide it.
-const GROUPING = /\$?[(){}`]/g
+// The command line a shell or `eval` is handed as a string: `bash -c '...'`,
+// `sh -lc '...'`, `eval ...`. It is read back as a command line of its own, so
+// the kill-list sees what is inside the quotes.
+function shellScriptOf(tokens: string[]): string | null {
+  if (tokens.length === 0) return null
+  const name = commandName(tokens[0])
+  if (name === "eval") return tokens.length > 1 ? tokens.slice(1).map(unquoteWord).join(" ") : null
+  if (!SHELL_INTERPRETERS.has(name)) return null
+  for (let i = 1; i < tokens.length; i++) {
+    const arg = unquoteWord(tokens[i])
+    if (arg === "--command") return i + 1 < tokens.length ? unquoteWord(tokens[i + 1]) : null
+    if (arg === "--rcfile" || arg === "--init-file") {
+      i++
+      continue
+    }
+    // A short-option cluster: every `o` / `O` in it takes the next word as its
+    // value (`-euxo pipefail`, `-eo pipefail -c`), and `-c` takes the program
+    // after those values.
+    if (/^[-+][A-Za-z]+$/.test(arg)) {
+      const values = arg.replace(/[^oO]/g, "").length
+      if (arg.startsWith("-") && arg.includes("c")) {
+        return i + 1 + values < tokens.length ? unquoteWord(tokens[i + 1 + values]) : null
+      }
+      i += values
+      continue
+    }
+    if (!arg.startsWith("-") && !arg.startsWith("+")) return null
+  }
+  return null
+}
 
+// opencode drops the operators when it splits, but a recovered or unsplit
+// command still has them. The reader above gives statements and pipeline
+// stages with quotes, groups and substitutions respected.
+//
 // True when some interpreter reads a fetched or decoded program from stdin.
 // Every segment is read once, left to right, so the cost is linear.
 //
 // Inside one segment only a real pipe counts: an interpreter at stage k is
 // fed by a pipeline that already holds a fetch or decode at an earlier
 // stage. `curl --version && node --test` or `curl -s URL | jq .` have none.
+// A group stage counts as what it contains: `{ curl U; } | python3` pipes a
+// fetch, and `curl U | (cd /tmp && bash)` feeds the group's stdin to the bash
+// inside it. A pipeline inside the group is read the same way.
 //
 // Across segments the pipe is gone (opencode's splitter drops it), so a
 // later segment that reads stdin after an earlier fetch is the only evidence
@@ -530,21 +949,46 @@ const GROUPING = /\$?[(){}`]/g
 export function fetchFeedsInterpreter(segments: string[]): boolean {
   let fetchedEarlier = false
   for (const segment of segments) {
-    let fetchedInSegment = false
-    for (const statement of segment.split(STATEMENT_BREAK)) {
-      let fetched = false
-      for (const stage of statement.split(PIPE)) {
-        const tokens = commandTokens(stage.replace(GROUPING, " "))
-        if (interpreterReadsStdin(tokens) && (fetched || fetchedEarlier)) return true
-        if (isFetchOrDecode(tokens)) {
-          fetched = true
-          fetchedInSegment = true
-        }
-      }
-    }
-    if (fetchedInSegment) fetchedEarlier = true
+    const result = bodyFeedsInterpreter(parseShell(segment), fetchedEarlier)
+    if (result.hit) return true
+    if (result.fetch) fetchedEarlier = true
   }
   return false
+}
+
+// `fed`: the body's stdin already carries a fetched or decoded program.
+// Returns whether a stdin interpreter was found, and whether the body holds a
+// fetch anywhere (what makes a group or substitution a fetch stage).
+function bodyFeedsInterpreter(body: Body, fed: boolean): { hit: boolean; fetch: boolean } {
+  let anyFetch = false
+  for (const stages of body) {
+    let fetched = false
+    for (const stage of stages) {
+      const stdinFed = fetched || fed
+      let stageFetches = false
+      if (stage.group) {
+        const inner = bodyFeedsInterpreter(stage.group, stdinFed)
+        if (inner.hit) return { hit: true, fetch: true }
+        stageFetches = inner.fetch
+      } else {
+        const tokens = commandTokens(stage.words)
+        if (stdinFed && !stage.inputRedirect && interpreterReadsStdin(tokens)) return { hit: true, fetch: true }
+        stageFetches = isFetchOrDecode(tokens)
+      }
+      // A substitution is not on the pipe, but what it fetches is the stage's
+      // output: `echo $(curl U) | bash`.
+      for (const sub of stage.subs) {
+        const inner = bodyFeedsInterpreter(sub, false)
+        if (inner.hit) return { hit: true, fetch: true }
+        if (inner.fetch) stageFetches = true
+      }
+      if (stageFetches) {
+        fetched = true
+        anyFetch = true
+      }
+    }
+  }
+  return { hit: false, fetch: anyFetch }
 }
 
 // Same target set the `rm` regex above protects, decided per token instead
@@ -586,60 +1030,371 @@ function rmTargetOf(raw: string): string {
   return t
 }
 
-// Quotes/backslashes are stripped the way normalizeCommand does it, so
-// `rm -r -f "$HOME"` reads as the same token as the bare form.
-function rmSegmentHits(segment: string): boolean {
-  // Lowercased only after commandTokens: its wrapper option tables are case
-  // sensitive (`xargs -I` takes a value, `-i` does not).
-  const text = segment.replace(/\$\{ifs\}/gi, " ").replace(/\$ifs\b/gi, " ")
-  const tokens = commandTokens(text).map((token) => token.toLowerCase())
-  // The first token is a command word. Later ones are too when they open a
-  // subshell or substitution (`echo $(rm -rf ~)`, `(rm -rf /)`).
-  for (let k = 0; k < tokens.length; k++) {
-    if (k > 0 && !OPENS_COMMAND.test(tokens[k])) continue
-    if (rmCommandAt(tokens, k)) return true
-  }
-  return false
-}
-
-const OPENS_COMMAND = /^(\$\(|\(|`)/
-
-// `tokens[start]` is an rm command word. Its arguments run until the next
-// token that opens a new command, so every token is read once per segment.
-function rmCommandAt(tokens: string[], start: number): boolean {
-  if (commandName(tokens[start].replace(/^[(`$]+/, "")) !== "rm") return false
+// `tokens` is one simple command, lowercased. Quotes and backslashes are
+// stripped the way normalizeCommand does it, so `rm -r -f "$HOME"` reads as
+// the same token as the bare form.
+//
+// An `rm` word counts wherever it sits in the command, not only as its first
+// word, because a dispatch prompt or an argument list is prose around it
+// (`run rm -rf ~ to clean up`, `xxx... rm -rf /`) and the old regex matched
+// there too. The flags and operands that follow it, up to the next `rm` word,
+// belong to it; the command ends at the statement break, so an rm in one
+// statement never borrows a target from the next. One pass, so a long run of
+// `rm` words stays linear.
+function rmWipes(tokens: string[]): boolean {
+  let active = false
   let recursive = false
   let force = false
   let targeted = false
-  for (let i = start + 1; i < tokens.length && !OPENS_COMMAND.test(tokens[i]); i++) {
-    const raw = tokens[i]
+  let noPreserveRoot = false
+  for (const raw of tokens) {
+    if (commandName(raw) === "rm") {
+      active = true
+      recursive = force = targeted = noPreserveRoot = false
+      continue
+    }
+    if (!active) continue
     const token = raw.replace(/["'`\\]/g, "")
     if (token === "--") continue
     if (token.startsWith("--")) {
       if (token === "--recursive") recursive = true
       else if (token === "--force") force = true
-      continue
-    }
-    if (token.startsWith("-") && token.length > 1) {
+      else if (token === "--no-preserve-root") noPreserveRoot = true
+    } else if (token.startsWith("-") && token.length > 1) {
       const flags = token.slice(1)
       if (flags.includes("r")) recursive = true
       if (flags.includes("f")) force = true
-      continue
+    } else {
+      const target = rmTargetOf(raw)
+      if (RM_PROTECTED_TARGETS.has(target) || HOME_USER_DIR.test(target)) targeted = true
     }
-    const target = rmTargetOf(raw)
-    if (RM_PROTECTED_TARGETS.has(target) || HOME_USER_DIR.test(target)) targeted = true
+    // `--no-preserve-root` is only ever given to wipe `/`: with the other two
+    // it is a wipe whatever operand it comes with.
+    if (recursive && force && (targeted || noPreserveRoot)) return true
   }
-  return recursive && force && targeted
+  return false
 }
 
 export function rmRemovesProtectedTarget(segments: string[]): boolean {
-  // One segment can still hold several simple commands when the original
-  // shell string was recovered (the splitter drops the operators, but the
-  // recovered command keeps them), so split on them here too.
-  for (const segment of segments) {
-    for (const simple of segment.split(/[;&|]+/)) {
-      if (rmSegmentHits(simple)) return true
+  // Several simple commands can share one segment when the original shell
+  // string was recovered (the splitter drops the operators, but the recovered
+  // command keeps them); the reader splits them. Lowercased only after
+  // commandTokens: its wrapper option tables are case sensitive (`xargs -I`
+  // takes a value, `-i` does not).
+  return someCommand(segments, (tokens) => rmWipes(tokens.map((token) => token.toLowerCase())))
+}
+
+// `find -exec rm ...` needs no rule of its own on the rm side: the rm word is
+// read wherever it sits in the command (see rmWipes). This is the start-path
+// side: directories `find` must not be pointed at with `-delete` / `-exec rm`,
+// the rm targets that are a root of the system or of a home plus the system
+// trees. A start path below them (`/tmp/build`, `/var/log`, `.`) is ordinary
+// cleanup.
+const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"])
+const FIND_PROTECTED_ROOTS = new Set(["/", "~", "/home", "/root", "/var"])
+// System trees: the directory and everything below it (`/usr/lib`, `/etc/nginx`).
+const FIND_PROTECTED_TREES = ["/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var/lib"]
+
+function findStartIsProtected(target: string): boolean {
+  if (FIND_PROTECTED_ROOTS.has(target) || HOME_USER_DIR.test(target)) return true
+  return FIND_PROTECTED_TREES.some((tree) => target === tree || target.startsWith(tree + "/"))
+}
+
+function findDeletesProtectedRoot(tokens: string[]): boolean {
+  const args = tokens.slice(1)
+  let i = 0
+  // Global options come before the start paths.
+  while (i < args.length) {
+    const option = args[i].replace(/["'\\]/g, "")
+    if (option === "-H" || option === "-L" || option === "-P" || /^-O\d$/.test(option)) i++
+    else if (option === "-D") i += 2
+    else break
+  }
+  let protectedStart = false
+  for (; i < args.length; i++) {
+    const arg = args[i].replace(/["'\\]/g, "")
+    if (arg.startsWith("-") || arg === "(" || arg === ")" || arg === "!" || arg === ",") break
+    const target = rmTargetOf(args[i].toLowerCase())
+    if (findStartIsProtected(target)) protectedStart = true
+  }
+  if (!protectedStart) return false
+  for (; i < args.length; i++) {
+    const arg = args[i].replace(/["'\\]/g, "")
+    if (arg === "-delete") return true
+    if (FIND_EXEC.has(arg) && i + 1 < args.length && commandName(args[i + 1]) === "rm") return true
+  }
+  return false
+}
+
+const POWER_COMMANDS = new Set(["shutdown", "reboot", "halt", "poweroff"])
+const SYSTEMCTL_POWER_VERBS = new Set(["poweroff", "reboot", "halt", "kexec"])
+
+// Power-off and reboot are judged by the command word, not by the word
+// appearing anywhere: `grep -rn shutdown src/`, `git commit -m "handle
+// reboot"` and `echo halt` run nothing of the sort.
+function powerOrFindHits(tokens: string[]): boolean {
+  if (tokens.length === 0) return false
+  const name = commandName(tokens[0])
+  if (POWER_COMMANDS.has(name)) return true
+  if (name === "init") {
+    const level = tokens.length > 1 ? tokens[1].replace(/["'\\]/g, "") : ""
+    return level === "0" || level === "6"
+  }
+  if (name === "systemctl" || name === "loginctl") {
+    const args = tokens.slice(1).map((t) => t.replace(/["'\\]/g, ""))
+    for (let i = 0; i < args.length; i++) {
+      // The value of `-H host` / `-M machine` is not the verb.
+      if (args[i] === "-H" || args[i] === "--host" || args[i] === "-M" || args[i] === "--machine") i++
+      else if (!args[i].startsWith("-")) return SYSTEMCTL_POWER_VERBS.has(args[i].toLowerCase())
     }
+    return false
+  }
+  return name === "find" && findDeletesProtectedRoot(tokens)
+}
+
+// How many levels of `bash -c '...'` / `eval` inside one another are read back
+// as command lines. Real commands nest once or twice; the limit keeps the
+// cost bounded on input built to nest.
+const MAX_NESTED_SCRIPT_DEPTH = 3
+
+// One budget of characters for all the re-reading of nested text inside a
+// single `isCatastrophic` call (`bash -c` scripts, handed-over command lines,
+// quoted payloads). Each of those is a fresh parse, and input built so that
+// every nested script holds almost the whole input (`bash -c "$(bash -c "$(`
+// repeated) costs one full parse per path through it, cubic in the nesting
+// width. A call that runs the budget out stops and fails closed: it is
+// treated as catastrophic, and the request is denied with the kill-list
+// message instead of stalling the event loop.
+interface ScanBudget {
+  left: number
+}
+const SCAN_BUDGET_EXTRA = 4096
+// Each re-read costs at least this much, so many tiny ones cannot add up to
+// unbounded per-call overhead. A full rule pass (a script or a handed-over
+// command line) is dearer than the wipe check on one quoted payload.
+const MIN_SCAN_COST = 32
+const MIN_PAYLOAD_COST = 8
+
+function newScanBudget(inputLength: number): ScanBudget {
+  return { left: 2 * inputLength + SCAN_BUDGET_EXTRA }
+}
+
+// False when the budget is spent.
+function charge(scan: ScanBudget, chars: number, floor: number = MIN_SCAN_COST): boolean {
+  scan.left -= Math.max(chars, floor)
+  return scan.left >= 0
+}
+
+function nestedScripts(segments: string[]): string[] {
+  const scripts = new Set<string>()
+  someCommand(segments, (tokens) => {
+    const script = shellScriptOf(tokens)
+    if (script) scripts.add(script)
+    return false
+  })
+  return [...scripts]
+}
+
+// Like walkStages, one pipeline at a time: a pipeline's stages are what tell
+// `printf "rm -rf ~" | bash` from a lone printf.
+function walkPipelines(body: Body, visit: (stages: Stage[]) => boolean): boolean {
+  for (const stages of body) {
+    if (visit(stages)) return true
+    for (const stage of stages) {
+      if (stage.group && walkPipelines(stage.group, visit)) return true
+      for (const sub of stage.subs) if (walkPipelines(sub, visit)) return true
+    }
+  }
+  return false
+}
+
+// Index of the first word after the options that start at `start`: the host of
+// `ssh`, the container of `docker exec`. `valueLetters` / `valueLong` name the
+// options that take a separate value, and `--` ends the options.
+function afterOptions(tokens: string[], start: number, valueLetters: string, valueLong: ReadonlySet<string>): number {
+  let i = start
+  while (i < tokens.length) {
+    const t = tokens[i].replace(/["'\\]/g, "")
+    if (t === "--") return i + 1
+    if (!t.startsWith("-") || t === "-") return i
+    if (t.startsWith("--")) {
+      i += !t.includes("=") && valueLong.has(t) ? 2 : 1
+      continue
+    }
+    let consumes = false
+    for (let k = 1; k < t.length; k++) {
+      if (valueLetters.includes(t[k])) {
+        consumes = k === t.length - 1
+        break
+      }
+    }
+    i += consumes ? 2 : 1
+  }
+  return i
+}
+
+const NO_LONG_OPTIONS: ReadonlySet<string> = new Set()
+const SSH_VALUE_LETTERS = "bBcDEeFIiJLlmOopQRSWw"
+const DOCKER_EXEC_LONG = new Set(["--env", "--user", "--workdir", "--env-file", "--detach-keys", "--index"])
+
+// Command lines that a command hands to another shell or program to run, as
+// text: what follows `ssh <host>`, `docker exec <container>`, `kubectl exec
+// ... --`, `su -c`, `find -exec` and so on. `ssh` and `watch` give the words
+// to a shell, which strips their quotes; the others run the words as they are,
+// so their quotes stay. The caller reads each one as a command line of its own.
+function handedScripts(tokens: string[]): string[] {
+  const scripts: string[] = []
+  const name = commandName(tokens[0])
+  const raw = (from: number) => (from < tokens.length ? scripts.push(tokens.slice(from).join(" ")) : 0)
+  const afterHost = (from: number) => (from < tokens.length ? scripts.push(tokens.slice(from).map(unquoteWord).join(" ")) : 0)
+  switch (name) {
+    case "ssh":
+      afterHost(afterOptions(tokens, 1, SSH_VALUE_LETTERS, NO_LONG_OPTIONS) + 1)
+      break
+    case "watch":
+      afterHost(afterOptions(tokens, 1, "n", new Set(["--interval"])))
+      break
+    case "su":
+    case "runuser":
+    case "flock":
+      for (let i = 1; i < tokens.length; i++) {
+        const t = unquoteWord(tokens[i])
+        if (t === "--command" || (name !== "flock" && /^-[A-Za-z]*c$/.test(t)) || (name === "flock" && t === "-c")) {
+          if (i + 1 < tokens.length) scripts.push(unquoteWord(tokens[i + 1]))
+          return scripts
+        }
+        if (t.startsWith("--command=")) {
+          scripts.push(t.slice("--command=".length))
+          return scripts
+        }
+      }
+      // `flock <lockfile> <command...>`
+      if (name === "flock") raw(afterOptions(tokens, 1, "wE", new Set(["--timeout", "--wait", "--conflict-exit-code"])) + 1)
+      break
+    case "docker":
+    case "podman": {
+      const exec = tokens.slice(1, 6).findIndex((t) => unquoteWord(t) === "exec")
+      if (exec !== -1) raw(afterOptions(tokens, exec + 2, "euw", DOCKER_EXEC_LONG) + 1)
+      break
+    }
+    case "kubectl":
+    case "oc": {
+      const exec = tokens.slice(1, 9).findIndex((t) => unquoteWord(t) === "exec")
+      if (exec !== -1) {
+        const dashes = tokens.findIndex((t, i) => i > exec + 1 && unquoteWord(t) === "--")
+        if (dashes !== -1) raw(dashes + 1)
+      }
+      break
+    }
+    case "nsenter":
+      raw(afterOptions(tokens, 1, "tSG", NO_LONG_OPTIONS))
+      break
+    case "chroot":
+      raw(afterOptions(tokens, 1, "", new Set(["--userspec", "--groups"])) + 1)
+      break
+    case "find":
+      for (let i = 1; i < tokens.length; i++) {
+        if (!FIND_EXEC.has(unquoteWord(tokens[i]))) continue
+        let end = i + 1
+        while (end < tokens.length && !/^\\?[;+]$/.test(tokens[end])) end++
+        if (end > i + 1) scripts.push(tokens.slice(i + 1, end).join(" "))
+      }
+      break
+    case "git":
+      // `git -c alias.x='!cmd'` / `git config alias.x '!cmd'`: an alias that
+      // starts with `!` runs a shell command.
+      for (let i = 1; i < tokens.length; i++) {
+        const m = /^(?:alias\.[^=]*=)?!([\s\S]+)$/.exec(unquoteWord(tokens[i]))
+        if (m) scripts.push(m[1])
+      }
+      break
+  }
+  return scripts
+}
+
+// The text between the quotes of every quoted span in a word that holds
+// whitespace, or that is a git alias value starting with `!`.
+function quotedPayloads(word: string): string[] {
+  if (!word.includes("'") && !word.includes('"')) return []
+  const payloads: string[] = []
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i]
+    if (c === "\\") {
+      i++
+    } else if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      const stop = end === -1 ? word.length : end
+      const content = word.slice(i + 1, stop)
+      if (/\s/.test(content)) payloads.push(content)
+      i = stop
+    } else if (c === '"') {
+      let end = i + 1
+      while (end < word.length && word[end] !== '"') end += word[end] === "\\" ? 2 : 1
+      const content = unquoteWord(word.slice(i, end + 1))
+      if (/\s/.test(content)) payloads.push(content)
+      i = end
+    }
+  }
+  return payloads
+}
+
+// A quoted word that holds whitespace is read as a command line, and only the
+// wipe rule is applied to it: the old regexes stripped the quotes and so
+// caught `ssh prod 'rm -rf /'`, `watch 'rm -rf ~'` and `git -c alias.x='!rm
+// -rf ~' x` whatever the command around them. A bare `shutdown` inside a quote
+// (`grep -rn "shutdown" src/`) is not in command position and is not judged
+// here; the power rule only reads text that a command hands over to run (see
+// handsOverCatastrophic). Prose that spells out a wipe (`echo "rm -rf /"`) is
+// denied too, as it always was: the gate cannot tell it from the command, and
+// the cost of the wrong guess is asymmetric.
+function quotedWipes(text: string, depth: number, scan: ScanBudget): boolean {
+  if (!charge(scan, text.length, MIN_PAYLOAD_COST)) return true
+  return walkStages(parseShell(text.replace(/^\s*!/, "")), (stage) => {
+    if (stage.group) return false
+    if (rmWipes(commandTokens(stage.words).map((token) => token.toLowerCase()))) return true
+    if (depth >= MAX_NESTED_SCRIPT_DEPTH) return false
+    for (const word of stage.words) {
+      for (const payload of quotedPayloads(word)) if (quotedWipes(payload, depth + 1, scan)) return true
+    }
+    return false
+  })
+}
+
+// The rules that need a command's neighbours: the command line a command
+// hands over to run (ssh, docker exec, su -c, ...) is judged by every rule as
+// a command line of its own, the text an echo or printf pipes into a shell the
+// same, and any other quoted payload is read for a wipe.
+function handsOverCatastrophic(segments: string[], depth: number, scan: ScanBudget): boolean {
+  if (depth >= MAX_NESTED_SCRIPT_DEPTH) return false
+  for (const segment of segments) {
+    const hit = walkPipelines(parseShell(segment), (stages) => {
+      const tokensOf = stages.map((stage) => (stage.group ? [] : commandTokens(stage.words)))
+      let lastShell = -1
+      tokensOf.forEach((tokens, k) => {
+        if (k > 0 && !stages[k].inputRedirect && tokens.length > 0 && SHELL_INTERPRETERS.has(commandName(tokens[0])) && interpreterReadsStdin(tokens)) lastShell = k
+      })
+      for (let k = 0; k < stages.length; k++) {
+        const tokens = tokensOf[k]
+        if (tokens.length === 0) continue
+        const scripts = handedScripts(tokens)
+        const name = commandName(tokens[0])
+        if (k < lastShell && (name === "echo" || name === "printf")) scripts.push(tokens.slice(1).map(unquoteWord).join(" "))
+        if (scripts.length > 0) {
+          for (const script of scripts) {
+            if (!charge(scan, script.length)) return true
+            if (catastrophicAt(script, script, depth + 1, scan)) return true
+          }
+          continue
+        }
+        // `bash -c '...'` is read as a script by nestedScripts.
+        if (shellScriptOf(tokens) !== null) continue
+        for (const word of stages[k].words) {
+          for (const payload of quotedPayloads(word)) if (quotedWipes(payload, depth + 1, scan)) return true
+        }
+      }
+      return false
+    })
+    if (hit) return true
   }
   return false
 }
@@ -705,15 +1460,24 @@ export function forcePushRefspec(segments: string[]): boolean {
 // a successful read is already an irreversible disclosure (the contents
 // reach the agent's model provider), and live red-team runs showed Jev
 // allowing ~/.ssh/id_rsa in one of three. Deterministic, before any network
-// call. Nothing is anchored to a home prefix: `~`, `$HOME`, `${HOME}`,
-// `/home/<user>` and `/root` all leave the same suffix to match.
+// call. `.ssh` and the single-file names match anywhere; `.aws`, `.docker`,
+// `.kube` and `.gnupg` are also names a project uses for its own files
+// (`docker build -f .docker/Dockerfile .`), so as directories they need a home
+// or root prefix: `~/`, `$HOME/`, `${HOME}/`, `/home/<user>/`, `/root/`
+// (`/Users/<user>/` and `~user/` too).
+const HOME_PREFIX = String.raw`(?:~[\w.-]*|\$home|\$\{home\}|/home/[^/\s]+|/Users/[^/\s]+|/root)[/\\]`
 const CREDENTIAL_STORE = [
   // The credential directories themselves, or anything under them. The name
   // must end there: a `.` or `-` or word character after it means another
   // thing (`www.ssh.com`, `.ssh-agent-notes.md`, `.dockerignore`), anything
   // else is the directory (`~/.ssh*`, `~/.ssh>x`, `~/.ssh,`, `~/.ssh}`,
   // `~/.aws/cred*`, `tar czf - ~/.aws`).
-  /\.(?:ssh|aws|docker|kube|gnupg)(?![\w.-])/i,
+  /\.ssh(?![\w.-])/i,
+  new RegExp(`${HOME_PREFIX}\\.(?:aws|docker|kube|gnupg)(?![\\w.-])`, "i"),
+  // Unambiguous wherever the directory sits: each names the credential file.
+  /\.aws[/\\]credentials\b/i,
+  /\.docker[/\\]config\.json\b/i,
+  /\.kube[/\\]config\b/i,
   // opencode's data directory holds auth.json and the session history.
   /\.local[/\\]share[/\\]opencode(?![\w.-])/i,
   // Prints every kubeconfig credential unredacted.
@@ -750,11 +1514,27 @@ export function touchesCredentialStore(text: string): boolean {
 // pipes available, matching fragments by order would flag `curl ... && node
 // --test` as a pipe-to-shell. Every other rule still scans all of `joined`.
 export function isCatastrophic(joined: string, original?: string | null): boolean {
-  // Segment rule first: it is a single linear pass and covers the live
+  return catastrophicAt(joined, original ?? null, 0, newScanBudget(joined.length))
+}
+
+function catastrophicAt(joined: string, original: string | null, depth: number, scan: ScanBudget): boolean {
+  const lines = joined.split("\n")
+  // Token rules first: each is a single linear pass and covers the live
   // split shape even when the original command could not be recovered.
-  if (fetchFeedsInterpreter(original ? [original] : joined.split("\n"))) return true
-  if (rmRemovesProtectedTarget(joined.split("\n"))) return true
-  if (forcePushRefspec(joined.split("\n"))) return true
+  if (fetchFeedsInterpreter(original ? [original] : lines)) return true
+  if (rmRemovesProtectedTarget(lines)) return true
+  if (someCommand(lines, powerOrFindHits)) return true
+  if (forcePushRefspec(lines)) return true
+  // `bash -c '...'` and `eval ...` carry a command line in a string. Each one
+  // is judged as a command of its own, with its real pipes, so a wipe or a
+  // `curl | sh` inside the quotes is not hidden by them.
+  if (depth < MAX_NESTED_SCRIPT_DEPTH) {
+    if (handsOverCatastrophic(lines, depth, scan)) return true
+    for (const script of nestedScripts(lines)) {
+      if (!charge(scan, script.length)) return true
+      if (catastrophicAt(script, script, depth + 1, scan)) return true
+    }
+  }
   const step = CATASTROPHIC_CHECK_MAX_CHARS - CATASTROPHIC_WINDOW_OVERLAP
   for (let start = 0; start === 0 || start + CATASTROPHIC_WINDOW_OVERLAP < joined.length; start += step) {
     const window = joined.slice(start, start + CATASTROPHIC_CHECK_MAX_CHARS)
