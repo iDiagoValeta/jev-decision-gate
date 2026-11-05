@@ -8,5 +8,10 @@
     "skipLibCheck": true,
     "outDir": "dist"
   },
-  "include": ["jev-decision-gate/index.ts", "jev-decision-gate/index.test.ts"]
+  "include": [
+    "jev-decision-gate/index.ts",
+    "jev-decision-gate/index.test.ts",
+    "jev-decision-gate/redteam.ts",
+    "jev-decision-gate/redteam.test.ts"
+  ]
 }

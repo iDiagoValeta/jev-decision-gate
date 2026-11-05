@@ -9,30 +9,28 @@ import { fileURLToPath } from "node:url"
 // Checked against a NORMALIZED command string (lowercased, quotes/
 // separators collapsed) so trivial obfuscation does not bypass them.
 //
-// Known, accepted false-positive trade-off (present since quote-stripping
-// was added, widened by backslash-stripping): stripping quotes/backslashes
-// to defeat obfuscation also means descriptive text that merely MENTIONS a
-// dangerous command inside quotes can normalize into something that matches
-// — e.g. `echo "talk about rm -rf / here"` or `echo "rm -r\f / in docs"`
-// both normalize to a string containing `rm -rf /`. This fails closed (the
-// command is rejected, not silently allowed) so it's a usability cost, not
-// a security hole, and there is no narrower fix available: restricting
-// backslash-stripping to avoid this would reopen the r\m obfuscation bypass
-// it exists to close (confirmed — `r\m` has a backslash between two
-// letters, same shape as the false-positive case). A real shell parser
-// could tell prose from syntax; a regex-based kill-list can't.
+// Only what a regex can decide stays here. rm, find, power-off and the
+// fetch-to-interpreter rules are token rules over a parsed command (see
+// `parseShell`): their old regexes spanned statements (`rm -rf dist && tsc -p .`
+// matched `.` as a target), matched a word anywhere (`git commit -m "handle
+// reboot"`) and backtracked exponentially on a long script.
+//
+// Known, accepted false-positive trade-off for the patterns below: stripping
+// quotes/backslashes to defeat obfuscation also means descriptive text that
+// merely MENTIONS a dangerous command inside quotes can normalize into
+// something that matches, e.g. `echo "DROP TABLE users"`. This fails closed
+// (the command is rejected, not silently allowed) so it's a usability cost,
+// not a security hole. A real shell parser could tell prose from syntax; a
+// regex kill-list can't, and the rules that matter most to everyday commands
+// have moved to the token rules for that reason.
 const CATASTROPHIC = [
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+(\S*\s+)*(\/(?!\S)|\/\*|~(?!\S)|~\/(?!\S)|\$home(?!\S)|\$home\/(?!\S)|\${home}(?!\S)|\${home}\/(?!\S)|\/home(?!\S)|\/home\/[^/\s]+(?!\S)|\/root(?!\S)|\.(?!\S)|\.\/(?!\S)|\.\.(?!\S)|\.\.\/(?!\S))/,
-  /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+.*--no-preserve-root/,
   /\bmkfs\b/,
   /\bdd\b\s+.*\bof=\/dev\//,
   />\s*\/dev\/(sd[a-z]|nvme\d+n\d+|vd[a-z]|hd[a-z])/,
-  /\b(shutdown|reboot|halt|poweroff|init\s+[06])\b/,
   /\bchmod\s+(-R\s+)?777\s+(\/|~|\$home|\${home}|\/home|\/etc|\/usr)/,
   /\bchown\s+-R\s+\S+\s+(\/|~|\/etc|\/usr)/,
   /:\(\)\s*\{\s*:\|\:&\s*\}\s*;/,
   /\bsudo\s+rm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\s+/,
-  /\bfind\s+\/\S*\s+.*-delete\b/,
   /\bcurl\b.*\|\s*(sh|bash|sudo\s+bash)\b/,
   /\bwget\b.*\|\s*(sudo\s+bash|sh|bash)\b/,
   /\bbase64\s+(-d|--decode)\b.*\|\s*(sh|bash)\b/,
@@ -41,11 +39,20 @@ const CATASTROPHIC = [
   // fetch (curl/wget) directly inside the substitution counts, so local
   // `eval "$(ssh-agent -s)"` or `source <(kubectl completion bash)` pass.
   /\b(sh|bash|zsh|dash|ksh)\s+(-[a-z]+\s+)*-[a-z]*c\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
+  // The same for the other interpreters, which take the program as an
+  // argument: `python3 -c "$(curl ...)"`, `perl -e`, `node -e`, `ruby -e`,
+  // `php -r`. Only a fetch inside the substitution counts, as above.
+  /\b(python[23]?|perl|ruby|node|php)\s+(-[a-z]+\s+)*-[a-z]*[cer]\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
   /\beval\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
-  /(^|[\s(])(source|sh|bash|zsh|\.)\s+<\(\s*(curl|wget)\b/,
+  // Process substitution: `python3 <(curl ...)` hands the fetched file to
+  // the interpreter as a script, the same as `bash <(curl ...)`.
+  /(^|[\s(])(source|sh|bash|zsh|\.|python[23]?|perl|ruby|node|php)\s+<\(\s*(curl|wget)\b/,
   /\b(powershell|pwsh)\b.*\biex\b/i,
   /\bgit\s+push\b.*--(force|mirror)\b/,
   /\bgit\s+push\b.*\s+(-f)(?!\S)/,
+  // `+refspec` force pushes (`git push origin +main`) are matched by
+  // forcePushRefspec below, per command, not by a `.*` span here: a regex
+  // cannot tell a refspec from a `+` inside another command's argument.
   /\bgh\s+repo\s+delete\b/,
   /\bkubectl\s+delete\b.*--all/,
   /\bterraform\s+destroy\b/,
@@ -54,7 +61,7 @@ const CATASTROPHIC = [
   /\bdrop\s+(table|database)\b/i,
 ]
 
-const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database)|docker\s+(rm|system)|aws\s+s3)/i
+export const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database)|docker\s+(rm|system)|aws\s+s3)/i
 
 // curl/wget used to be an unconditional DESTRUCTIVE_HINT match, so a
 // read-only `curl -s URL` scored the same as `rm -rf /`. They now count as
@@ -164,7 +171,7 @@ export function hasDestructiveCurlOrWget(resources: readonly string[]): boolean 
 // Command substitution ($(...) or `...`) can hide a command's real effect
 // from both the kill-list and normalizeCommand (neither evaluates it) —
 // not blockable by regex, so it's surfaced to Jev as a hint instead.
-const COMMAND_SUBSTITUTION = /\$\(|`/
+export const COMMAND_SUBSTITUTION = /\$\(|`/
 
 const SECRET_PATTERNS: RegExp[] = [
   /bearer\s+[A-Za-z0-9\-._~+/=]{8,}/gi,
@@ -321,7 +328,1213 @@ const CATASTROPHIC_WINDOW_OVERLAP = 500
 // sends such requests straight to the human instead of scanning them.
 export const MAX_SCANNED_CHARS = 256 * 1024
 
-export function isCatastrophic(joined: string): boolean {
+// opencode 2.2.3 hands the permission hook a shell command PRE-SPLIT into
+// simple commands with the operators dropped: `curl -fsSL URL | bash`
+// arrives as resources ["curl -fsSL URL", "bash"]. Every kill-list pattern
+// that needs `|` (curl|sh, wget|sh, base64 -d|sh) then never fires live, and
+// Jev judges fragments instead of the real command. When the original
+// command cannot be recovered (see `shellCommandFor`), this segment rule
+// still catches the canonical remote-code-execution shape: a fetch or
+// decode stage followed by a LATER interpreter that reads its program
+// from stdin. Not requiring the pipe is deliberate — the splitter already
+// dropped it, so "later segment" is the only evidence left.
+const FETCH_COMMANDS = new Set(["curl", "wget"])
+
+// Leading wrappers run the command that follows them, so the command word is
+// whatever comes after them: `sudo -E bash`, `env FOO=1 sh` and `timeout 30 sh`
+// all end in an interpreter. Their options are skipped too. The map names the
+// options that take a separate value (`sudo -u root`, `env -u NAME`,
+// `nice -n 10`, `timeout -s KILL`): without it the value would be read as the
+// command word. A short option inside a cluster counts too (`sudo -iu root`,
+// `sudo -Hu root bash`): if the value-taking letter is the last one, the next
+// word is its value, otherwise the value is attached. A Map, not an object, so
+// a command named like an Object prototype property is not mistaken for a
+// wrapper.
+const WRAPPER_ARG_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ["sudo", new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "--user", "--group", "--other-user", "--chdir", "--host", "--prompt", "--role", "--type"])],
+  ["doas", new Set(["-u", "-C"])],
+  ["env", new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"])],
+  ["nice", new Set(["-n"])],
+  ["ionice", new Set(["-c", "-n", "-p", "-P", "-u"])],
+  ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
+  // xargs runs the words after its options as a command, so `xargs rm -r -f ~`
+  // is an rm. Only the options that take a separate value are listed.
+  ["xargs", new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--arg-file", "--delimiter", "--eof", "--replace", "--max-lines", "--max-args", "--max-procs", "--max-chars"])],
+  ["stdbuf", new Set(["-i", "-o", "-e", "--input", "--output", "--error"])],
+])
+// `busybox rm ...` runs the applet named next, like any other wrapper.
+const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time", "busybox", "setsid"])
+// `sudo -s` / `sudo -i` with nothing after them start a shell that reads its
+// program from stdin, exactly like a bare `bash`.
+const SHELL_FLAG_WRAPPERS = new Set(["sudo", "doas"])
+const SHELL_FLAG = /^-[a-z]*[si]/i
+// `command -v curl` / `command -V node` only look a command up and run
+// nothing, so what follows is not a command word. (`type` and `which` need no
+// rule: they are not wrappers, so their own name is already the command word
+// and what follows is never read as one.)
+const COMMAND_LOOKUP_FLAG = /^-[a-zA-Z]*[vV][a-zA-Z]*$/
+
+// True when the wrapper's option `opt` is followed by its value as a
+// separate word. `--user root` and `-u root` do; `--user=root`, `-uroot` and
+// a cluster whose value letter is not last (`-n10`) carry the value inside.
+function optionConsumesNext(wrapper: string, opt: string): boolean {
+  const withValue = WRAPPER_ARG_OPTIONS.get(wrapper)
+  if (!withValue) return false
+  if (opt.startsWith("--")) return withValue.has(opt)
+  const letters = opt.slice(1)
+  for (let k = 0; k < letters.length; k++) {
+    if (withValue.has("-" + letters[k])) return k === letters.length - 1
+  }
+  return false
+}
+
+// Words of one simple command with its leading wrappers and VAR=value
+// assignments removed. Wrappers can nest (`sudo env bash`), so each one is
+// entered in turn and its options are skipped as they come.
+function commandTokens(tokens: string[]): string[] {
+  let i = 0
+  let wrapper: string | null = null
+  let shellFlag = false
+  let timeoutDurationSeen = false
+  while (i < tokens.length) {
+    const token = tokens[i]
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      i++
+      continue
+    }
+    const name = commandName(token)
+    if (PLAIN_WRAPPERS.has(name) || WRAPPER_ARG_OPTIONS.has(name)) {
+      wrapper = name
+      shellFlag = false
+      timeoutDurationSeen = false
+      i++
+      continue
+    }
+    if (wrapper === null) break
+    if (token.startsWith("-") && token.length > 1) {
+      if (wrapper === "command" && COMMAND_LOOKUP_FLAG.test(token)) return []
+      if (SHELL_FLAG_WRAPPERS.has(wrapper) && (SHELL_FLAG.test(token) || token === "--shell" || token === "--login")) {
+        shellFlag = true
+      }
+      i += optionConsumesNext(wrapper, token) ? 2 : 1
+      continue
+    }
+    // timeout's first operand is the duration, not the command.
+    if (wrapper === "timeout" && !timeoutDurationSeen) {
+      timeoutDurationSeen = true
+      i++
+      continue
+    }
+    break
+  }
+  const rest = tokens.slice(i)
+  if (rest.length === 0 && shellFlag) return ["sh"]
+  return rest
+}
+
+// Quotes and backslashes inside a command word do not change which command
+// runs (`"rm"`, `r\m`, `\bash`, `b""ash` are all rm/bash), so they come out
+// before the path is cut off.
+function commandName(word: string): string {
+  const bare = word.replace(/["'\\]/g, "")
+  return (bare.split("/").pop() ?? bare).toLowerCase()
+}
+
+// A shell word as the shell would hand it to the command: quotes removed,
+// backslash escapes resolved. Used where the CONTENT of a word is read as
+// another command line (`bash -c '...'`, `eval ...`).
+function unquoteWord(word: string): string {
+  let out = ""
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i]
+    if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      const stop = end === -1 ? word.length : end
+      out += word.slice(i + 1, stop)
+      i = stop
+    } else if (c === '"') {
+      for (i++; i < word.length && word[i] !== '"'; i++) {
+        if (word[i] === "\\" && i + 1 < word.length && '"\\$`'.includes(word[i + 1])) i++
+        out += word[i]
+      }
+    } else if (c === "\\") {
+      i++
+      if (i < word.length) out += word[i]
+    } else {
+      out += c
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// A small shell reader. Every token rule below used to split the text on
+// `[;&|]` or read it word by word with a regex, which cannot tell an operator
+// from a quoted one, a group from its contents, or a statement from the next.
+// This one pass (linear, no backtracking) gives them the structure instead:
+// statements split on `;` `&&` `||` `&` and newlines, pipeline stages split on
+// `|`, quotes kept inside their word, redirections taken out of the words, and
+// `( ... )`, `{ ...; }`, `$( ... )`, backticks and `<( ... )` read as nested
+// bodies. It is not a full shell grammar (no heredoc bodies, no `case`, no
+// keywords such as `then`/`do`): it reads what the kill-list needs.
+// ---------------------------------------------------------------------------
+interface Stage {
+  // Words of the simple command, quotes kept, redirections removed.
+  words: string[]
+  // The whole stage is a `( ... )` or `{ ...; }` group.
+  group: Body | null
+  // Substitutions and subshells met inside the stage's words.
+  subs: Body[]
+  // Stdin comes from a file or here-string, not from the pipeline.
+  inputRedirect: boolean
+}
+type Body = Stage[][]
+
+// Beyond this nesting `(` and `$(` are plain characters, so adversarial input
+// cannot overflow the stack and the cost stays linear.
+const MAX_GROUP_DEPTH = 32
+const PLAIN_RUN = /[^\\'"$`(){}\s;&|<>#]+/y
+
+function parseShell(input: string): Body {
+  // `${IFS}` and `$IFS` are whitespace to the shell, so `rm${IFS}-rf${IFS}/`
+  // is an ordinary rm.
+  const text = input.replace(/\$\{ifs\}/gi, " ").replace(/\$ifs\b/gi, " ")
+  const n = text.length
+  let pos = 0
+
+  function parseBody(depth: number, closer: ")" | "}" | "`" | null): Body {
+    const body: Body = []
+    let stages: Stage[] = []
+    let stage: Stage = { words: [], group: null, subs: [], inputRedirect: false }
+    let word = ""
+    let inWord = false
+    let redirectPending = false
+
+    const endWord = () => {
+      if (!inWord) return
+      inWord = false
+      const done = word
+      word = ""
+      // The target of a bare `>` / `<` is not an argument of the command.
+      if (redirectPending) redirectPending = false
+      else stage.words.push(done)
+    }
+    const endStage = () => {
+      endWord()
+      redirectPending = false
+      if (stage.words.length > 0 || stage.group || stage.subs.length > 0) stages.push(stage)
+      stage = { words: [], group: null, subs: [], inputRedirect: false }
+    }
+    const endStatement = () => {
+      endStage()
+      if (stages.length > 0) body.push(stages)
+      stages = []
+    }
+    const atCommandStart = () => !inWord && stage.words.length === 0 && !stage.group
+    // Reads a nested body whose opener is already consumed; its raw text stays
+    // in the enclosing word so `bash -c "..."` can be read back later.
+    const nested = (start: number, nestedCloser: ")" | "`"): void => {
+      stage.subs.push(parseBody(depth + 1, nestedCloser))
+      word += text.slice(start, pos)
+      inWord = true
+    }
+
+    while (pos < n) {
+      const c = text[pos]
+      switch (c) {
+        case "\\": {
+          const next = text[pos + 1]
+          if (next === undefined) pos++
+          // A line continuation joins the lines.
+          else if (next === "\n") pos += 2
+          // `rm\ -rf\ /` is one word to a real shell. normalizeCommand reads it
+          // as the spaced command, and so does this, so an escaped space ends
+          // the word instead of hiding the wipe inside it.
+          else if (next === " " || next === "\t") {
+            endWord()
+            pos += 2
+          } else {
+            word += c + next
+            inWord = true
+            pos += 2
+          }
+          break
+        }
+        case "'": {
+          const end = text.indexOf("'", pos + 1)
+          const stop = end === -1 ? n : end + 1
+          word += text.slice(pos, stop)
+          inWord = true
+          pos = stop
+          break
+        }
+        case '"': {
+          word += c
+          inWord = true
+          pos++
+          while (pos < n) {
+            const d = text[pos]
+            if (d === '"') {
+              word += d
+              pos++
+              break
+            }
+            if (d === "\\") {
+              word += text.slice(pos, pos + 2)
+              pos += 2
+            } else if (d === "$" && text[pos + 1] === "(" && depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos += 2
+              nested(start, ")")
+            } else if (d === "`" && closer !== "`" && depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos++
+              nested(start, "`")
+            } else if (d === "`") {
+              break
+            } else {
+              word += d
+              pos++
+            }
+          }
+          break
+        }
+        case "$":
+          if (text[pos + 1] === "(" && depth < MAX_GROUP_DEPTH) {
+            const start = pos
+            pos += 2
+            nested(start, ")")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "`":
+          if (closer === "`") {
+            endStatement()
+            pos++
+            return body
+          }
+          if (depth < MAX_GROUP_DEPTH) {
+            const start = pos
+            pos++
+            nested(start, "`")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "(":
+          if (depth >= MAX_GROUP_DEPTH) {
+            word += c
+            inWord = true
+            pos++
+          } else if (atCommandStart()) {
+            pos++
+            stage.group = parseBody(depth + 1, ")")
+          } else {
+            pos++
+            stage.subs.push(parseBody(depth + 1, ")"))
+          }
+          break
+        case ")":
+          if (closer === ")") {
+            endStatement()
+            pos++
+            return body
+          }
+          endWord()
+          pos++
+          break
+        case "{":
+          if (depth < MAX_GROUP_DEPTH && atCommandStart() && (pos + 1 >= n || /\s/.test(text[pos + 1]))) {
+            pos++
+            stage.group = parseBody(depth + 1, "}")
+          } else {
+            word += c
+            inWord = true
+            pos++
+          }
+          break
+        case "}":
+          if (closer === "}" && atCommandStart()) {
+            endStatement()
+            pos++
+            return body
+          }
+          word += c
+          inWord = true
+          pos++
+          break
+        case ";":
+        case "\n":
+          endStatement()
+          pos++
+          break
+        case "&":
+          if (text[pos + 1] === "&") {
+            endStatement()
+            pos += 2
+          } else if (text[pos + 1] === ">") {
+            // `&>file` / `&>>file`
+            endWord()
+            pos += text[pos + 2] === ">" ? 3 : 2
+            redirectPending = true
+          } else {
+            endStatement()
+            pos++
+          }
+          break
+        case "|":
+          if (text[pos + 1] === "|") {
+            endStatement()
+            pos += 2
+          } else {
+            endStage()
+            pos += text[pos + 1] === "&" ? 2 : 1
+          }
+          break
+        case "<":
+        case ">": {
+          if (text[pos + 1] === "(") {
+            // Process substitution: the fetched file is an argument.
+            if (depth < MAX_GROUP_DEPTH) {
+              const start = pos
+              pos += 2
+              nested(start, ")")
+            } else {
+              word += c
+              inWord = true
+              pos++
+            }
+            break
+          }
+          // `2>file`: the leading digits are the descriptor, not a word.
+          if (inWord && /^\d+$/.test(word)) {
+            inWord = false
+            word = ""
+          } else {
+            endWord()
+          }
+          let end = pos
+          while (end < n && (text[end] === "<" || text[end] === ">")) end++
+          if (text[end - 1] === ">" && text[end] === "|") end++
+          if (text[end] === "&") {
+            // `2>&1`, `<&0`: a descriptor, no file target follows.
+            end++
+            while (end < n && /[0-9-]/.test(text[end])) end++
+          } else {
+            redirectPending = true
+            if (c === "<") stage.inputRedirect = true
+          }
+          pos = end
+          break
+        }
+        case "#":
+          if (!inWord) {
+            while (pos < n && text[pos] !== "\n") pos++
+          } else {
+            word += c
+            pos++
+          }
+          break
+        case " ":
+        case "\t":
+        case "\r":
+          endWord()
+          pos++
+          break
+        default: {
+          PLAIN_RUN.lastIndex = pos
+          const match = PLAIN_RUN.exec(text)
+          if (match) {
+            word += match[0]
+            pos += match[0].length
+          } else {
+            word += c
+            pos++
+          }
+          inWord = true
+        }
+      }
+    }
+    endStatement()
+    return body
+  }
+
+  return parseBody(0, null)
+}
+
+// Visits every stage of a body, nested groups and substitutions included,
+// and stops at the first one `visit` accepts.
+function walkStages(body: Body, visit: (stage: Stage) => boolean): boolean {
+  for (const stages of body) {
+    for (const stage of stages) {
+      if (visit(stage)) return true
+      if (stage.group && walkStages(stage.group, visit)) return true
+      for (const sub of stage.subs) if (walkStages(sub, visit)) return true
+    }
+  }
+  return false
+}
+
+// True when `hit` accepts the command (wrappers already removed) of any
+// simple command in any of the segments.
+function someCommand(segments: string[], hit: (tokens: string[]) => boolean): boolean {
+  for (const segment of segments) {
+    if (walkStages(parseShell(segment), (stage) => !stage.group && hit(commandTokens(stage.words)))) return true
+  }
+  return false
+}
+
+function isFetchOrDecode(tokens: string[]): boolean {
+  if (tokens.length === 0) return false
+  const name = commandName(tokens[0])
+  if (FETCH_COMMANDS.has(name)) return true
+  const args = tokens.slice(1)
+  if (name === "base64") return args.some((a) => a === "-d" || a === "--decode")
+  if (name === "xxd") return args.includes("-r")
+  return false
+}
+
+// What each interpreter does with its options, so that only a command that
+// really reads its program from stdin counts. `stop` letters and `stopLong`
+// options supply the program or print and exit (`-c`, `-e`, `-m`, `--version`);
+// every other option leaves it reading stdin (`python3 -E`, `node --inspect`,
+// `perl -I/tmp/lib`). `value` letters take a value that is either the rest of
+// the cluster (`-rjson`) or the next word (`-r json`), `attached` letters only
+// the rest of the cluster (`perl -i.bak`), `valueLong` options a next word
+// unless written `--opt=value`. The value is never read as a script path.
+interface InterpreterSpec {
+  stop: string
+  stopLong: ReadonlySet<string>
+  value: string
+  valueLong: ReadonlySet<string>
+  attached: string
+  // Shells only: `-s` reads stdin, and `+o` style options exist.
+  shell: boolean
+}
+const NO_OPTIONS: ReadonlySet<string> = new Set()
+const SHELL_SPEC: InterpreterSpec = {
+  stop: "c",
+  stopLong: new Set(["--version", "--help", "--command"]),
+  value: "oO",
+  valueLong: new Set(["--rcfile", "--init-file"]),
+  attached: "",
+  shell: true,
+}
+const PYTHON_SPEC: InterpreterSpec = { stop: "cmVh", stopLong: new Set(["--version", "--help"]), value: "WXQ", valueLong: NO_OPTIONS, attached: "", shell: false }
+const NODE_SPEC: InterpreterSpec = {
+  stop: "epvch",
+  stopLong: new Set(["--eval", "--print", "--version", "--test", "--help", "--check"]),
+  value: "rC",
+  valueLong: new Set(["--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type"]),
+  attached: "",
+  shell: false,
+}
+// `ruby -v` prints the version and then still reads the program from stdin.
+const RUBY_SPEC: InterpreterSpec = { stop: "eh", stopLong: new Set(["--version", "--help"]), value: "rICEF", valueLong: NO_OPTIONS, attached: "KWx0i", shell: false }
+const PERL_SPEC: InterpreterSpec = { stop: "eEvVh", stopLong: NO_OPTIONS, value: "IMm", valueLong: NO_OPTIONS, attached: "FCixdD", shell: false }
+const PHP_SPEC: InterpreterSpec = { stop: "rvh", stopLong: new Set(["--version", "--help"]), value: "dcz", valueLong: NO_OPTIONS, attached: "", shell: false }
+
+const SHELL_NAMES = ["sh", "bash", "zsh", "dash", "ksh", "fish", "$shell", "${shell}"]
+const SHELL_INTERPRETERS = new Set(SHELL_NAMES)
+const INTERPRETER_SPECS = new Map<string, InterpreterSpec>([
+  ...SHELL_NAMES.map((name): [string, InterpreterSpec] => [name, SHELL_SPEC]),
+  ["python", PYTHON_SPEC],
+  ["python2", PYTHON_SPEC],
+  ["python3", PYTHON_SPEC],
+  ["node", NODE_SPEC],
+  ["ruby", RUBY_SPEC],
+  ["perl", PERL_SPEC],
+  ["php", PHP_SPEC],
+])
+
+// An interpreter reads its program from stdin only when nothing else supplies
+// one: no arguments at all, `-` or /dev/stdin as the first positional, `-s` on
+// a shell, or only options that neither supply a program nor print and exit.
+// A script path (`bash setup.sh`) runs local code, not the fetch.
+function interpreterReadsStdin(tokens: string[]): boolean {
+  if (tokens.length === 0) return false
+  const spec = INTERPRETER_SPECS.get(commandName(tokens[0]))
+  if (!spec) return false
+  const args = tokens.slice(1).map((a) => a.replace(/["'\\]/g, ""))
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === "--") return args[i + 1] === undefined || args[i + 1] === "-" || args[i + 1] === "/dev/stdin"
+    if (arg === "-" || arg === "/dev/stdin") return true
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=")
+      const long = eq === -1 ? arg : arg.slice(0, eq)
+      if (spec.stopLong.has(long)) return false
+      if (eq === -1 && spec.valueLong.has(long)) i++
+      continue
+    }
+    if (arg.startsWith("-") || (spec.shell && arg.startsWith("+"))) {
+      const letters = arg.slice(1)
+      if (spec.shell) {
+        // getopt-style cluster: `-c` supplies the program, `-s`/`-es` reads stdin.
+        if (letters.includes("c")) return false
+        if (letters.includes("s")) return true
+      }
+      for (let k = 0; k < letters.length; k++) {
+        const letter = letters[k]
+        if (spec.stop.includes(letter)) return false
+        if (spec.attached.includes(letter)) break
+        if (spec.value.includes(letter)) {
+          if (k === letters.length - 1) i++
+          break
+        }
+      }
+      continue
+    }
+    // First positional is a script path.
+    return false
+  }
+  return true
+}
+
+// The command line a shell or `eval` is handed as a string: `bash -c '...'`,
+// `sh -lc '...'`, `eval ...`. It is read back as a command line of its own, so
+// the kill-list sees what is inside the quotes.
+function shellScriptOf(tokens: string[]): string | null {
+  if (tokens.length === 0) return null
+  const name = commandName(tokens[0])
+  if (name === "eval") return tokens.length > 1 ? tokens.slice(1).map(unquoteWord).join(" ") : null
+  if (!SHELL_INTERPRETERS.has(name)) return null
+  for (let i = 1; i < tokens.length; i++) {
+    const arg = unquoteWord(tokens[i])
+    if (arg === "--command") return i + 1 < tokens.length ? unquoteWord(tokens[i + 1]) : null
+    if (arg === "--rcfile" || arg === "--init-file") {
+      i++
+      continue
+    }
+    // A short-option cluster: every `o` / `O` in it takes the next word as its
+    // value (`-euxo pipefail`, `-eo pipefail -c`), and `-c` takes the program
+    // after those values.
+    if (/^[-+][A-Za-z]+$/.test(arg)) {
+      const values = arg.replace(/[^oO]/g, "").length
+      if (arg.startsWith("-") && arg.includes("c")) {
+        return i + 1 + values < tokens.length ? unquoteWord(tokens[i + 1 + values]) : null
+      }
+      i += values
+      continue
+    }
+    if (!arg.startsWith("-") && !arg.startsWith("+")) return null
+  }
+  return null
+}
+
+// opencode drops the operators when it splits, but a recovered or unsplit
+// command still has them. The reader above gives statements and pipeline
+// stages with quotes, groups and substitutions respected.
+//
+// True when some interpreter reads a fetched or decoded program from stdin.
+// Every segment is read once, left to right, so the cost is linear.
+//
+// Inside one segment only a real pipe counts: an interpreter at stage k is
+// fed by a pipeline that already holds a fetch or decode at an earlier
+// stage. `curl --version && node --test` or `curl -s URL | jq .` have none.
+// A group stage counts as what it contains: `{ curl U; } | python3` pipes a
+// fetch, and `curl U | (cd /tmp && bash)` feeds the group's stdin to the bash
+// inside it. A pipeline inside the group is read the same way.
+//
+// Across segments the pipe is gone (opencode's splitter drops it), so a
+// later segment that reads stdin after an earlier fetch is the only evidence
+// left. That fallback is for resources only: `isCatastrophic` passes the
+// recovered original alone when it has one, because its fragments repeat
+// commands the original shows with their real operators.
+export function fetchFeedsInterpreter(segments: string[]): boolean {
+  let fetchedEarlier = false
+  for (const segment of segments) {
+    const result = bodyFeedsInterpreter(parseShell(segment), fetchedEarlier)
+    if (result.hit) return true
+    if (result.fetch) fetchedEarlier = true
+  }
+  return false
+}
+
+// `fed`: the body's stdin already carries a fetched or decoded program.
+// Returns whether a stdin interpreter was found, and whether the body holds a
+// fetch anywhere (what makes a group or substitution a fetch stage).
+function bodyFeedsInterpreter(body: Body, fed: boolean): { hit: boolean; fetch: boolean } {
+  let anyFetch = false
+  for (const stages of body) {
+    let fetched = false
+    for (const stage of stages) {
+      const stdinFed = fetched || fed
+      let stageFetches = false
+      if (stage.group) {
+        const inner = bodyFeedsInterpreter(stage.group, stdinFed)
+        if (inner.hit) return { hit: true, fetch: true }
+        stageFetches = inner.fetch
+      } else {
+        const tokens = commandTokens(stage.words)
+        if (stdinFed && !stage.inputRedirect && interpreterReadsStdin(tokens)) return { hit: true, fetch: true }
+        stageFetches = isFetchOrDecode(tokens)
+      }
+      // A substitution is not on the pipe, but what it fetches is the stage's
+      // output: `echo $(curl U) | bash`.
+      for (const sub of stage.subs) {
+        const inner = bodyFeedsInterpreter(sub, false)
+        if (inner.hit) return { hit: true, fetch: true }
+        if (inner.fetch) stageFetches = true
+      }
+      if (stageFetches) {
+        fetched = true
+        anyFetch = true
+      }
+    }
+  }
+  return { hit: false, fetch: anyFetch }
+}
+
+// Same target set the `rm` regex above protects, decided per token instead
+// of per character. A regex cannot tell a flag token from an operand, so it
+// only recognises the bundled spelling it pattern-matches; `rm -r -f ~`,
+// `rm -f -R /` and `rm --recursive --force /` are the same wipe in ordinary,
+// non-obfuscated spellings and used to slip through. Flags are therefore
+// classified as tokens (any cluster containing r is recursive, any
+// containing f is a force flag) and a match needs both, exactly like -rf.
+// Protected directories after rmTargetOf has reduced every spelling to one
+// canonical form. `/home/<user>` is matched by HOME_USER_DIR instead.
+const RM_PROTECTED_TARGETS = new Set(["/", "~", "/home", "/root", ".", ".."])
+
+// /home/<user> itself (the home directory), but not anything under it:
+// `/home/idiaval/tmp` is ordinary cleanup, matching the regex's `(?!\S)`.
+const HOME_USER_DIR = /^\/home\/[^/\s]+$/
+
+// Drops a trailing run of the given characters with one backward scan. A
+// `/[;)]+$/` regex is retried from every start position, so input that is
+// one long run of `)` costs O(n^2) (250 KB of them stalled the event loop);
+// this is O(n).
+function stripTrailing(text: string, chars: string): string {
+  let end = text.length
+  while (end > 0 && chars.includes(text[end - 1])) end--
+  return end === text.length ? text : text.slice(0, end)
+}
+
+// Reduces an rm operand to the directory it names, so `~/*`, `$HOME/*`,
+// `"${HOME}"/*`, `/home/u/` and `./*` compare equal to `~`, `/home/u` and `.`.
+// A wipe of the contents is still a wipe of the directory. Quotes and
+// backslashes are removed as normalizeCommand does; the trailing `)` and `;`
+// come from a command substitution or a statement end. Input is lowercased.
+function rmTargetOf(raw: string): string {
+  let t = stripTrailing(raw.replace(/["'`\\]/g, ""), ";)")
+  if (t.endsWith("/*")) t = t.slice(0, -2) || "/"
+  if (t.length > 1) t = stripTrailing(t, "/") || "/"
+  if (t === "$home" || t.startsWith("$home/")) t = "~" + t.slice("$home".length)
+  if (t === "${home}" || t.startsWith("${home}/")) t = "~" + t.slice("${home}".length)
+  return t
+}
+
+// `tokens` is one simple command, lowercased. Quotes and backslashes are
+// stripped the way normalizeCommand does it, so `rm -r -f "$HOME"` reads as
+// the same token as the bare form.
+//
+// An `rm` word counts wherever it sits in the command, not only as its first
+// word, because a dispatch prompt or an argument list is prose around it
+// (`run rm -rf ~ to clean up`, `xxx... rm -rf /`) and the old regex matched
+// there too. The flags and operands that follow it, up to the next `rm` word,
+// belong to it; the command ends at the statement break, so an rm in one
+// statement never borrows a target from the next. One pass, so a long run of
+// `rm` words stays linear.
+function rmWipes(tokens: string[]): boolean {
+  let active = false
+  let recursive = false
+  let force = false
+  let targeted = false
+  let noPreserveRoot = false
+  for (const raw of tokens) {
+    if (commandName(raw) === "rm") {
+      active = true
+      recursive = force = targeted = noPreserveRoot = false
+      continue
+    }
+    if (!active) continue
+    const token = raw.replace(/["'`\\]/g, "")
+    if (token === "--") continue
+    if (token.startsWith("--")) {
+      if (token === "--recursive") recursive = true
+      else if (token === "--force") force = true
+      else if (token === "--no-preserve-root") noPreserveRoot = true
+    } else if (token.startsWith("-") && token.length > 1) {
+      const flags = token.slice(1)
+      if (flags.includes("r")) recursive = true
+      if (flags.includes("f")) force = true
+    } else {
+      const target = rmTargetOf(raw)
+      if (RM_PROTECTED_TARGETS.has(target) || HOME_USER_DIR.test(target)) targeted = true
+    }
+    // `--no-preserve-root` is only ever given to wipe `/`: with the other two
+    // it is a wipe whatever operand it comes with.
+    if (recursive && force && (targeted || noPreserveRoot)) return true
+  }
+  return false
+}
+
+export function rmRemovesProtectedTarget(segments: string[]): boolean {
+  // Several simple commands can share one segment when the original shell
+  // string was recovered (the splitter drops the operators, but the recovered
+  // command keeps them); the reader splits them. Lowercased only after
+  // commandTokens: its wrapper option tables are case sensitive (`xargs -I`
+  // takes a value, `-i` does not).
+  return someCommand(segments, (tokens) => rmWipes(tokens.map((token) => token.toLowerCase())))
+}
+
+// `find -exec rm ...` needs no rule of its own on the rm side: the rm word is
+// read wherever it sits in the command (see rmWipes). This is the start-path
+// side: directories `find` must not be pointed at with `-delete` / `-exec rm`,
+// the rm targets that are a root of the system or of a home plus the system
+// trees. A start path below them (`/tmp/build`, `/var/log`, `.`) is ordinary
+// cleanup.
+const FIND_EXEC = new Set(["-exec", "-execdir", "-ok", "-okdir"])
+const FIND_PROTECTED_ROOTS = new Set(["/", "~", "/home", "/root", "/var"])
+// System trees: the directory and everything below it (`/usr/lib`, `/etc/nginx`).
+const FIND_PROTECTED_TREES = ["/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var/lib"]
+
+function findStartIsProtected(target: string): boolean {
+  if (FIND_PROTECTED_ROOTS.has(target) || HOME_USER_DIR.test(target)) return true
+  return FIND_PROTECTED_TREES.some((tree) => target === tree || target.startsWith(tree + "/"))
+}
+
+function findDeletesProtectedRoot(tokens: string[]): boolean {
+  const args = tokens.slice(1)
+  let i = 0
+  // Global options come before the start paths.
+  while (i < args.length) {
+    const option = args[i].replace(/["'\\]/g, "")
+    if (option === "-H" || option === "-L" || option === "-P" || /^-O\d$/.test(option)) i++
+    else if (option === "-D") i += 2
+    else break
+  }
+  let protectedStart = false
+  for (; i < args.length; i++) {
+    const arg = args[i].replace(/["'\\]/g, "")
+    if (arg.startsWith("-") || arg === "(" || arg === ")" || arg === "!" || arg === ",") break
+    const target = rmTargetOf(args[i].toLowerCase())
+    if (findStartIsProtected(target)) protectedStart = true
+  }
+  if (!protectedStart) return false
+  for (; i < args.length; i++) {
+    const arg = args[i].replace(/["'\\]/g, "")
+    if (arg === "-delete") return true
+    if (FIND_EXEC.has(arg) && i + 1 < args.length && commandName(args[i + 1]) === "rm") return true
+  }
+  return false
+}
+
+const POWER_COMMANDS = new Set(["shutdown", "reboot", "halt", "poweroff"])
+const SYSTEMCTL_POWER_VERBS = new Set(["poweroff", "reboot", "halt", "kexec"])
+
+// Power-off and reboot are judged by the command word, not by the word
+// appearing anywhere: `grep -rn shutdown src/`, `git commit -m "handle
+// reboot"` and `echo halt` run nothing of the sort.
+function powerOrFindHits(tokens: string[]): boolean {
+  if (tokens.length === 0) return false
+  const name = commandName(tokens[0])
+  if (POWER_COMMANDS.has(name)) return true
+  if (name === "init") {
+    const level = tokens.length > 1 ? tokens[1].replace(/["'\\]/g, "") : ""
+    return level === "0" || level === "6"
+  }
+  if (name === "systemctl" || name === "loginctl") {
+    const args = tokens.slice(1).map((t) => t.replace(/["'\\]/g, ""))
+    for (let i = 0; i < args.length; i++) {
+      // The value of `-H host` / `-M machine` is not the verb.
+      if (args[i] === "-H" || args[i] === "--host" || args[i] === "-M" || args[i] === "--machine") i++
+      else if (!args[i].startsWith("-")) return SYSTEMCTL_POWER_VERBS.has(args[i].toLowerCase())
+    }
+    return false
+  }
+  return name === "find" && findDeletesProtectedRoot(tokens)
+}
+
+// How many levels of `bash -c '...'` / `eval` inside one another are read back
+// as command lines. Real commands nest once or twice; the limit keeps the
+// cost bounded on input built to nest.
+const MAX_NESTED_SCRIPT_DEPTH = 3
+
+// One budget of characters for all the re-reading of nested text inside a
+// single `isCatastrophic` call (`bash -c` scripts, handed-over command lines,
+// quoted payloads). Each of those is a fresh parse, and input built so that
+// every nested script holds almost the whole input (`bash -c "$(bash -c "$(`
+// repeated) costs one full parse per path through it, cubic in the nesting
+// width. A call that runs the budget out stops and fails closed: it is
+// treated as catastrophic, and the request is denied with the kill-list
+// message instead of stalling the event loop.
+interface ScanBudget {
+  left: number
+}
+const SCAN_BUDGET_EXTRA = 4096
+// Each re-read costs at least this much, so many tiny ones cannot add up to
+// unbounded per-call overhead. A full rule pass (a script or a handed-over
+// command line) is dearer than the wipe check on one quoted payload.
+const MIN_SCAN_COST = 32
+const MIN_PAYLOAD_COST = 8
+
+function newScanBudget(inputLength: number): ScanBudget {
+  return { left: 2 * inputLength + SCAN_BUDGET_EXTRA }
+}
+
+// False when the budget is spent.
+function charge(scan: ScanBudget, chars: number, floor: number = MIN_SCAN_COST): boolean {
+  scan.left -= Math.max(chars, floor)
+  return scan.left >= 0
+}
+
+function nestedScripts(segments: string[]): string[] {
+  const scripts = new Set<string>()
+  someCommand(segments, (tokens) => {
+    const script = shellScriptOf(tokens)
+    if (script) scripts.add(script)
+    return false
+  })
+  return [...scripts]
+}
+
+// Like walkStages, one pipeline at a time: a pipeline's stages are what tell
+// `printf "rm -rf ~" | bash` from a lone printf.
+function walkPipelines(body: Body, visit: (stages: Stage[]) => boolean): boolean {
+  for (const stages of body) {
+    if (visit(stages)) return true
+    for (const stage of stages) {
+      if (stage.group && walkPipelines(stage.group, visit)) return true
+      for (const sub of stage.subs) if (walkPipelines(sub, visit)) return true
+    }
+  }
+  return false
+}
+
+// Index of the first word after the options that start at `start`: the host of
+// `ssh`, the container of `docker exec`. `valueLetters` / `valueLong` name the
+// options that take a separate value, and `--` ends the options.
+function afterOptions(tokens: string[], start: number, valueLetters: string, valueLong: ReadonlySet<string>): number {
+  let i = start
+  while (i < tokens.length) {
+    const t = tokens[i].replace(/["'\\]/g, "")
+    if (t === "--") return i + 1
+    if (!t.startsWith("-") || t === "-") return i
+    if (t.startsWith("--")) {
+      i += !t.includes("=") && valueLong.has(t) ? 2 : 1
+      continue
+    }
+    let consumes = false
+    for (let k = 1; k < t.length; k++) {
+      if (valueLetters.includes(t[k])) {
+        consumes = k === t.length - 1
+        break
+      }
+    }
+    i += consumes ? 2 : 1
+  }
+  return i
+}
+
+const NO_LONG_OPTIONS: ReadonlySet<string> = new Set()
+const SSH_VALUE_LETTERS = "bBcDEeFIiJLlmOopQRSWw"
+const DOCKER_EXEC_LONG = new Set(["--env", "--user", "--workdir", "--env-file", "--detach-keys", "--index"])
+
+// Command lines that a command hands to another shell or program to run, as
+// text: what follows `ssh <host>`, `docker exec <container>`, `kubectl exec
+// ... --`, `su -c`, `find -exec` and so on. `ssh` and `watch` give the words
+// to a shell, which strips their quotes; the others run the words as they are,
+// so their quotes stay. The caller reads each one as a command line of its own.
+function handedScripts(tokens: string[]): string[] {
+  const scripts: string[] = []
+  const name = commandName(tokens[0])
+  const raw = (from: number) => (from < tokens.length ? scripts.push(tokens.slice(from).join(" ")) : 0)
+  const afterHost = (from: number) => (from < tokens.length ? scripts.push(tokens.slice(from).map(unquoteWord).join(" ")) : 0)
+  switch (name) {
+    case "ssh":
+      afterHost(afterOptions(tokens, 1, SSH_VALUE_LETTERS, NO_LONG_OPTIONS) + 1)
+      break
+    case "watch":
+      afterHost(afterOptions(tokens, 1, "n", new Set(["--interval"])))
+      break
+    case "su":
+    case "runuser":
+    case "flock":
+      for (let i = 1; i < tokens.length; i++) {
+        const t = unquoteWord(tokens[i])
+        if (t === "--command" || (name !== "flock" && /^-[A-Za-z]*c$/.test(t)) || (name === "flock" && t === "-c")) {
+          if (i + 1 < tokens.length) scripts.push(unquoteWord(tokens[i + 1]))
+          return scripts
+        }
+        if (t.startsWith("--command=")) {
+          scripts.push(t.slice("--command=".length))
+          return scripts
+        }
+      }
+      // `flock <lockfile> <command...>`
+      if (name === "flock") raw(afterOptions(tokens, 1, "wE", new Set(["--timeout", "--wait", "--conflict-exit-code"])) + 1)
+      break
+    case "docker":
+    case "podman": {
+      const exec = tokens.slice(1, 6).findIndex((t) => unquoteWord(t) === "exec")
+      if (exec !== -1) raw(afterOptions(tokens, exec + 2, "euw", DOCKER_EXEC_LONG) + 1)
+      break
+    }
+    case "kubectl":
+    case "oc": {
+      const exec = tokens.slice(1, 9).findIndex((t) => unquoteWord(t) === "exec")
+      if (exec !== -1) {
+        const dashes = tokens.findIndex((t, i) => i > exec + 1 && unquoteWord(t) === "--")
+        if (dashes !== -1) raw(dashes + 1)
+      }
+      break
+    }
+    case "nsenter":
+      raw(afterOptions(tokens, 1, "tSG", NO_LONG_OPTIONS))
+      break
+    case "chroot":
+      raw(afterOptions(tokens, 1, "", new Set(["--userspec", "--groups"])) + 1)
+      break
+    case "find":
+      for (let i = 1; i < tokens.length; i++) {
+        if (!FIND_EXEC.has(unquoteWord(tokens[i]))) continue
+        let end = i + 1
+        while (end < tokens.length && !/^\\?[;+]$/.test(tokens[end])) end++
+        if (end > i + 1) scripts.push(tokens.slice(i + 1, end).join(" "))
+      }
+      break
+    case "git":
+      // `git -c alias.x='!cmd'` / `git config alias.x '!cmd'`: an alias that
+      // starts with `!` runs a shell command.
+      for (let i = 1; i < tokens.length; i++) {
+        const m = /^(?:alias\.[^=]*=)?!([\s\S]+)$/.exec(unquoteWord(tokens[i]))
+        if (m) scripts.push(m[1])
+      }
+      break
+  }
+  return scripts
+}
+
+// The text between the quotes of every quoted span in a word that holds
+// whitespace, or that is a git alias value starting with `!`.
+function quotedPayloads(word: string): string[] {
+  if (!word.includes("'") && !word.includes('"')) return []
+  const payloads: string[] = []
+  for (let i = 0; i < word.length; i++) {
+    const c = word[i]
+    if (c === "\\") {
+      i++
+    } else if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      const stop = end === -1 ? word.length : end
+      const content = word.slice(i + 1, stop)
+      if (/\s/.test(content)) payloads.push(content)
+      i = stop
+    } else if (c === '"') {
+      let end = i + 1
+      while (end < word.length && word[end] !== '"') end += word[end] === "\\" ? 2 : 1
+      const content = unquoteWord(word.slice(i, end + 1))
+      if (/\s/.test(content)) payloads.push(content)
+      i = end
+    }
+  }
+  return payloads
+}
+
+// A quoted word that holds whitespace is read as a command line, and only the
+// wipe rule is applied to it: the old regexes stripped the quotes and so
+// caught `ssh prod 'rm -rf /'`, `watch 'rm -rf ~'` and `git -c alias.x='!rm
+// -rf ~' x` whatever the command around them. A bare `shutdown` inside a quote
+// (`grep -rn "shutdown" src/`) is not in command position and is not judged
+// here; the power rule only reads text that a command hands over to run (see
+// handsOverCatastrophic). Prose that spells out a wipe (`echo "rm -rf /"`) is
+// denied too, as it always was: the gate cannot tell it from the command, and
+// the cost of the wrong guess is asymmetric.
+function quotedWipes(text: string, depth: number, scan: ScanBudget): boolean {
+  if (!charge(scan, text.length, MIN_PAYLOAD_COST)) return true
+  return walkStages(parseShell(text.replace(/^\s*!/, "")), (stage) => {
+    if (stage.group) return false
+    if (rmWipes(commandTokens(stage.words).map((token) => token.toLowerCase()))) return true
+    if (depth >= MAX_NESTED_SCRIPT_DEPTH) return false
+    for (const word of stage.words) {
+      for (const payload of quotedPayloads(word)) if (quotedWipes(payload, depth + 1, scan)) return true
+    }
+    return false
+  })
+}
+
+// The rules that need a command's neighbours: the command line a command
+// hands over to run (ssh, docker exec, su -c, ...) is judged by every rule as
+// a command line of its own, the text an echo or printf pipes into a shell the
+// same, and any other quoted payload is read for a wipe.
+function handsOverCatastrophic(segments: string[], depth: number, scan: ScanBudget): boolean {
+  if (depth >= MAX_NESTED_SCRIPT_DEPTH) return false
+  for (const segment of segments) {
+    const hit = walkPipelines(parseShell(segment), (stages) => {
+      const tokensOf = stages.map((stage) => (stage.group ? [] : commandTokens(stage.words)))
+      let lastShell = -1
+      tokensOf.forEach((tokens, k) => {
+        if (k > 0 && !stages[k].inputRedirect && tokens.length > 0 && SHELL_INTERPRETERS.has(commandName(tokens[0])) && interpreterReadsStdin(tokens)) lastShell = k
+      })
+      for (let k = 0; k < stages.length; k++) {
+        const tokens = tokensOf[k]
+        if (tokens.length === 0) continue
+        const scripts = handedScripts(tokens)
+        const name = commandName(tokens[0])
+        if (k < lastShell && (name === "echo" || name === "printf")) scripts.push(tokens.slice(1).map(unquoteWord).join(" "))
+        if (scripts.length > 0) {
+          for (const script of scripts) {
+            if (!charge(scan, script.length)) return true
+            if (catastrophicAt(script, script, depth + 1, scan)) return true
+          }
+          continue
+        }
+        // `bash -c '...'` is read as a script by nestedScripts.
+        if (shellScriptOf(tokens) !== null) continue
+        for (const word of stages[k].words) {
+          for (const payload of quotedPayloads(word)) if (quotedWipes(payload, depth + 1, scan)) return true
+        }
+      }
+      return false
+    })
+    if (hit) return true
+  }
+  return false
+}
+
+// A refspec with a leading `+` forces that ref just as `--force` does
+// (`git push origin +main`), and it is the spelling people reach for after a
+// local rebase. It is matched per command: the `git` word, its global
+// options (`git -C dir`, `git -c k=v`, `--no-pager`, ...), then `push`, then
+// any later argument shaped like a refspec. A regex over the whole line
+// cannot tell that refspec from a `+` in another command's argument
+// (`gh pr create --title "feat: +20% faster"`) or in a commit message.
+const GIT_FORCE_REFSPEC = /^\+[\w./@{}^~-]+(:[\w./-]+)?$/
+const GIT_ARG_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree"])
+// A short-flag cluster after `push` that holds `f` is `-f` bundled with
+// others (`-fu`, `-uf`), which the lone-`-f` regex above cannot see. Only
+// push's own boolean short flags are accepted in the cluster, so `-ofoo`
+// (`-o` with a value) and other commands' flags are not read as a force.
+const GIT_PUSH_FORCE_CLUSTER = /^-[nuvqd46]*f[nufvqd46]*$/
+
+// Scans one simple command (already split on operators) as a token stream,
+// one pass, so a long run of `git` words stays linear. A `git` word resets
+// the state, so `bash -c "git push ..."` and `$(git push ...)` are found too,
+// as the old line regex found them.
+function forcePushRefspecIn(simple: string): boolean {
+  let state: "idle" | "git" | "git-arg" | "push" = "idle"
+  for (const raw of simple.split(/\s+/)) {
+    // Quotes and backslashes out, a substitution's `(`/`$(` in front and its
+    // `)` behind, so `$(git push origin +main)` reads the same as the bare form.
+    const token = stripTrailing(raw.replace(/["'`\\]/g, "").replace(/^[(`$]+/, ""), ")")
+    if (!token) continue
+    if (commandName(token) === "git") {
+      state = "git"
+      continue
+    }
+    if (state === "idle") continue
+    if (state === "git-arg") {
+      state = "git"
+      continue
+    }
+    if (state === "git") {
+      if (token.startsWith("-") && token.length > 1) {
+        if (GIT_ARG_OPTIONS.has(token)) state = "git-arg"
+        continue
+      }
+      state = token === "push" ? "push" : "idle"
+      continue
+    }
+    if (GIT_FORCE_REFSPEC.test(token) || GIT_PUSH_FORCE_CLUSTER.test(token)) return true
+  }
+  return false
+}
+
+export function forcePushRefspec(segments: string[]): boolean {
+  for (const segment of segments) {
+    for (const simple of segment.split(/[;&|]+/)) {
+      if (forcePushRefspecIn(simple)) return true
+    }
+  }
+  return false
+}
+
+// Credential stores and private keys are never a policy judgement for Jev:
+// a successful read is already an irreversible disclosure (the contents
+// reach the agent's model provider), and live red-team runs showed Jev
+// allowing ~/.ssh/id_rsa in one of three. Deterministic, before any network
+// call. `.ssh` and the single-file names match anywhere; `.aws`, `.docker`,
+// `.kube` and `.gnupg` are also names a project uses for its own files
+// (`docker build -f .docker/Dockerfile .`), so as directories they need a home
+// or root prefix: `~/`, `$HOME/`, `${HOME}/`, `/home/<user>/`, `/root/`
+// (`/Users/<user>/` and `~user/` too).
+const HOME_PREFIX = String.raw`(?:~[\w.-]*|\$home|\$\{home\}|/home/[^/\s]+|/Users/[^/\s]+|/root)[/\\]`
+const CREDENTIAL_STORE = [
+  // The credential directories themselves, or anything under them. The name
+  // must end there: a `.` or `-` or word character after it means another
+  // thing (`www.ssh.com`, `.ssh-agent-notes.md`, `.dockerignore`), anything
+  // else is the directory (`~/.ssh*`, `~/.ssh>x`, `~/.ssh,`, `~/.ssh}`,
+  // `~/.aws/cred*`, `tar czf - ~/.aws`).
+  /\.ssh(?![\w.-])/i,
+  new RegExp(`${HOME_PREFIX}\\.(?:aws|docker|kube|gnupg)(?![\\w.-])`, "i"),
+  // Unambiguous wherever the directory sits: each names the credential file.
+  /\.aws[/\\]credentials\b/i,
+  /\.docker[/\\]config\.json\b/i,
+  /\.kube[/\\]config\b/i,
+  // opencode's data directory holds auth.json and the session history.
+  /\.local[/\\]share[/\\]opencode(?![\w.-])/i,
+  // Prints every kubeconfig credential unredacted.
+  /\bkubectl\s+config\s+view\b[^\n]{0,200}--raw\b/i,
+  /\.netrc\b/i,
+  /\.git-credentials\b/i,
+  /\.config[/\\]git[/\\]credentials\b/i,
+  /\.config[/\\]gh\b/i,
+  /\.pypirc\b/i,
+  /\.npmrc\b/i,
+  /\.cargo[/\\]credentials(?:\.toml)?\b/i,
+  /\/etc\/shadow\b/i,
+  /\/etc\/sudoers\b/i,
+  /\.(?:p12|pfx)\b/i,
+  // A `.pem` is a key only when its name says so. A CA bundle or certificate
+  // (`--cacert ./ca.pem`) is read in ordinary TLS work. The length bounds
+  // keep these linear on long input, like the rest of this file.
+  /(?<![\w.-])[\w.-]{0,64}(?:key|private)[\w.-]{0,64}\.pem\b/i,
+  /(?<![\w.-])id_[\w.-]{0,64}\.pem\b/i,
+  /\bid_(?:rsa|ed25519|ecdsa)\b/i,
+]
+
+// Checked on the raw text and on its normalized form, so quotes, backslashes
+// or separators spliced into a path (`~/.s"s"h/id_rsa`) do not hide it.
+export function touchesCredentialStore(text: string): boolean {
+  const normalized = normalizeCommand(text)
+  return CREDENTIAL_STORE.some((re) => re.test(text) || re.test(normalized))
+}
+
+// `original` is the shell command recovered from the session when there is
+// one. `joined` then holds it followed by the fragments opencode split it
+// into, which repeat its commands without the operators. The fetch-to-
+// interpreter rule reads the original alone in that case: with the real
+// pipes available, matching fragments by order would flag `curl ... && node
+// --test` as a pipe-to-shell. Every other rule still scans all of `joined`.
+export function isCatastrophic(joined: string, original?: string | null): boolean {
+  return catastrophicAt(joined, original ?? null, 0, newScanBudget(joined.length))
+}
+
+function catastrophicAt(joined: string, original: string | null, depth: number, scan: ScanBudget): boolean {
+  const lines = joined.split("\n")
+  // Token rules first: each is a single linear pass and covers the live
+  // split shape even when the original command could not be recovered.
+  if (fetchFeedsInterpreter(original ? [original] : lines)) return true
+  if (rmRemovesProtectedTarget(lines)) return true
+  if (someCommand(lines, powerOrFindHits)) return true
+  if (forcePushRefspec(lines)) return true
+  // `bash -c '...'` and `eval ...` carry a command line in a string. Each one
+  // is judged as a command of its own, with its real pipes, so a wipe or a
+  // `curl | sh` inside the quotes is not hidden by them.
+  if (depth < MAX_NESTED_SCRIPT_DEPTH) {
+    if (handsOverCatastrophic(lines, depth, scan)) return true
+    for (const script of nestedScripts(lines)) {
+      if (!charge(scan, script.length)) return true
+      if (catastrophicAt(script, script, depth + 1, scan)) return true
+    }
+  }
   const step = CATASTROPHIC_CHECK_MAX_CHARS - CATASTROPHIC_WINDOW_OVERLAP
   for (let start = 0; start === 0 || start + CATASTROPHIC_WINDOW_OVERLAP < joined.length; start += step) {
     const window = joined.slice(start, start + CATASTROPHIC_CHECK_MAX_CHARS)
@@ -357,7 +1570,7 @@ function numberedOptions(options: string[]): string {
   return options.map((o, i) => `${i + 1}. ${o}`).join("\n")
 }
 
-function resourceKinds(resources: string[]): string {
+export function resourceKinds(resources: string[]): string {
   return resources
     .map((r) => {
       const t = r.trim()
@@ -384,13 +1597,53 @@ function isEnabled(options: Record<string, unknown>): boolean {
   return true
 }
 
+// Unattended mode: no human is watching the session. In an interactive
+// opencode a pending permission simply blocks until someone answers, so
+// leaving effect at "ask" is safe. `opencode run --auto` instead answers
+// "yes" to anything still at "ask", which silently turns the gate's "I am
+// not sure" (Jev ask-human, an unknown decision, a gate error, an oversized
+// request) into an approval. Opting in makes those cases deny instead.
+// Turning this on only ever turns an "ask" into a deny, so the safe direction
+// is to read doubt as on: a value read as off would instead leave ask-human
+// to become an approval under `--auto`. Only an explicit off spelling (false,
+// 0, no, off, empty or unset) keeps the gate attended. Anything else that is
+// not a recognised "on" either (a typo such as "ture", 2, an object) counts
+// as unattended too, and setup() logs that it did without echoing the value.
+const UNATTENDED_ON = new Set(["true", "1", "yes", "on"])
+const UNATTENDED_OFF = new Set(["false", "0", "no", "off", ""])
+
+function unattendedState(value: unknown): "on" | "off" | "unrecognised" {
+  if (value === undefined || value === null) return "off"
+  if (typeof value === "boolean") return value ? "on" : "off"
+  if (typeof value === "number") return value === 1 ? "on" : value === 0 ? "off" : "unrecognised"
+  if (typeof value !== "string") return "unrecognised"
+  const text = value.trim().toLowerCase()
+  if (UNATTENDED_ON.has(text)) return "on"
+  return UNATTENDED_OFF.has(text) ? "off" : "unrecognised"
+}
+
+export function isUnattended(options: Record<string, unknown>): boolean {
+  return (
+    unattendedState(options.unattended) !== "off" || unattendedState(process.env.JEV_GATE_UNATTENDED) !== "off"
+  )
+}
+
+// True when the config or the env var holds a value that is neither a known
+// "on" nor a known "off": it is being treated as unattended on a guess.
+export function unattendedUnrecognised(options: Record<string, unknown>): boolean {
+  return (
+    unattendedState(options.unattended) === "unrecognised" ||
+    unattendedState(process.env.JEV_GATE_UNATTENDED) === "unrecognised"
+  )
+}
+
 function repoRoot(options: Record<string, unknown>): string {
   if (typeof options.gateDir === "string" && options.gateDir) return options.gateDir
   if (process.env.JEV_GATE_DIR) return process.env.JEV_GATE_DIR
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 }
 
-function apiKeyOf(options: Record<string, unknown>): string {
+export function apiKeyOf(options: Record<string, unknown>): string {
   if (typeof options.typesafeKey === "string" && options.typesafeKey) return options.typesafeKey
   return process.env.TYPESAFE_API_KEY ?? ""
 }
@@ -424,7 +1677,7 @@ export function timeoutMsOf(options: Record<string, unknown>): number {
 // measured at 1 to 2 s), so the default fills most of its ~33k-token
 // window; schemas.py fits objective and detail into the final budget.
 // Override per-project via options.objectiveChars or JEV_GATE_OBJECTIVE_CHARS.
-function objectiveBudgetOf(options: Record<string, unknown>): number {
+export function objectiveBudgetOf(options: Record<string, unknown>): number {
   const raw = (options.objectiveChars as unknown) ?? process.env.JEV_GATE_OBJECTIVE_CHARS
   const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10)
   if (!Number.isFinite(n)) return 60000
@@ -828,6 +2081,12 @@ function spawnGate(options: Record<string, unknown>): {
     cwd: repoRoot(options),
     env: minimalEnv(options),
   })
+  // A child that exits before reading its stdin (a crash on import, a bad
+  // argument) closes the pipe, and the write then fails with EPIPE as an
+  // asynchronous 'error' event on the stream. With no listener that event
+  // throws and kills the whole host process, while the child's exit code
+  // already reports the real outcome. The stream error is absorbed here.
+  child.stdin.on("error", () => {})
   let stdout = ""
   let stderr = ""
   const CAP = 256 * 1024
@@ -996,6 +2255,16 @@ export function textOfMessage(message: unknown): ConversationTurn | null {
 // points back at the exact tool-call part that triggered this permission.
 export type PermissionSource = { messageID: string; id: string }
 
+// Both lookups below answer null for "no record found" (no source, no
+// matching message or part). A lookup that THREW or timed out is a different
+// thing: it says nothing about what the command or prompt is. By default it
+// still reads as null (the pre-existing behaviour every other caller keeps);
+// evaluatePermission asks for `throwOnFailure` so it can tell the two apart
+// and hold the request instead of judging thin fragments.
+export interface LookupOptions {
+  throwOnFailure?: boolean
+}
+
 // The "subagent" permission action (opencode 2.0.11; docs still call it
 // "task") carries only the target agent's short name in `resources` —
 // live-verified: `resKinds` was consistently "text:7ch", the exact length
@@ -1016,10 +2285,11 @@ export async function subagentDetailFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   source: PermissionSource | null | undefined,
+  lookup: LookupOptions = {},
 ): Promise<string | null> {
   if (!source?.messageID || !source?.id) return null
   try {
-    const messages = await ctx.session.context({ sessionID })
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
     const list = Array.isArray(messages) ? messages : []
     const message = list.find(
       (m): m is { content?: unknown } =>
@@ -1040,7 +2310,59 @@ export async function subagentDetailFor(
       typeof prompt === "string" && prompt ? `prompt: ${prompt}` : "",
     ].filter(Boolean)
     return parts.length ? parts.join("\n") : null
-  } catch {
+  } catch (err) {
+    if (lookup.throwOnFailure) throw err
+    return null
+  }
+}
+
+// opencode 2.2.3 gives the evaluate hook a shell command PRE-SPLIT into
+// simple commands with the operators dropped. The shell tool call that
+// raised the permission still holds the real command at
+// `state.input.command` in the same session-context RPC
+// `subagentDetailFor` already reads, so recover it from there: the
+// kill-list and Jev then see the operators instead of fragments. Any miss
+// or throw returns null, and the caller keeps its pre-existing behaviour.
+// Both lookups below run BEFORE the kill-list and the credential guard, so a
+// session.context call that never settles would hold that permission
+// indefinitely. Past this bound the lookup counts as a miss and the caller
+// keeps its thin resources, the same fail-open as any other miss.
+export const LOOKUP_TIMEOUT_MS = 3000
+
+function withLookupTimeout<T>(pending: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("lookup timeout")), LOOKUP_TIMEOUT_MS)
+  })
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
+}
+
+export async function shellCommandFor(
+  ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+  source: PermissionSource | null | undefined,
+  lookup: LookupOptions = {},
+): Promise<string | null> {
+  if (!source?.messageID || !source?.id) return null
+  try {
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
+    const list = Array.isArray(messages) ? messages : []
+    const message = list.find(
+      (m): m is { content?: unknown } =>
+        !!m && typeof m === "object" && (m as { id?: unknown }).id === source.messageID,
+    )
+    const content = Array.isArray((message as { content?: unknown } | undefined)?.content)
+      ? ((message as { content: unknown[] }).content)
+      : []
+    const call = content.find(
+      (c): c is { state?: unknown } => !!c && typeof c === "object" && (c as { id?: unknown }).id === source.id,
+    )
+    const input = (call as { state?: { input?: unknown } } | undefined)?.state?.input
+    if (!input || typeof input !== "object") return null
+    const command = (input as Record<string, unknown>).command
+    return typeof command === "string" && command.trim() ? command : null
+  } catch (err) {
+    if (lookup.throwOnFailure) throw err
     return null
   }
 }
@@ -1090,11 +2412,19 @@ export interface EvaluateDeps {
   kindFor: (action: string, resources: string[]) => string;
   redactSecrets: (text: string) => string;
   sha256Hex: (text: string) => string;
-  isCatastrophic: (joined: string) => boolean;
+  isCatastrophic: (joined: string, original?: string | null) => boolean;
   subagentDetailFor: (
     ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
     sessionID: string,
     source: PermissionSource | null | undefined,
+    lookup?: LookupOptions,
+  ) => Promise<string | null>;
+  // Optional so existing fixtures compile unchanged; setup always passes it.
+  shellCommandFor?: (
+    ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+    sessionID: string,
+    source: PermissionSource | null | undefined,
+    lookup?: LookupOptions,
   ) => Promise<string | null>;
   resourceKinds: (resources: string[]) => string;
   DESTRUCTIVE_HINT: RegExp;
@@ -1106,6 +2436,15 @@ export interface EvaluateDeps {
   options: Record<string, unknown>;
   endedSessions: Set<string>;
   inst: string;
+}
+
+/**
+ * Message the agent gets when unattended mode holds a request that would
+ * otherwise wait for a human. A deny with no message aborts the whole turn,
+ * so it has to name the cause and offer a way forward.
+ */
+function unattendedHoldMessage(reason: string, redact: (text: string) => string): string {
+  return `Held by jev-decision-gate (unattended mode): ${redact(reason)}. No human is available to approve this; choose a safer, reversible alternative or stop and report what you need.`
 }
 
 /**
@@ -1127,6 +2466,7 @@ export async function evaluatePermission(
   },
 ): Promise<void> {
   const { sessionID, action, resources, source, effect } = input;
+  const unattended = isUnattended(deps.options);
 
   // Respect user's allow/deny config — only intercept when effect is "ask"
   if (effect !== "ask") {
@@ -1148,16 +2488,121 @@ export async function evaluatePermission(
 
   // Convert readonly array to mutable for enrichment
   const mutableResources: string[] = Array.from(resources);
-  let joined = mutableResources.join("\n");
+  const joined = mutableResources.join("\n");
   let resKinds = deps.resourceKinds(mutableResources);
 
-  if (joined.length > MAX_SCANNED_CHARS) {
-    deps.log({ sessionID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: joined.length, detail_sha256: deps.sha256Hex(joined) });
+  // `scanned` is what the oversized check, kill-list, credential guard,
+  // hints, kind and Jev payload all evaluate. Each lookup below only ADDS
+  // text in front of the original resources, never replaces them, and all of
+  // them run before any of those checks: a dispatch prompt or a recovered
+  // command that the lookup finds must be judged too.
+  let scanned = joined;
+  let scannedResources = mutableResources;
+  // The text recovered by a lookup, if any. Jev's detail shows only this
+  // (plus the metadata extras), not the resources it was recovered from.
+  let recovered: string | null = null;
+  // The shell command recovered from the session, kept apart from `recovered`
+  // because the kill-list reads it as a whole command (with its pipes), and
+  // the dispatch prompt below is prose.
+  let shellOriginal: string | null = null;
+  let promptRecovered = false;
+  // Set when a lookup threw or timed out, as opposed to finding no record.
+  let lookupFailure: string | null = null;
+  const lookupError = (err: unknown): string =>
+    deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120);
+
+  // Shell commands arrive PRE-SPLIT with the operators dropped (opencode
+  // 2.2.3), so recover the real command and scan that too: pipe-only
+  // kill-list patterns and the destructive/substitution hints need the
+  // operators, and Jev must judge the command, not its fragments. A failed
+  // lookup leaves today's behaviour exactly.
+  if (action === "shell" || action === "bash") {
+    let original: string | null = null;
+    try {
+      original = typeof deps.shellCommandFor === "function"
+        ? await deps.shellCommandFor(deps.ctx, sessionID, source, { throwOnFailure: true })
+        : null;
+    } catch (err) {
+      lookupFailure = lookupError(err);
+    }
+    if (original) {
+      shellOriginal = original;
+      recovered = original;
+      scanned = `${original}\n${joined}`;
+      // Extra resource (not a replacement): kindFor's pipeline checks look
+      // at every resource, and the original alone shows the missing pipe.
+      scannedResources = [original, ...mutableResources];
+    }
+  }
+
+  // Subagent/task dispatch: the permission's own resource is only the target
+  // agent's name, while the prompt that would run lives in the tool call. It
+  // is looked up here, before the kill-list and credential guard, so a
+  // dispatch like "run rm -rf ~" or "print ~/.ssh/id_rsa" meets the same
+  // deterministic rules as a shell command.
+  if (action === "subagent" || action === "task") {
+    let enriched: string | null = null;
+    try {
+      enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source, { throwOnFailure: true });
+    } catch (err) {
+      lookupFailure = lookupError(err);
+    }
+    if (enriched) {
+      promptRecovered = true;
+      recovered = enriched;
+      scanned = `${enriched}\n${joined}`;
+      scannedResources = [enriched, ...mutableResources];
+      resKinds = deps.resourceKinds(scannedResources);
+    }
+  }
+
+  if (scanned.length > MAX_SCANNED_CHARS) {
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("oversized-request", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        gateAction: "reject",
+        reason: "oversized-request",
+        detailChars: scanned.length,
+        detail_sha256: deps.sha256Hex(scanned),
+        unattended: true,
+      });
+      return;
+    }
+    deps.log({ sessionID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: scanned.length, detail_sha256: deps.sha256Hex(scanned) });
+    return;
+  }
+
+  // A dispatch prompt is prose written to another model, not a command: it
+  // can mention `shutdown`, `drop table` or a path without running anything.
+  // Only the resources (the agent's name) are a hard deny; a match that comes
+  // from the prompt text alone goes to a human instead, and is held when
+  // nobody is there to answer.
+  const resourcesCatastrophic = promptRecovered ? deps.isCatastrophic(joined) : false;
+  if (promptRecovered && !resourcesCatastrophic && deps.isCatastrophic(scanned)) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("subagent-prompt-flagged", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "subagent-prompt-flagged",
+        detail_sha256: deps.sha256Hex(scanned),
+        unattended: true,
+      });
+      return;
+    }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "subagent-prompt-flagged", detail_sha256: deps.sha256Hex(scanned) });
     return;
   }
 
   // Catastrophic pattern: deny instantly with message, no Jev call
-  if (deps.isCatastrophic(joined)) {
+  if (promptRecovered ? resourcesCatastrophic : deps.isCatastrophic(scanned, shellOriginal)) {
     input.effect = "deny";
     input.message =
       "Blocked by jev-decision-gate: matches the catastrophic-command kill-list. Do not retry this command or variants of it.";
@@ -1167,22 +2612,50 @@ export async function evaluatePermission(
       kind: "destructive",
       gateAction: "reject",
       reason: "catastrophic-pattern",
-      detail_sha256: deps.sha256Hex(joined),
+      detail_sha256: deps.sha256Hex(scanned),
     });
     return;
   }
 
-  // Subagent/task enrichment
-  if (action === "subagent" || action === "task") {
-    const enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source);
-    if (enriched) {
-      mutableResources[0] = enriched;
-      joined = enriched;
-      resKinds = deps.resourceKinds(mutableResources);
+  // Credential path: a read is an irreversible disclosure, so no Jev call.
+  // Attended leaves the request to the human; unattended denies because
+  // "ask" is auto-approved there. This sits after the kill-list (a wipe is
+  // still blocked outright) and before any gate work.
+  if (touchesCredentialStore(scanned)) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("credential-path", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "credential-path",
+        unattended: true,
+      });
+      return;
     }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "credential-path" });
+    return;
   }
 
-  const kind = deps.kindFor(action, mutableResources);
+  // A lookup that failed (threw or timed out) says nothing about the command
+  // or the prompt, so Jev would judge thin fragments: hold it. It sits after
+  // the kill-list and credential guard, which still see the resources.
+  if (lookupFailure !== null) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("context-lookup-failed", deps.redactSecrets);
+      deps.log({ sessionID, tool: action, kind, gateAction: "reject", reason: "context-lookup-failed", error_class: lookupFailure, unattended: true });
+      return;
+    }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "context-lookup-failed", error_class: lookupFailure });
+    return;
+  }
+
+  const kind = deps.kindFor(action, scannedResources);
 
   // Build gate event and call Jev
   try {
@@ -1193,11 +2666,16 @@ export async function evaluatePermission(
     const patches = editPatchesOf(input.metadata);
     const metaDetail = metadataDetailFor(action, input.metadata);
     const extra = [patches, metaDetail].filter((x): x is string => !!x).join("\n");
-    const detail = clipHeadTail(deps.redactSecrets(extra ? `${joined}\n${extra}` : joined), DETAIL_MAX_CHARS);
+    // Jev reads the recovered command or dispatch text, or the raw resources
+    // when nothing was recovered. `scanned` is not used here: it repeats the
+    // resources after the recovered text, so Jev would see the same command
+    // twice. The hash below still covers `scanned`.
+    const primary = recovered ?? joined;
+    const detail = clipHeadTail(deps.redactSecrets(extra ? `${primary}\n${extra}` : primary), DETAIL_MAX_CHARS);
     const hintParts: string[] = [];
     if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated");
-    if (deps.DESTRUCTIVE_HINT.test(joined) || hasDestructiveCurlOrWget(mutableResources)) hintParts.push("matches destructive-hint");
-    if (deps.COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
+    if (deps.DESTRUCTIVE_HINT.test(scanned) || hasDestructiveCurlOrWget(scannedResources)) hintParts.push("matches destructive-hint");
+    if (deps.COMMAND_SUBSTITUTION.test(scanned)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
     if (detail.includes(OMITTED_MARK)) hintParts.push("detail too long: middle omitted, judge head and tail");
     const riskHints = hintParts.join("; ");
 
@@ -1212,12 +2690,15 @@ export async function evaluatePermission(
     const startedAt = Date.now();
     const { decision, retried } = await deps.runGate(deps.options, gateEvent);
     const elapsedMs = Date.now() - startedAt;
+    // "ask" is about to become a deny: record the request as rejected so
+    // the log does not claim a human was asked when none exists.
+    const heldByUnattended = unattended && decision.action !== "allow" && decision.action !== "deny";
 
     deps.log({
       sessionID,
       tool: action,
       kind,
-      gateAction: decision.action,
+      gateAction: heldByUnattended ? "reject" : decision.action,
       reason: decision.reason,
       confidence: decision.confidence,
       model: decision.model,
@@ -1225,12 +2706,13 @@ export async function evaluatePermission(
       pick: decision.pick ?? null,
       elapsedMs,
       objectiveChars: objective.length,
-      detail_sha256: deps.sha256Hex(joined),
+      detail_sha256: deps.sha256Hex(scanned),
       hasKey: deps.apiKeyOf(deps.options) !== "",
       resKinds,
       ...(retried ? { retry: 1 } : {}),
-      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
-      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+      ...(heldByUnattended ? { unattended: true } : {}),
+      ...(typeof decision.error === "string" ? { error_class: deps.redactSecrets(decision.error) } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: deps.redactSecrets(decision.error_detail) } : {}),
     });
 
     if (decision.action === "allow") {
@@ -1239,18 +2721,38 @@ export async function evaluatePermission(
       input.effect = "deny";
       const reason = String(decision.reason ?? "jev-deny");
       input.message = `Denied by jev-decision-gate (Jev): ${deps.redactSecrets(reason)}. Choose a safer alternative or explain why this is needed.`;
+    } else if (heldByUnattended) {
+      // ask-human, or an action we do not recognise: nobody is there to
+      // answer, so hold it instead of letting --auto approve it.
+      input.effect = "deny";
+      input.message = unattendedHoldMessage(String(decision.reason ?? decision.action ?? "ask-human"), deps.redactSecrets);
     } else {
       // ask-human or unknown -> leave effect as "ask"
     }
   } catch (err) {
-    // Fail-open: never silent allow, always leave effect as "ask"
+    // Fail-open: never silent allow, always leave effect as "ask" — unless
+    // nobody is there to answer it, where "ask" means "allow" to --auto.
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("fail-open", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "fail-open",
+        error_class: deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120),
+        unattended: true,
+      });
+      return;
+    }
     deps.log({
       sessionID,
       tool: action,
       kind,
       gateAction: "ask-human",
       reason: "fail-open",
-      error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      error_class: deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120),
     });
     // effect remains "ask"
   }
@@ -1315,14 +2817,17 @@ async function sessionIsEnded(
   }
 }
 
-async function objectiveFor(
+export async function objectiveFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   ended: Set<string>,
   budgetChars: number,
 ): Promise<string> {
   try {
-    const messages = await ctx.session.context({ sessionID })
+    // Bounded like the other session.context lookups: a call that never
+    // settles would otherwise hold this permission forever. A timeout lands
+    // in the catch below and falls back to the generic objective.
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
     const list = Array.isArray(messages) ? messages : []
     const turns = list.map(textOfMessage).filter((t): t is ConversationTurn => t !== null)
     // Recent conversation, both roles, newest last: lets Jev judge
@@ -1349,10 +2854,10 @@ async function objectiveFor(
   }
 }
 
-// Question tool calls whose questions Jev could not answer and were handed
-// to the tool's own execute (which opens the human form). The form path
-// skips those forms instead of asking Jev the same thing again.
-// opencode loads a separate copy of this module for every setup()
+// Question tool calls are never handed back to the built-in form path
+// (that form hangs the TUI on 2.2.3), so there is no "already declined"
+// marker to share; the form poller only serves forms raised by other
+// tools. opencode loads a separate copy of this module for every setup()
 // instance (one per project directory), so module-level state is NOT
 // shared between instances: a "one poller per process" design that
 // leaves this on module-level state ends up as one poller per
@@ -1360,7 +2865,6 @@ async function objectiveFor(
 // globalThis. The versioned key keeps a future incompatible shape from
 // colliding with an instance still running older code.
 type SharedState = {
-  questionsLeftForHuman: Set<string>
   pollHandlers: Set<PollHandler>
   pollDirRefs: Map<string, number>
   formSeen: Set<string>
@@ -1369,7 +2873,6 @@ type SharedState = {
   pollCursor: number
 }
 const SHARED: SharedState = ((globalThis as Record<symbol, unknown>)[Symbol.for("jev-decision-gate.shared.v1")] ??= {
-  questionsLeftForHuman: new Set<string>(),
   pollHandlers: new Set<PollHandler>(),
   pollDirRefs: new Map<string, number>(),
   formSeen: new Set<string>(),
@@ -1377,7 +2880,6 @@ const SHARED: SharedState = ((globalThis as Record<symbol, unknown>)[Symbol.for(
   pollInFlight: false,
   pollCursor: 0,
 }) as SharedState
-const questionsLeftForHuman = SHARED.questionsLeftForHuman
 
 export type QuestionToolInput = {
   questions?: Array<{ question?: unknown; header?: unknown; multiple?: unknown; options?: unknown }>
@@ -1399,10 +2901,45 @@ export function questionToolResult(
   }
 }
 
+// Result when Jev cannot answer: the agent asks the user in chat instead
+// of opening the question form. Calling the original execute creates a
+// form server-side that the TUI never renders on opencode 2.2.3 (the SDK
+// promise adapter runs the host effect in the plugin runtime), which
+// hangs the turn forever; a chat question always reaches the user.
+// `answers` is empty on purpose: nothing is invented.
+export function questionHandoffResult(
+  input: QuestionToolInput,
+  reason: string,
+  options: Record<string, unknown> = {},
+): { output: { answers: string[][] }; content: string; metadata: { answers: string[][] } } {
+  const qs = Array.isArray(input.questions) ? input.questions : []
+  const answers = qs.map(() => [] as string[])
+  const listed = qs
+    .map((q, i) => {
+      const labels = (Array.isArray(q?.options) ? q.options : [])
+        .map((o) => (o && typeof o === "object" ? (o as { label?: unknown }).label : o))
+        .filter((l): l is string => typeof l === "string" && l.length > 0)
+        .map((l) => `"${l}"`)
+        .join(", ")
+      return `${i + 1}. "${String(q?.question ?? "")}"${labels ? ` (options: ${labels})` : ""}`
+    })
+    .join("\n")
+  const details = redactSecrets(listed)
+  const why = redactSecrets(reason)
+  const instruction = isUnattended(options)
+    ? `jev-decision-gate could not answer these questions on the user's behalf (${why}), and no human is available in this session: do not guess or pick an option yourself. Stop and report what you need.`
+    : `jev-decision-gate could not answer these questions on the user's behalf (${why}): do not guess or pick an option yourself. Ask the user these questions directly in your reply, then end your turn and wait for the user's answer.`
+  return {
+    output: { answers },
+    content: details ? `${instruction}\n${details}` : instruction,
+    metadata: { answers },
+  }
+}
+
 // Asks Jev each question of one question-tool call. Returns one [label] per
 // question, or null as soon as one cannot be answered (not allow, pick not
 // offered, ambiguous after redaction, or no options): the caller then
-// falls back to the human form for the whole call.
+// hands the whole call to the human in chat (never the built-in form).
 export async function answerQuestionsWithJev(
   deps: {
     runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>
@@ -1416,7 +2953,9 @@ export async function answerQuestionsWithJev(
 ): Promise<string[][] | null> {
   const qs = Array.isArray(input.questions) ? input.questions : []
   if (qs.length === 0) return null
-  const objective = await deps.objective()
+  // Bounded as well: the caller turns a throw (or this timeout) into the
+  // chat handoff, never into an answer.
+  const objective = await withLookupTimeout(deps.objective())
   const answers: string[][] = []
   for (let i = 0; i < qs.length; i++) {
     const q = qs[i] ?? {}
@@ -1452,8 +2991,8 @@ export async function answerQuestionsWithJev(
       elapsedMs: Date.now() - startedAt,
       optionsCount: labels.length,
       ...(retried ? { retry: 1 } : {}),
-      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
-      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+      ...(typeof decision.error === "string" ? { error_class: redactSecrets(decision.error) } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: redactSecrets(decision.error_detail) } : {}),
     })
     const pick = decision.pick
     if (decision.action !== "allow" || typeof pick !== "string" || !pick) {
@@ -1472,6 +3011,57 @@ export async function answerQuestionsWithJev(
     answers.push([matches[0] as string])
   }
   return answers
+}
+
+// Wraps the question tool's execute so Jev can answer it in-process.
+// `original` is accepted to keep the tool's contract but is NEVER called:
+// on opencode 2.2.3 the form it creates never reaches the TUI and the
+// agent's turn hangs (see docs/ARCHITECTURE.md, "Question tool" ADR).
+// When Jev cannot answer, the agent asks the user in chat and ends its
+// turn; no answer is ever invented.
+export type QuestionWrapDeps = {
+  runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>
+  objectiveFor: (sessionID: string) => Promise<string>
+  log: (entry: Record<string, unknown>) => void
+  options: Record<string, unknown>
+}
+
+export function wrapQuestionExecute(
+  original: (input: unknown, context: unknown) => Promise<unknown>,
+  deps: QuestionWrapDeps,
+): (input: unknown, context: unknown) => Promise<unknown> {
+  void original
+  return async (input, context) => {
+    const c = (context ?? {}) as { sessionID?: unknown; messageID?: unknown; id?: unknown }
+    const sessionID = String(c.sessionID ?? "")
+    const callKey = `${String(c.messageID ?? "")}:${String(c.id ?? "")}`
+    const qInput = (input ?? {}) as QuestionToolInput
+    let handoffReason = "Jev did not return a usable pick"
+    try {
+      const answers = await answerQuestionsWithJev(
+        {
+          runGate: deps.runGate,
+          objective: () => deps.objectiveFor(sessionID),
+          log: deps.log,
+          options: deps.options,
+        },
+        sessionID,
+        callKey,
+        qInput,
+      )
+      if (answers) {
+        deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "allow", reason: "question-answered", phase: "question-tool", pick: answers.map((a) => a.join(", ")).join(" | ") })
+        return questionToolResult(qInput, answers)
+      }
+    } catch (err) {
+      // Redacted before it reaches the log AND the agent-facing handoff text.
+      const errorClass = redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120)
+      deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "fail-open", phase: "question-tool", error_class: errorClass })
+      handoffReason = `gate error: ${errorClass}`
+    }
+    deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "question-handoff-chat", phase: "question-tool" })
+    return questionHandoffResult(qInput, handoffReason, deps.options)
+  }
 }
 
 // Shared form poller: setup() runs once per project directory, so a
@@ -1576,49 +3166,32 @@ export default Plugin.define({
     const logEv = (entry: Record<string, unknown>): void =>
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
+    // Unattended is read as on when its value is unclear (see isUnattended);
+    // say so once per setup, never the value itself.
+    if (unattendedUnrecognised(options)) logEv({ reason: "config-unattended-unrecognised" })
     
     // Answer the question tool in-process: wrapping its execute means
     // Jev's pick is returned as the tool result directly, with no form and
     // no reply through `opencode api` (which only reaches the background
-    // service). When Jev cannot answer, the original execute opens the
-    // human form as before. The marker keeps sibling setup() instances
+    // service). The original execute is never called: its form never
+    // reaches the TUI on 2.2.3, so when Jev cannot answer the agent asks
+    // the user in chat instead. The marker keeps sibling setup() instances
     // from wrapping the same tool twice.
     try {
       await ctx.tool.transform((editor) => {
         editor.update("question", (tool) => {
           const t = tool as { execute: (input: unknown, context: unknown) => Promise<unknown>; __jevWrapped?: boolean }
           if (t.__jevWrapped) return
-          const original = t.execute
           t.__jevWrapped = true
-          t.execute = async (input: unknown, context: unknown) => {
-            const c = (context ?? {}) as { sessionID?: unknown; messageID?: unknown; id?: unknown }
-            const sessionID = String(c.sessionID ?? "")
-            const callKey = `${String(c.messageID ?? "")}:${String(c.id ?? "")}`
-            try {
-              const answers = await answerQuestionsWithJev(
-                {
-                  runGate,
-                  objective: () =>
-                    objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options))).catch(
-                      () => "Answer the agent's multiple-choice question to unblock the session",
-                    ),
-                  log: logEv,
-                  options,
-                },
-                sessionID,
-                callKey,
-                (input ?? {}) as QuestionToolInput,
-              )
-              if (answers) {
-                logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "allow", reason: "question-answered", phase: "question-tool", pick: answers.map((a) => a.join(", ")).join(" | ") })
-                return questionToolResult((input ?? {}) as QuestionToolInput, answers)
-              }
-            } catch (err) {
-              logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "fail-open", phase: "question-tool", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
-            }
-            capped(questionsLeftForHuman).add(callKey)
-            return original(input, context)
-          }
+          t.execute = wrapQuestionExecute(t.execute, {
+            runGate,
+            objectiveFor: (sessionID) =>
+              objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options))).catch(
+                () => "Answer the agent's multiple-choice question to unblock the session",
+              ),
+            log: logEv,
+            options,
+          })
         })
       })
     } catch (err) {
@@ -1653,6 +3226,7 @@ export default Plugin.define({
           sha256Hex,
           isCatastrophic,
           subagentDetailFor,
+          shellCommandFor,
           resourceKinds,
           DESTRUCTIVE_HINT,
           COMMAND_SUBSTITUTION,
@@ -1850,12 +3424,6 @@ export async function handleFormAsked(
   const formID = String(payload.id ?? "")
   if (!sessionID || !formID) {
     log({ sessionID: sessionID || null, requestID: formID || null, tool: "question", gateAction: "ask-human", reason: "missing-ids" })
-    return
-  }
-  const toolRef = (payload.metadata as { tool?: { messageID?: unknown; id?: unknown } } | undefined)?.tool
-  if (toolRef && questionsLeftForHuman.has(`${String(toolRef.messageID ?? "")}:${String(toolRef.id ?? "")}`)) {
-    // Jev already declined this question in the tool wrapper; asking
-    // again here would just repeat the same call. It is the human's.
     return
   }
   const claim = claimReply(options, `form:${formID}`, inst)
