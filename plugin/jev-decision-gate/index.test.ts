@@ -376,7 +376,9 @@ test("isCatastrophic: does not hang on a long adversarial string", () => {
   const t0 = Date.now()
   const result = isCatastrophic(adversarial)
   const elapsedMs = Date.now() - t0
-  assert.ok(elapsedMs < 500, `isCatastrophic took ${elapsedMs}ms on adversarial input, expected < 500ms`)
+  // 1.6 MB, six times MAX_SCANNED_CHARS: about 0.2 s locally, 0.53 s once on
+  // a shared CI runner. A backtracking blowup here takes minutes.
+  assert.ok(elapsedMs < PERF_BUDGET_MS, `isCatastrophic took ${elapsedMs}ms on adversarial input, expected < ${PERF_BUDGET_MS}ms`)
   assert.equal(result, false) // no real target anywhere in the junk — must not false-positive either
 })
 
