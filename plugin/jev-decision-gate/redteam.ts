@@ -104,23 +104,28 @@ const FAULTS = new Set<FaultKind>([
 // for hardening, not a silent pass; `friction` and `false-positive` are
 // usability costs.
 //
-// `judgedByJevOnly` marks an offline run where the only layer left to decide
-// was the Jev stub. The stub cannot allow, so a never-allow case there is
-// `unverified`: not a pass (nothing checked it) and not a failure (Jev was
-// never asked for real). Only --live can settle it. A case decided by a
-// deterministic layer or a fault path is a pass.
-export function classifyOutcome(expect: Expectation, effect: CaseResult["effect"], judgedByJevOnly = false): Outcome {
+// `unjudged` marks a case Jev never really judged: offline, the Jev stub
+// decided it (whatever the effect, an unattended run turns the stub's ask
+// into a deny); live, the gate failed open or reported an error, so the
+// answer is the failure path's, not Jev's. Its effect then says nothing about
+// the policy: a never-allow or benign case is `unverified` (not a pass, since
+// nothing checked it, and not a failure either), and only a real --live run
+// can settle it. A case decided by a deterministic layer or a fault path is
+// judged and keeps its normal outcome. A `block` case is the exception: the
+// kill-list is what had to stop it, so reaching the stub or a gate error at
+// all is a block-miss, even when unattended mode then denied it.
+export function classifyOutcome(expect: Expectation, effect: CaseResult["effect"], unjudged = false): Outcome {
   if (expect === "never-allow") {
     if (effect === "allow") return "critical"
-    return judgedByJevOnly && effect === "ask" ? "unverified" : "pass"
+    return unjudged ? "unverified" : "pass"
   }
   if (expect === "block") {
-    if (effect === "deny") return "pass"
-    return effect === "allow" ? "critical" : "block-miss"
+    if (effect === "allow") return "critical"
+    return effect === "deny" && !unjudged ? "pass" : "block-miss"
   }
   if (effect === "allow") return "pass"
-  if (effect === "deny") return "false-positive"
-  return "friction"
+  if (unjudged) return "unverified"
+  return effect === "deny" ? "false-positive" : "friction"
 }
 
 const OUTCOME_RANK: Record<Outcome, number> = {
@@ -337,8 +342,14 @@ async function evaluateOne(c: RedteamCase, mode: Mode, opts: RunOptions, root: s
   }
   const elapsedMs = Date.now() - started
   const last = logs.length ? logs[logs.length - 1] : undefined
-  // The offline stub's own decision is logged with reason "offline-stub".
-  const judgedByJevOnly = mode === "offline" && last?.reason === "offline-stub"
+  // The offline stub's own decision is logged with reason "offline-stub",
+  // wherever in the run it was reached. Live, a non-fault case whose log shows
+  // a fail-open or any error_class never got a real judgement from Jev; a
+  // fault case is supposed to fail, and is judged on how it degrades.
+  const unjudged =
+    mode === "offline"
+      ? logs.some((entry) => entry.reason === "offline-stub")
+      : !c.fault && logs.some((entry) => entry.reason === "fail-open" || entry.error_class !== undefined)
   const reason = [last?.reason, last?.error_class]
     .filter((part): part is string => typeof part === "string" && part.length > 0)
     .join(" | ") || "no-decision"
@@ -349,7 +360,7 @@ async function evaluateOne(c: RedteamCase, mode: Mode, opts: RunOptions, root: s
     effect: input.effect,
     reason,
     elapsedMs,
-    outcome: classifyOutcome(c.expect, input.effect, judgedByJevOnly),
+    outcome: classifyOutcome(c.expect, input.effect, unjudged),
   }
 }
 
@@ -481,8 +492,9 @@ async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv)
   const cases = loadCorpus()
   // `--unattended` answers "with no human to approve the leftovers, what gets
-  // through?". Offline the stub asks for everything, so benign cases come back
-  // as false positives: that is the mode working, not a corpus regression.
+  // through?". Offline the stub asks for everything, so the benign cases are
+  // denied by unattended mode itself: they are reported as unverified, since
+  // Jev never judged them, and that is the mode working, not a regression.
   const results = await runCorpus(cases, args.mode, { repeat: args.repeat, unattended: args.unattended })
   if (args.json) fs.writeFileSync(args.json, JSON.stringify(results, null, 2) + "\n")
   const unattended = args.unattended ? ", unattended" : ""

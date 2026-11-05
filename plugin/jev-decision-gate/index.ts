@@ -365,17 +365,27 @@ const FETCH_COMMANDS = new Set(["curl", "wget"])
 // command word. A Map, not an object, so a command named like an Object
 // prototype property is not mistaken for a wrapper.
 const WRAPPER_ARG_OPTIONS = new Map<string, ReadonlySet<string>>([
-  ["sudo", new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T"])],
+  ["sudo", new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "--user", "--group", "--other-user", "--chdir", "--host", "--prompt", "--role", "--type"])],
   ["doas", new Set(["-u", "-C"])],
-  ["env", new Set(["-u", "-C", "-S"])],
+  ["env", new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"])],
   ["nice", new Set(["-n"])],
-  ["timeout", new Set(["-s", "-k"])],
+  ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
+  // xargs runs the words after its options as a command, so `xargs rm -r -f ~`
+  // is an rm. Only the options that take a separate value are listed.
+  ["xargs", new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--arg-file", "--delimiter", "--eof", "--replace", "--max-lines", "--max-args", "--max-procs", "--max-chars"])],
+  ["stdbuf", new Set(["-i", "-o", "-e", "--input", "--output", "--error"])],
 ])
-const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time"])
+// `busybox rm ...` runs the applet named next, like any other wrapper.
+const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time", "busybox"])
 // `sudo -s` / `sudo -i` with nothing after them start a shell that reads its
 // program from stdin, exactly like a bare `bash`.
 const SHELL_FLAG_WRAPPERS = new Set(["sudo", "doas"])
 const SHELL_FLAG = /^-[a-z]*[si]/i
+// `command -v curl` / `command -V node` only look a command up and run
+// nothing, so what follows is not a command word. (`type` and `which` need no
+// rule: they are not wrappers, so their own name is already the command word
+// and what follows is never read as one.)
+const COMMAND_LOOKUP_FLAG = /^-[a-zA-Z]*[vV][a-zA-Z]*$/
 
 // Tokens of one segment with its leading wrappers and VAR=value assignments
 // removed. Wrappers can nest (`sudo env bash`), so each one is entered in
@@ -402,6 +412,7 @@ function commandTokens(segment: string): string[] {
     }
     if (wrapper === null) break
     if (token.startsWith("-") && token.length > 1) {
+      if (wrapper === "command" && COMMAND_LOOKUP_FLAG.test(token)) return []
       if (SHELL_FLAG_WRAPPERS.has(wrapper) && (SHELL_FLAG.test(token) || token === "--shell" || token === "--login")) {
         shellFlag = true
       }
@@ -421,8 +432,12 @@ function commandTokens(segment: string): string[] {
   return rest
 }
 
+// Quotes and backslashes inside a command word do not change which command
+// runs (`"rm"`, `r\m`, `\bash`, `b""ash` are all rm/bash), so they come out
+// before the path is cut off.
 function commandName(word: string): string {
-  return (word.split("/").pop() ?? word).toLowerCase()
+  const bare = word.replace(/["'\\]/g, "")
+  return (bare.split("/").pop() ?? bare).toLowerCase()
 }
 
 function isFetchOrDecode(tokens: string[]): boolean {
@@ -435,28 +450,99 @@ function isFetchOrDecode(tokens: string[]): boolean {
   return false
 }
 
-// `bash`/`sh` with no script argument, a literal "-", or -s reads the
-// program from stdin. A positional script (`bash setup.sh`) runs local
-// code, not the fetch, so it does not count.
+const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"])
+// Long flags that print something or hand the interpreter its program, so no
+// program is read from stdin (`python3 --version`, `node --test`).
+const NO_STDIN_LONG = new Set(["--version", "--help", "--test", "--eval", "--print", "--command"])
+// Short-flag letters with the same meaning for the non-shell interpreters:
+// -c/-e/-E/-r/-p give the program, -m runs a module, -v/-V/-h print and exit.
+const NO_STDIN_SHORT = /[cmeEpvVhr]/
+// Shell options whose value is a separate word, not a script path.
+const SHELL_OPTIONS_WITH_VALUE = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"])
+const PYTHON_OPTIONS_WITH_VALUE = new Set(["-W", "-X"])
+
+// An interpreter reads its program from stdin only when nothing else supplies
+// one: no arguments at all, `-` or /dev/stdin as the first positional, or
+// `-s` on a shell. A flag that gives the program or prints and exits (`-c`,
+// `-e`, `-m`, `-r...`, `-v`, `--version`, `--help`, `--test`) means it does not,
+// and a script path (`bash setup.sh`) runs local code, not the fetch. Plain
+// option flags (`bash -x`, `python3 -u`) keep it reading stdin.
 function interpreterReadsStdin(tokens: string[]): boolean {
-  if (tokens.length === 0 || !STDIN_INTERPRETERS.has(commandName(tokens[0]))) return false
-  const args = tokens.slice(1)
-  // getopt-style short cluster containing `s` (`-s`, `-es`) is -s.
-  if (args.some((a) => /^-[A-Za-z]+$/.test(a) && a.includes("s"))) return true
-  const positional = args.find((a) => a === "-" || !a.startsWith("-"))
-  return positional === undefined || positional === "-"
+  if (tokens.length === 0) return false
+  const name = commandName(tokens[0])
+  if (!STDIN_INTERPRETERS.has(name)) return false
+  const args = tokens.slice(1).map((a) => a.replace(/["'\\]/g, ""))
+  const shell = SHELL_INTERPRETERS.has(name)
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+    if (arg === "--") return args[i + 1] === undefined || args[i + 1] === "-" || args[i + 1] === "/dev/stdin"
+    if (arg === "-" || arg === "/dev/stdin") return true
+    if (arg.startsWith("--")) {
+      if (NO_STDIN_LONG.has(arg.split("=")[0])) return false
+      if (shell && SHELL_OPTIONS_WITH_VALUE.has(arg)) i++
+      continue
+    }
+    if (shell && SHELL_OPTIONS_WITH_VALUE.has(arg)) {
+      i++
+      continue
+    }
+    if (arg.startsWith("-") || (shell && arg.startsWith("+"))) {
+      const letters = arg.slice(1)
+      if (shell) {
+        // getopt-style cluster: `-c` supplies the program, `-s`/`-es` reads stdin.
+        if (letters.includes("c")) return false
+        if (letters.includes("s")) return true
+      } else if (NO_STDIN_SHORT.test(letters)) {
+        return false
+      } else if (PYTHON_OPTIONS_WITH_VALUE.has(arg)) {
+        i++
+      }
+      continue
+    }
+    // First positional is a script path.
+    return false
+  }
+  return true
 }
 
+// opencode drops the operators when it splits, but a recovered or unsplit
+// command still has them. Statements end at ; && || & or a newline (a `&`
+// that belongs to `2>&1`, `&>file` or `|&` is not one); inside a statement a
+// single `|` feeds the next stage.
+const STATEMENT_BREAK = /;|&&|\|\||\n|(?<![<>&|])&(?![>&|])/
+const PIPE = /\|&?/
+// Grouping characters would otherwise stick to a command word (`(curl`,
+// `bash)`, `$(wget`) and hide it.
+const GROUPING = /\$?[(){}`]/g
+
+// True when some interpreter reads a fetched or decoded program from stdin.
+// Every segment is read once, left to right, so the cost is linear.
+//
+// Inside one segment only a real pipe counts: an interpreter at stage k is
+// fed by a pipeline that already holds a fetch or decode at an earlier
+// stage. `curl --version && node --test` or `curl -s URL | jq .` have none.
+//
+// Across segments the pipe is gone (opencode's splitter drops it), so a
+// later segment that reads stdin after an earlier fetch is the only evidence
+// left. That fallback is for resources only: `isCatastrophic` passes the
+// recovered original alone when it has one, because its fragments repeat
+// commands the original shows with their real operators.
 export function fetchFeedsInterpreter(segments: string[]): boolean {
-  // A segment can still hold a whole pipeline (`curl U | sudo -E bash`) when
-  // the original command was recovered or the splitter left it joined, so the
-  // operators are split here too, as hasDestructiveCurlOrWget does.
-  const parsed = segments.flatMap((s) => s.split(/[;&|]+/)).map(commandTokens)
-  for (let i = 0; i < parsed.length; i++) {
-    if (!isFetchOrDecode(parsed[i])) continue
-    for (let j = i + 1; j < parsed.length; j++) {
-      if (interpreterReadsStdin(parsed[j])) return true
+  let fetchedEarlier = false
+  for (const segment of segments) {
+    let fetchedInSegment = false
+    for (const statement of segment.split(STATEMENT_BREAK)) {
+      let fetched = false
+      for (const stage of statement.split(PIPE)) {
+        const tokens = commandTokens(stage.replace(GROUPING, " "))
+        if (interpreterReadsStdin(tokens) && (fetched || fetchedEarlier)) return true
+        if (isFetchOrDecode(tokens)) {
+          fetched = true
+          fetchedInSegment = true
+        }
+      }
     }
+    if (fetchedInSegment) fetchedEarlier = true
   }
   return false
 }
@@ -476,15 +562,25 @@ const RM_PROTECTED_TARGETS = new Set(["/", "~", "/home", "/root", ".", ".."])
 // `/home/idiaval/tmp` is ordinary cleanup, matching the regex's `(?!\S)`.
 const HOME_USER_DIR = /^\/home\/[^/\s]+$/
 
+// Drops a trailing run of the given characters with one backward scan. A
+// `/[;)]+$/` regex is retried from every start position, so input that is
+// one long run of `)` costs O(n^2) (250 KB of them stalled the event loop);
+// this is O(n).
+function stripTrailing(text: string, chars: string): string {
+  let end = text.length
+  while (end > 0 && chars.includes(text[end - 1])) end--
+  return end === text.length ? text : text.slice(0, end)
+}
+
 // Reduces an rm operand to the directory it names, so `~/*`, `$HOME/*`,
 // `"${HOME}"/*`, `/home/u/` and `./*` compare equal to `~`, `/home/u` and `.`.
 // A wipe of the contents is still a wipe of the directory. Quotes and
 // backslashes are removed as normalizeCommand does; the trailing `)` and `;`
 // come from a command substitution or a statement end. Input is lowercased.
 function rmTargetOf(raw: string): string {
-  let t = raw.replace(/["'`\\]/g, "").replace(/[;)]+$/, "")
+  let t = stripTrailing(raw.replace(/["'`\\]/g, ""), ";)")
   if (t.endsWith("/*")) t = t.slice(0, -2) || "/"
-  while (t.length > 1 && t.endsWith("/")) t = t.slice(0, -1)
+  if (t.length > 1) t = stripTrailing(t, "/") || "/"
   if (t === "$home" || t.startsWith("$home/")) t = "~" + t.slice("$home".length)
   if (t === "${home}" || t.startsWith("${home}/")) t = "~" + t.slice("${home}".length)
   return t
@@ -493,11 +589,10 @@ function rmTargetOf(raw: string): string {
 // Quotes/backslashes are stripped the way normalizeCommand does it, so
 // `rm -r -f "$HOME"` reads as the same token as the bare form.
 function rmSegmentHits(segment: string): boolean {
-  const text = segment
-    .toLowerCase()
-    .replace(/\$\{ifs\}/g, " ")
-    .replace(/\$ifs\b/g, " ")
-  const tokens = commandTokens(text)
+  // Lowercased only after commandTokens: its wrapper option tables are case
+  // sensitive (`xargs -I` takes a value, `-i` does not).
+  const text = segment.replace(/\$\{ifs\}/gi, " ").replace(/\$ifs\b/gi, " ")
+  const tokens = commandTokens(text).map((token) => token.toLowerCase())
   // The first token is a command word. Later ones are too when they open a
   // subshell or substitution (`echo $(rm -rf ~)`, `(rm -rf /)`).
   for (let k = 0; k < tokens.length; k++) {
@@ -558,6 +653,11 @@ export function rmRemovesProtectedTarget(segments: string[]): boolean {
 // (`gh pr create --title "feat: +20% faster"`) or in a commit message.
 const GIT_FORCE_REFSPEC = /^\+[\w./@{}^~-]+(:[\w./-]+)?$/
 const GIT_ARG_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree"])
+// A short-flag cluster after `push` that holds `f` is `-f` bundled with
+// others (`-fu`, `-uf`), which the lone-`-f` regex above cannot see. Only
+// push's own boolean short flags are accepted in the cluster, so `-ofoo`
+// (`-o` with a value) and other commands' flags are not read as a force.
+const GIT_PUSH_FORCE_CLUSTER = /^-[nuvqd46]*f[nufvqd46]*$/
 
 // Scans one simple command (already split on operators) as a token stream,
 // one pass, so a long run of `git` words stays linear. A `git` word resets
@@ -568,7 +668,7 @@ function forcePushRefspecIn(simple: string): boolean {
   for (const raw of simple.split(/\s+/)) {
     // Quotes and backslashes out, a substitution's `(`/`$(` in front and its
     // `)` behind, so `$(git push origin +main)` reads the same as the bare form.
-    const token = raw.replace(/["'`\\]/g, "").replace(/^[(`$]+/, "").replace(/\)+$/, "")
+    const token = stripTrailing(raw.replace(/["'`\\]/g, "").replace(/^[(`$]+/, ""), ")")
     if (!token) continue
     if (commandName(token) === "git") {
       state = "git"
@@ -587,7 +687,7 @@ function forcePushRefspecIn(simple: string): boolean {
       state = token === "push" ? "push" : "idle"
       continue
     }
-    if (GIT_FORCE_REFSPEC.test(token)) return true
+    if (GIT_FORCE_REFSPEC.test(token) || GIT_PUSH_FORCE_CLUSTER.test(token)) return true
   }
   return false
 }
@@ -608,21 +708,23 @@ export function forcePushRefspec(segments: string[]): boolean {
 // call. Nothing is anchored to a home prefix: `~`, `$HOME`, `${HOME}`,
 // `/home/<user>` and `/root` all leave the same suffix to match.
 const CREDENTIAL_STORE = [
-  // `.ssh` only as a directory (`~/.ssh/config`) or a whole token (`~/.ssh`).
-  // `www.ssh.com` and `.ssh-agent-notes.md` name something else.
-  /\.ssh(?=[/\\\s"'`;|&)]|$)/i,
-  /\.aws[/\\]credentials\b/i,
-  /\.gnupg\b/i,
+  // The credential directories themselves, or anything under them. The name
+  // must end there: a `.` or `-` or word character after it means another
+  // thing (`www.ssh.com`, `.ssh-agent-notes.md`, `.dockerignore`), anything
+  // else is the directory (`~/.ssh*`, `~/.ssh>x`, `~/.ssh,`, `~/.ssh}`,
+  // `~/.aws/cred*`, `tar czf - ~/.aws`).
+  /\.(?:ssh|aws|docker|kube|gnupg)(?![\w.-])/i,
+  // opencode's data directory holds auth.json and the session history.
+  /\.local[/\\]share[/\\]opencode(?![\w.-])/i,
+  // Prints every kubeconfig credential unredacted.
+  /\bkubectl\s+config\s+view\b[^\n]{0,200}--raw\b/i,
   /\.netrc\b/i,
   /\.git-credentials\b/i,
   /\.config[/\\]git[/\\]credentials\b/i,
   /\.config[/\\]gh\b/i,
-  /\.docker[/\\]config\.json/i,
-  /\.kube[/\\]config\b/i,
   /\.pypirc\b/i,
   /\.npmrc\b/i,
   /\.cargo[/\\]credentials(?:\.toml)?\b/i,
-  /\.local[/\\]share[/\\]opencode[/\\]auth\.json\b/i,
   /\/etc\/shadow\b/i,
   /\/etc\/sudoers\b/i,
   /\.(?:p12|pfx)\b/i,
@@ -634,14 +736,23 @@ const CREDENTIAL_STORE = [
   /\bid_(?:rsa|ed25519|ecdsa)\b/i,
 ]
 
+// Checked on the raw text and on its normalized form, so quotes, backslashes
+// or separators spliced into a path (`~/.s"s"h/id_rsa`) do not hide it.
 export function touchesCredentialStore(text: string): boolean {
-  return CREDENTIAL_STORE.some((re) => re.test(text))
+  const normalized = normalizeCommand(text)
+  return CREDENTIAL_STORE.some((re) => re.test(text) || re.test(normalized))
 }
 
-export function isCatastrophic(joined: string): boolean {
+// `original` is the shell command recovered from the session when there is
+// one. `joined` then holds it followed by the fragments opencode split it
+// into, which repeat its commands without the operators. The fetch-to-
+// interpreter rule reads the original alone in that case: with the real
+// pipes available, matching fragments by order would flag `curl ... && node
+// --test` as a pipe-to-shell. Every other rule still scans all of `joined`.
+export function isCatastrophic(joined: string, original?: string | null): boolean {
   // Segment rule first: it is a single linear pass and covers the live
   // split shape even when the original command could not be recovered.
-  if (fetchFeedsInterpreter(joined.split("\n"))) return true
+  if (fetchFeedsInterpreter(original ? [original] : joined.split("\n"))) return true
   if (rmRemovesProtectedTarget(joined.split("\n"))) return true
   if (forcePushRefspec(joined.split("\n"))) return true
   const step = CATASTROPHIC_CHECK_MAX_CHARS - CATASTROPHIC_WINDOW_OVERLAP
@@ -712,16 +823,38 @@ function isEnabled(options: Record<string, unknown>): boolean {
 // "yes" to anything still at "ask", which silently turns the gate's "I am
 // not sure" (Jev ask-human, an unknown decision, a gate error, an oversized
 // request) into an approval. Opting in makes those cases deny instead.
-// Turning this on only ever turns an "ask" into a deny, so accepting the
-// common spellings of "on" is the safe direction: a config or env value that
-// is read as off would instead leave ask-human to become an approval under
-// `--auto`. Other values, including "off", stay attended.
+// Turning this on only ever turns an "ask" into a deny, so the safe direction
+// is to read doubt as on: a value read as off would instead leave ask-human
+// to become an approval under `--auto`. Only an explicit off spelling (false,
+// 0, no, off, empty or unset) keeps the gate attended. Anything else that is
+// not a recognised "on" either (a typo such as "ture", 2, an object) counts
+// as unattended too, and setup() logs that it did without echoing the value.
 const UNATTENDED_ON = new Set(["true", "1", "yes", "on"])
+const UNATTENDED_OFF = new Set(["false", "0", "no", "off", ""])
+
+function unattendedState(value: unknown): "on" | "off" | "unrecognised" {
+  if (value === undefined || value === null) return "off"
+  if (typeof value === "boolean") return value ? "on" : "off"
+  if (typeof value === "number") return value === 1 ? "on" : value === 0 ? "off" : "unrecognised"
+  if (typeof value !== "string") return "unrecognised"
+  const text = value.trim().toLowerCase()
+  if (UNATTENDED_ON.has(text)) return "on"
+  return UNATTENDED_OFF.has(text) ? "off" : "unrecognised"
+}
+
 export function isUnattended(options: Record<string, unknown>): boolean {
-  const configured = options.unattended
-  if (configured === true) return true
-  if (typeof configured === "string" && UNATTENDED_ON.has(configured.toLowerCase())) return true
-  return UNATTENDED_ON.has((process.env.JEV_GATE_UNATTENDED ?? "").toLowerCase())
+  return (
+    unattendedState(options.unattended) !== "off" || unattendedState(process.env.JEV_GATE_UNATTENDED) !== "off"
+  )
+}
+
+// True when the config or the env var holds a value that is neither a known
+// "on" nor a known "off": it is being treated as unattended on a guess.
+export function unattendedUnrecognised(options: Record<string, unknown>): boolean {
+  return (
+    unattendedState(options.unattended) === "unrecognised" ||
+    unattendedState(process.env.JEV_GATE_UNATTENDED) === "unrecognised"
+  )
 }
 
 function repoRoot(options: Record<string, unknown>): string {
@@ -1342,6 +1475,16 @@ export function textOfMessage(message: unknown): ConversationTurn | null {
 // points back at the exact tool-call part that triggered this permission.
 export type PermissionSource = { messageID: string; id: string }
 
+// Both lookups below answer null for "no record found" (no source, no
+// matching message or part). A lookup that THREW or timed out is a different
+// thing: it says nothing about what the command or prompt is. By default it
+// still reads as null (the pre-existing behaviour every other caller keeps);
+// evaluatePermission asks for `throwOnFailure` so it can tell the two apart
+// and hold the request instead of judging thin fragments.
+export interface LookupOptions {
+  throwOnFailure?: boolean
+}
+
 // The "subagent" permission action (opencode 2.0.11; docs still call it
 // "task") carries only the target agent's short name in `resources` —
 // live-verified: `resKinds` was consistently "text:7ch", the exact length
@@ -1362,6 +1505,7 @@ export async function subagentDetailFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   source: PermissionSource | null | undefined,
+  lookup: LookupOptions = {},
 ): Promise<string | null> {
   if (!source?.messageID || !source?.id) return null
   try {
@@ -1386,7 +1530,8 @@ export async function subagentDetailFor(
       typeof prompt === "string" && prompt ? `prompt: ${prompt}` : "",
     ].filter(Boolean)
     return parts.length ? parts.join("\n") : null
-  } catch {
+  } catch (err) {
+    if (lookup.throwOnFailure) throw err
     return null
   }
 }
@@ -1416,6 +1561,7 @@ export async function shellCommandFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   source: PermissionSource | null | undefined,
+  lookup: LookupOptions = {},
 ): Promise<string | null> {
   if (!source?.messageID || !source?.id) return null
   try {
@@ -1435,7 +1581,8 @@ export async function shellCommandFor(
     if (!input || typeof input !== "object") return null
     const command = (input as Record<string, unknown>).command
     return typeof command === "string" && command.trim() ? command : null
-  } catch {
+  } catch (err) {
+    if (lookup.throwOnFailure) throw err
     return null
   }
 }
@@ -1485,17 +1632,19 @@ export interface EvaluateDeps {
   kindFor: (action: string, resources: string[]) => string;
   redactSecrets: (text: string) => string;
   sha256Hex: (text: string) => string;
-  isCatastrophic: (joined: string) => boolean;
+  isCatastrophic: (joined: string, original?: string | null) => boolean;
   subagentDetailFor: (
     ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
     sessionID: string,
     source: PermissionSource | null | undefined,
+    lookup?: LookupOptions,
   ) => Promise<string | null>;
   // Optional so existing fixtures compile unchanged; setup always passes it.
   shellCommandFor?: (
     ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
     sessionID: string,
     source: PermissionSource | null | undefined,
+    lookup?: LookupOptions,
   ) => Promise<string | null>;
   resourceKinds: (resources: string[]) => string;
   DESTRUCTIVE_HINT: RegExp;
@@ -1572,6 +1721,15 @@ export async function evaluatePermission(
   // The text recovered by a lookup, if any. Jev's detail shows only this
   // (plus the metadata extras), not the resources it was recovered from.
   let recovered: string | null = null;
+  // The shell command recovered from the session, kept apart from `recovered`
+  // because the kill-list reads it as a whole command (with its pipes), and
+  // the dispatch prompt below is prose.
+  let shellOriginal: string | null = null;
+  let promptRecovered = false;
+  // Set when a lookup threw or timed out, as opposed to finding no record.
+  let lookupFailure: string | null = null;
+  const lookupError = (err: unknown): string =>
+    deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120);
 
   // Shell commands arrive PRE-SPLIT with the operators dropped (opencode
   // 2.2.3), so recover the real command and scan that too: pipe-only
@@ -1579,10 +1737,16 @@ export async function evaluatePermission(
   // operators, and Jev must judge the command, not its fragments. A failed
   // lookup leaves today's behaviour exactly.
   if (action === "shell" || action === "bash") {
-    const original = typeof deps.shellCommandFor === "function"
-      ? await deps.shellCommandFor(deps.ctx, sessionID, source)
-      : null;
+    let original: string | null = null;
+    try {
+      original = typeof deps.shellCommandFor === "function"
+        ? await deps.shellCommandFor(deps.ctx, sessionID, source, { throwOnFailure: true })
+        : null;
+    } catch (err) {
+      lookupFailure = lookupError(err);
+    }
     if (original) {
+      shellOriginal = original;
       recovered = original;
       scanned = `${original}\n${joined}`;
       // Extra resource (not a replacement): kindFor's pipeline checks look
@@ -1597,8 +1761,14 @@ export async function evaluatePermission(
   // dispatch like "run rm -rf ~" or "print ~/.ssh/id_rsa" meets the same
   // deterministic rules as a shell command.
   if (action === "subagent" || action === "task") {
-    const enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source);
+    let enriched: string | null = null;
+    try {
+      enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source, { throwOnFailure: true });
+    } catch (err) {
+      lookupFailure = lookupError(err);
+    }
     if (enriched) {
+      promptRecovered = true;
       recovered = enriched;
       scanned = `${enriched}\n${joined}`;
       scannedResources = [enriched, ...mutableResources];
@@ -1625,8 +1795,34 @@ export async function evaluatePermission(
     return;
   }
 
+  // A dispatch prompt is prose written to another model, not a command: it
+  // can mention `shutdown`, `drop table` or a path without running anything.
+  // Only the resources (the agent's name) are a hard deny; a match that comes
+  // from the prompt text alone goes to a human instead, and is held when
+  // nobody is there to answer.
+  const resourcesCatastrophic = promptRecovered ? deps.isCatastrophic(joined) : false;
+  if (promptRecovered && !resourcesCatastrophic && deps.isCatastrophic(scanned)) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("subagent-prompt-flagged", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "subagent-prompt-flagged",
+        detail_sha256: deps.sha256Hex(scanned),
+        unattended: true,
+      });
+      return;
+    }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "subagent-prompt-flagged", detail_sha256: deps.sha256Hex(scanned) });
+    return;
+  }
+
   // Catastrophic pattern: deny instantly with message, no Jev call
-  if (deps.isCatastrophic(scanned)) {
+  if (promptRecovered ? resourcesCatastrophic : deps.isCatastrophic(scanned, shellOriginal)) {
     input.effect = "deny";
     input.message =
       "Blocked by jev-decision-gate: matches the catastrophic-command kill-list. Do not retry this command or variants of it.";
@@ -1661,6 +1857,21 @@ export async function evaluatePermission(
       return;
     }
     deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "credential-path" });
+    return;
+  }
+
+  // A lookup that failed (threw or timed out) says nothing about the command
+  // or the prompt, so Jev would judge thin fragments: hold it. It sits after
+  // the kill-list and credential guard, which still see the resources.
+  if (lookupFailure !== null) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("context-lookup-failed", deps.redactSecrets);
+      deps.log({ sessionID, tool: action, kind, gateAction: "reject", reason: "context-lookup-failed", error_class: lookupFailure, unattended: true });
+      return;
+    }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "context-lookup-failed", error_class: lookupFailure });
     return;
   }
 
@@ -1833,7 +2044,10 @@ export async function objectiveFor(
   budgetChars: number,
 ): Promise<string> {
   try {
-    const messages = await ctx.session.context({ sessionID })
+    // Bounded like the other session.context lookups: a call that never
+    // settles would otherwise hold this permission forever. A timeout lands
+    // in the catch below and falls back to the generic objective.
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
     const list = Array.isArray(messages) ? messages : []
     const turns = list.map(textOfMessage).filter((t): t is ConversationTurn => t !== null)
     // Recent conversation, both roles, newest last: lets Jev judge
@@ -1959,7 +2173,9 @@ export async function answerQuestionsWithJev(
 ): Promise<string[][] | null> {
   const qs = Array.isArray(input.questions) ? input.questions : []
   if (qs.length === 0) return null
-  const objective = await deps.objective()
+  // Bounded as well: the caller turns a throw (or this timeout) into the
+  // chat handoff, never into an answer.
+  const objective = await withLookupTimeout(deps.objective())
   const answers: string[][] = []
   for (let i = 0; i < qs.length; i++) {
     const q = qs[i] ?? {}
@@ -2170,6 +2386,9 @@ export default Plugin.define({
     const logEv = (entry: Record<string, unknown>): void =>
       logLine(options, { inst, pid: process.pid, ...entry })
     pruneReplied(options)
+    // Unattended is read as on when its value is unclear (see isUnattended);
+    // say so once per setup, never the value itself.
+    if (unattendedUnrecognised(options)) logEv({ reason: "config-unattended-unrecognised" })
     
     // Answer the question tool in-process: wrapping its execute means
     // Jev's pick is returned as the tool result directly, with no form and
