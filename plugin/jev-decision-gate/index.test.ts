@@ -4,6 +4,12 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { test } from "node:test"
+
+// Budget for the super-linear-time tests. Locally these inputs finish in
+// about 0.5 s and the regressions they guard against took 37 s to over
+// 200 s; a shared CI runner has measured 3 s, so the bar sits well above
+// that noise and far below the failure it exists to catch.
+const PERF_BUDGET_MS = 10000
 import JevGate, {
   answerQuestionsWithJev,
   capped,
@@ -370,7 +376,9 @@ test("isCatastrophic: does not hang on a long adversarial string", () => {
   const t0 = Date.now()
   const result = isCatastrophic(adversarial)
   const elapsedMs = Date.now() - t0
-  assert.ok(elapsedMs < 500, `isCatastrophic took ${elapsedMs}ms on adversarial input, expected < 500ms`)
+  // 1.6 MB, six times MAX_SCANNED_CHARS: about 0.2 s locally, 0.53 s once on
+  // a shared CI runner. A backtracking blowup here takes minutes.
+  assert.ok(elapsedMs < PERF_BUDGET_MS, `isCatastrophic took ${elapsedMs}ms on adversarial input, expected < ${PERF_BUDGET_MS}ms`)
   assert.equal(result, false) // no real target anywhere in the junk — must not false-positive either
 })
 
@@ -3194,14 +3202,14 @@ test("evaluatePermission: `curl ... && node --test` recovered from the session r
 test("isCatastrophic: the segment rule is linear, a 250 KB adversarial input finishes in seconds, not minutes", () => {
   // The `)` run must be followed by something: a run that ends the string is
   // matched at once by a `/\)+$/` regex, but one that does not is retried from
-  // every position (37 s at 250 000 `)` before the fix). The 3 s budget
+  // every position (37 s at 250 000 `)` before the fix). PERF_BUDGET_MS
   // leaves room for a slow CI runner and still fails that regression.
   const run = ")".repeat(250000)
   for (const input of ["rm -rf " + run, "rm -rf " + run + "x", "git push " + run + "x", run + "x", "curl;".repeat(50000)]) {
     const t0 = Date.now()
     isCatastrophic(input)
     const elapsedMs = Date.now() - t0
-    assert.ok(elapsedMs < 3000, `${input.slice(0, 16)}... took ${elapsedMs}ms`)
+    assert.ok(elapsedMs < PERF_BUDGET_MS, `${input.slice(0, 16)}... took ${elapsedMs}ms`)
   }
 })
 
@@ -3528,7 +3536,7 @@ test("isCatastrophic: a long multi-line script after rm -rf finishes at once (no
     const ms = elapsedMsOf(() => {
       result = isCatastrophic(input, input)
     })
-    assert.ok(ms < 3000, `took ${ms}ms`)
+    assert.ok(ms < PERF_BUDGET_MS, `took ${ms}ms`)
     assert.equal(result, false)
   }
   for (const count of [30, 30000]) {
@@ -3537,7 +3545,7 @@ test("isCatastrophic: a long multi-line script after rm -rf finishes at once (no
     const ms = elapsedMsOf(() => {
       result = isCatastrophic(input)
     })
-    assert.ok(ms < 3000, `${count} lines took ${ms}ms`)
+    assert.ok(ms < PERF_BUDGET_MS, `${count} lines took ${ms}ms`)
     assert.equal(result, false)
   }
 })
@@ -3982,7 +3990,7 @@ test("nested shell strings: a deeply nested or very large input stays fast", () 
   const substitutions = "$(".repeat(120000)
   for (const input of [nestedGroups, manyScripts, quotes, substitutions]) {
     const ms = elapsedMsOf(() => isCatastrophic(input))
-    assert.ok(ms < 3000, `${input.slice(0, 12)}... took ${ms}ms`)
+    assert.ok(ms < PERF_BUDGET_MS, `${input.slice(0, 12)}... took ${ms}ms`)
   }
 })
 
@@ -4040,7 +4048,7 @@ test("isCatastrophic: input built so every nested script holds the whole input f
   }
   for (const [name, input] of Object.entries(inputs)) {
     const ms = elapsedMsOf(() => isCatastrophic(input))
-    assert.ok(ms < 3000, `${name} took ${ms}ms`)
+    assert.ok(ms < PERF_BUDGET_MS, `${name} took ${ms}ms`)
   }
   assert.equal(isCatastrophic(inputs.wide), true)
   const narrow = "$(bash -c ".repeat(160)
