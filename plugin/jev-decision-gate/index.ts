@@ -41,11 +41,20 @@ const CATASTROPHIC = [
   // fetch (curl/wget) directly inside the substitution counts, so local
   // `eval "$(ssh-agent -s)"` or `source <(kubectl completion bash)` pass.
   /\b(sh|bash|zsh|dash|ksh)\s+(-[a-z]+\s+)*-[a-z]*c\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
+  // The same for the other interpreters, which take the program as an
+  // argument: `python3 -c "$(curl ...)"`, `perl -e`, `node -e`, `ruby -e`,
+  // `php -r`. Only a fetch inside the substitution counts, as above.
+  /\b(python[23]?|perl|ruby|node|php)\s+(-[a-z]+\s+)*-[a-z]*[cer]\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
   /\beval\s+["']?\s*(\$\(|`)\s*(curl|wget)\b/,
-  /(^|[\s(])(source|sh|bash|zsh|\.)\s+<\(\s*(curl|wget)\b/,
+  // Process substitution: `python3 <(curl ...)` hands the fetched file to
+  // the interpreter as a script, the same as `bash <(curl ...)`.
+  /(^|[\s(])(source|sh|bash|zsh|\.|python[23]?|perl|ruby|node|php)\s+<\(\s*(curl|wget)\b/,
   /\b(powershell|pwsh)\b.*\biex\b/i,
   /\bgit\s+push\b.*--(force|mirror)\b/,
   /\bgit\s+push\b.*\s+(-f)(?!\S)/,
+  // `+refspec` force pushes (`git push origin +main`) are matched by
+  // forcePushRefspec below, per command, not by a `.*` span here: a regex
+  // cannot tell a refspec from a `+` inside another command's argument.
   /\bgh\s+repo\s+delete\b/,
   /\bkubectl\s+delete\b.*--all/,
   /\bterraform\s+destroy\b/,
@@ -54,7 +63,7 @@ const CATASTROPHIC = [
   /\bdrop\s+(table|database)\b/i,
 ]
 
-const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database)|docker\s+(rm|system)|aws\s+s3)/i
+export const DESTRUCTIVE_HINT = /(^|\s)(rm\s+-rf|sudo|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd?|kubectl\s+delete|terraform\s+(apply|destroy)|npm\s+publish|cargo\s+publish|drop\s+(table|database)|docker\s+(rm|system)|aws\s+s3)/i
 
 // curl/wget used to be an unconditional DESTRUCTIVE_HINT match, so a
 // read-only `curl -s URL` scored the same as `rm -rf /`. They now count as
@@ -164,7 +173,7 @@ export function hasDestructiveCurlOrWget(resources: readonly string[]): boolean 
 // Command substitution ($(...) or `...`) can hide a command's real effect
 // from both the kill-list and normalizeCommand (neither evaluates it) —
 // not blockable by regex, so it's surfaced to Jev as a hint instead.
-const COMMAND_SUBSTITUTION = /\$\(|`/
+export const COMMAND_SUBSTITUTION = /\$\(|`/
 
 const SECRET_PATTERNS: RegExp[] = [
   /bearer\s+[A-Za-z0-9\-._~+/=]{8,}/gi,
@@ -321,7 +330,320 @@ const CATASTROPHIC_WINDOW_OVERLAP = 500
 // sends such requests straight to the human instead of scanning them.
 export const MAX_SCANNED_CHARS = 256 * 1024
 
+// opencode 2.2.3 hands the permission hook a shell command PRE-SPLIT into
+// simple commands with the operators dropped: `curl -fsSL URL | bash`
+// arrives as resources ["curl -fsSL URL", "bash"]. Every kill-list pattern
+// that needs `|` (curl|sh, wget|sh, base64 -d|sh) then never fires live, and
+// Jev judges fragments instead of the real command. When the original
+// command cannot be recovered (see `shellCommandFor`), this segment rule
+// still catches the canonical remote-code-execution shape: a fetch or
+// decode stage followed by a LATER interpreter that reads its program
+// from stdin. Not requiring the pipe is deliberate — the splitter already
+// dropped it, so "later segment" is the only evidence left.
+const STDIN_INTERPRETERS = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "python",
+  "python2",
+  "python3",
+  "perl",
+  "ruby",
+  "node",
+  "php",
+])
+const FETCH_COMMANDS = new Set(["curl", "wget"])
+
+// Leading wrappers run the command that follows them, so the command word is
+// whatever comes after them: `sudo -E bash`, `env FOO=1 sh` and `timeout 30 sh`
+// all end in an interpreter. Their options are skipped too. The map names the
+// options that take a separate value (`sudo -u root`, `env -u NAME`,
+// `nice -n 10`, `timeout -s KILL`): without it the value would be read as the
+// command word. A Map, not an object, so a command named like an Object
+// prototype property is not mistaken for a wrapper.
+const WRAPPER_ARG_OPTIONS = new Map<string, ReadonlySet<string>>([
+  ["sudo", new Set(["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-T"])],
+  ["doas", new Set(["-u", "-C"])],
+  ["env", new Set(["-u", "-C", "-S"])],
+  ["nice", new Set(["-n"])],
+  ["timeout", new Set(["-s", "-k"])],
+])
+const PLAIN_WRAPPERS = new Set(["nohup", "command", "exec", "time"])
+// `sudo -s` / `sudo -i` with nothing after them start a shell that reads its
+// program from stdin, exactly like a bare `bash`.
+const SHELL_FLAG_WRAPPERS = new Set(["sudo", "doas"])
+const SHELL_FLAG = /^-[a-z]*[si]/i
+
+// Tokens of one segment with its leading wrappers and VAR=value assignments
+// removed. Wrappers can nest (`sudo env bash`), so each one is entered in
+// turn and its options are skipped as they come.
+function commandTokens(segment: string): string[] {
+  const tokens = segment.trim().split(/\s+/).filter(Boolean)
+  let i = 0
+  let wrapper: string | null = null
+  let shellFlag = false
+  let timeoutDurationSeen = false
+  while (i < tokens.length) {
+    const token = tokens[i]
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      i++
+      continue
+    }
+    const name = commandName(token)
+    if (PLAIN_WRAPPERS.has(name) || WRAPPER_ARG_OPTIONS.has(name)) {
+      wrapper = name
+      shellFlag = false
+      timeoutDurationSeen = false
+      i++
+      continue
+    }
+    if (wrapper === null) break
+    if (token.startsWith("-") && token.length > 1) {
+      if (SHELL_FLAG_WRAPPERS.has(wrapper) && (SHELL_FLAG.test(token) || token === "--shell" || token === "--login")) {
+        shellFlag = true
+      }
+      i += WRAPPER_ARG_OPTIONS.get(wrapper)?.has(token) ? 2 : 1
+      continue
+    }
+    // timeout's first operand is the duration, not the command.
+    if (wrapper === "timeout" && !timeoutDurationSeen) {
+      timeoutDurationSeen = true
+      i++
+      continue
+    }
+    break
+  }
+  const rest = tokens.slice(i)
+  if (rest.length === 0 && shellFlag) return ["sh"]
+  return rest
+}
+
+function commandName(word: string): string {
+  return (word.split("/").pop() ?? word).toLowerCase()
+}
+
+function isFetchOrDecode(tokens: string[]): boolean {
+  if (tokens.length === 0) return false
+  const name = commandName(tokens[0])
+  if (FETCH_COMMANDS.has(name)) return true
+  const args = tokens.slice(1)
+  if (name === "base64") return args.some((a) => a === "-d" || a === "--decode")
+  if (name === "xxd") return args.includes("-r")
+  return false
+}
+
+// `bash`/`sh` with no script argument, a literal "-", or -s reads the
+// program from stdin. A positional script (`bash setup.sh`) runs local
+// code, not the fetch, so it does not count.
+function interpreterReadsStdin(tokens: string[]): boolean {
+  if (tokens.length === 0 || !STDIN_INTERPRETERS.has(commandName(tokens[0]))) return false
+  const args = tokens.slice(1)
+  // getopt-style short cluster containing `s` (`-s`, `-es`) is -s.
+  if (args.some((a) => /^-[A-Za-z]+$/.test(a) && a.includes("s"))) return true
+  const positional = args.find((a) => a === "-" || !a.startsWith("-"))
+  return positional === undefined || positional === "-"
+}
+
+export function fetchFeedsInterpreter(segments: string[]): boolean {
+  // A segment can still hold a whole pipeline (`curl U | sudo -E bash`) when
+  // the original command was recovered or the splitter left it joined, so the
+  // operators are split here too, as hasDestructiveCurlOrWget does.
+  const parsed = segments.flatMap((s) => s.split(/[;&|]+/)).map(commandTokens)
+  for (let i = 0; i < parsed.length; i++) {
+    if (!isFetchOrDecode(parsed[i])) continue
+    for (let j = i + 1; j < parsed.length; j++) {
+      if (interpreterReadsStdin(parsed[j])) return true
+    }
+  }
+  return false
+}
+
+// Same target set the `rm` regex above protects, decided per token instead
+// of per character. A regex cannot tell a flag token from an operand, so it
+// only recognises the bundled spelling it pattern-matches; `rm -r -f ~`,
+// `rm -f -R /` and `rm --recursive --force /` are the same wipe in ordinary,
+// non-obfuscated spellings and used to slip through. Flags are therefore
+// classified as tokens (any cluster containing r is recursive, any
+// containing f is a force flag) and a match needs both, exactly like -rf.
+// Protected directories after rmTargetOf has reduced every spelling to one
+// canonical form. `/home/<user>` is matched by HOME_USER_DIR instead.
+const RM_PROTECTED_TARGETS = new Set(["/", "~", "/home", "/root", ".", ".."])
+
+// /home/<user> itself (the home directory), but not anything under it:
+// `/home/idiaval/tmp` is ordinary cleanup, matching the regex's `(?!\S)`.
+const HOME_USER_DIR = /^\/home\/[^/\s]+$/
+
+// Reduces an rm operand to the directory it names, so `~/*`, `$HOME/*`,
+// `"${HOME}"/*`, `/home/u/` and `./*` compare equal to `~`, `/home/u` and `.`.
+// A wipe of the contents is still a wipe of the directory. Quotes and
+// backslashes are removed as normalizeCommand does; the trailing `)` and `;`
+// come from a command substitution or a statement end. Input is lowercased.
+function rmTargetOf(raw: string): string {
+  let t = raw.replace(/["'`\\]/g, "").replace(/[;)]+$/, "")
+  if (t.endsWith("/*")) t = t.slice(0, -2) || "/"
+  while (t.length > 1 && t.endsWith("/")) t = t.slice(0, -1)
+  if (t === "$home" || t.startsWith("$home/")) t = "~" + t.slice("$home".length)
+  if (t === "${home}" || t.startsWith("${home}/")) t = "~" + t.slice("${home}".length)
+  return t
+}
+
+// Quotes/backslashes are stripped the way normalizeCommand does it, so
+// `rm -r -f "$HOME"` reads as the same token as the bare form.
+function rmSegmentHits(segment: string): boolean {
+  const text = segment
+    .toLowerCase()
+    .replace(/\$\{ifs\}/g, " ")
+    .replace(/\$ifs\b/g, " ")
+  const tokens = commandTokens(text)
+  // The first token is a command word. Later ones are too when they open a
+  // subshell or substitution (`echo $(rm -rf ~)`, `(rm -rf /)`).
+  for (let k = 0; k < tokens.length; k++) {
+    if (k > 0 && !OPENS_COMMAND.test(tokens[k])) continue
+    if (rmCommandAt(tokens, k)) return true
+  }
+  return false
+}
+
+const OPENS_COMMAND = /^(\$\(|\(|`)/
+
+// `tokens[start]` is an rm command word. Its arguments run until the next
+// token that opens a new command, so every token is read once per segment.
+function rmCommandAt(tokens: string[], start: number): boolean {
+  if (commandName(tokens[start].replace(/^[(`$]+/, "")) !== "rm") return false
+  let recursive = false
+  let force = false
+  let targeted = false
+  for (let i = start + 1; i < tokens.length && !OPENS_COMMAND.test(tokens[i]); i++) {
+    const raw = tokens[i]
+    const token = raw.replace(/["'`\\]/g, "")
+    if (token === "--") continue
+    if (token.startsWith("--")) {
+      if (token === "--recursive") recursive = true
+      else if (token === "--force") force = true
+      continue
+    }
+    if (token.startsWith("-") && token.length > 1) {
+      const flags = token.slice(1)
+      if (flags.includes("r")) recursive = true
+      if (flags.includes("f")) force = true
+      continue
+    }
+    const target = rmTargetOf(raw)
+    if (RM_PROTECTED_TARGETS.has(target) || HOME_USER_DIR.test(target)) targeted = true
+  }
+  return recursive && force && targeted
+}
+
+export function rmRemovesProtectedTarget(segments: string[]): boolean {
+  // One segment can still hold several simple commands when the original
+  // shell string was recovered (the splitter drops the operators, but the
+  // recovered command keeps them), so split on them here too.
+  for (const segment of segments) {
+    for (const simple of segment.split(/[;&|]+/)) {
+      if (rmSegmentHits(simple)) return true
+    }
+  }
+  return false
+}
+
+// A refspec with a leading `+` forces that ref just as `--force` does
+// (`git push origin +main`), and it is the spelling people reach for after a
+// local rebase. It is matched per command: the `git` word, its global
+// options (`git -C dir`, `git -c k=v`, `--no-pager`, ...), then `push`, then
+// any later argument shaped like a refspec. A regex over the whole line
+// cannot tell that refspec from a `+` in another command's argument
+// (`gh pr create --title "feat: +20% faster"`) or in a commit message.
+const GIT_FORCE_REFSPEC = /^\+[\w./@{}^~-]+(:[\w./-]+)?$/
+const GIT_ARG_OPTIONS = new Set(["-C", "-c", "--git-dir", "--work-tree"])
+
+// Scans one simple command (already split on operators) as a token stream,
+// one pass, so a long run of `git` words stays linear. A `git` word resets
+// the state, so `bash -c "git push ..."` and `$(git push ...)` are found too,
+// as the old line regex found them.
+function forcePushRefspecIn(simple: string): boolean {
+  let state: "idle" | "git" | "git-arg" | "push" = "idle"
+  for (const raw of simple.split(/\s+/)) {
+    // Quotes and backslashes out, a substitution's `(`/`$(` in front and its
+    // `)` behind, so `$(git push origin +main)` reads the same as the bare form.
+    const token = raw.replace(/["'`\\]/g, "").replace(/^[(`$]+/, "").replace(/\)+$/, "")
+    if (!token) continue
+    if (commandName(token) === "git") {
+      state = "git"
+      continue
+    }
+    if (state === "idle") continue
+    if (state === "git-arg") {
+      state = "git"
+      continue
+    }
+    if (state === "git") {
+      if (token.startsWith("-") && token.length > 1) {
+        if (GIT_ARG_OPTIONS.has(token)) state = "git-arg"
+        continue
+      }
+      state = token === "push" ? "push" : "idle"
+      continue
+    }
+    if (GIT_FORCE_REFSPEC.test(token)) return true
+  }
+  return false
+}
+
+export function forcePushRefspec(segments: string[]): boolean {
+  for (const segment of segments) {
+    for (const simple of segment.split(/[;&|]+/)) {
+      if (forcePushRefspecIn(simple)) return true
+    }
+  }
+  return false
+}
+
+// Credential stores and private keys are never a policy judgement for Jev:
+// a successful read is already an irreversible disclosure (the contents
+// reach the agent's model provider), and live red-team runs showed Jev
+// allowing ~/.ssh/id_rsa in one of three. Deterministic, before any network
+// call. Nothing is anchored to a home prefix: `~`, `$HOME`, `${HOME}`,
+// `/home/<user>` and `/root` all leave the same suffix to match.
+const CREDENTIAL_STORE = [
+  // `.ssh` only as a directory (`~/.ssh/config`) or a whole token (`~/.ssh`).
+  // `www.ssh.com` and `.ssh-agent-notes.md` name something else.
+  /\.ssh(?=[/\\\s"'`;|&)]|$)/i,
+  /\.aws[/\\]credentials\b/i,
+  /\.gnupg\b/i,
+  /\.netrc\b/i,
+  /\.git-credentials\b/i,
+  /\.config[/\\]git[/\\]credentials\b/i,
+  /\.config[/\\]gh\b/i,
+  /\.docker[/\\]config\.json/i,
+  /\.kube[/\\]config\b/i,
+  /\.pypirc\b/i,
+  /\.npmrc\b/i,
+  /\.cargo[/\\]credentials(?:\.toml)?\b/i,
+  /\.local[/\\]share[/\\]opencode[/\\]auth\.json\b/i,
+  /\/etc\/shadow\b/i,
+  /\/etc\/sudoers\b/i,
+  /\.(?:p12|pfx)\b/i,
+  // A `.pem` is a key only when its name says so. A CA bundle or certificate
+  // (`--cacert ./ca.pem`) is read in ordinary TLS work. The length bounds
+  // keep these linear on long input, like the rest of this file.
+  /(?<![\w.-])[\w.-]{0,64}(?:key|private)[\w.-]{0,64}\.pem\b/i,
+  /(?<![\w.-])id_[\w.-]{0,64}\.pem\b/i,
+  /\bid_(?:rsa|ed25519|ecdsa)\b/i,
+]
+
+export function touchesCredentialStore(text: string): boolean {
+  return CREDENTIAL_STORE.some((re) => re.test(text))
+}
+
 export function isCatastrophic(joined: string): boolean {
+  // Segment rule first: it is a single linear pass and covers the live
+  // split shape even when the original command could not be recovered.
+  if (fetchFeedsInterpreter(joined.split("\n"))) return true
+  if (rmRemovesProtectedTarget(joined.split("\n"))) return true
+  if (forcePushRefspec(joined.split("\n"))) return true
   const step = CATASTROPHIC_CHECK_MAX_CHARS - CATASTROPHIC_WINDOW_OVERLAP
   for (let start = 0; start === 0 || start + CATASTROPHIC_WINDOW_OVERLAP < joined.length; start += step) {
     const window = joined.slice(start, start + CATASTROPHIC_CHECK_MAX_CHARS)
@@ -357,7 +679,7 @@ function numberedOptions(options: string[]): string {
   return options.map((o, i) => `${i + 1}. ${o}`).join("\n")
 }
 
-function resourceKinds(resources: string[]): string {
+export function resourceKinds(resources: string[]): string {
   return resources
     .map((r) => {
       const t = r.trim()
@@ -384,13 +706,31 @@ function isEnabled(options: Record<string, unknown>): boolean {
   return true
 }
 
+// Unattended mode: no human is watching the session. In an interactive
+// opencode a pending permission simply blocks until someone answers, so
+// leaving effect at "ask" is safe. `opencode run --auto` instead answers
+// "yes" to anything still at "ask", which silently turns the gate's "I am
+// not sure" (Jev ask-human, an unknown decision, a gate error, an oversized
+// request) into an approval. Opting in makes those cases deny instead.
+// Turning this on only ever turns an "ask" into a deny, so accepting the
+// common spellings of "on" is the safe direction: a config or env value that
+// is read as off would instead leave ask-human to become an approval under
+// `--auto`. Other values, including "off", stay attended.
+const UNATTENDED_ON = new Set(["true", "1", "yes", "on"])
+export function isUnattended(options: Record<string, unknown>): boolean {
+  const configured = options.unattended
+  if (configured === true) return true
+  if (typeof configured === "string" && UNATTENDED_ON.has(configured.toLowerCase())) return true
+  return UNATTENDED_ON.has((process.env.JEV_GATE_UNATTENDED ?? "").toLowerCase())
+}
+
 function repoRoot(options: Record<string, unknown>): string {
   if (typeof options.gateDir === "string" && options.gateDir) return options.gateDir
   if (process.env.JEV_GATE_DIR) return process.env.JEV_GATE_DIR
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 }
 
-function apiKeyOf(options: Record<string, unknown>): string {
+export function apiKeyOf(options: Record<string, unknown>): string {
   if (typeof options.typesafeKey === "string" && options.typesafeKey) return options.typesafeKey
   return process.env.TYPESAFE_API_KEY ?? ""
 }
@@ -424,7 +764,7 @@ export function timeoutMsOf(options: Record<string, unknown>): number {
 // measured at 1 to 2 s), so the default fills most of its ~33k-token
 // window; schemas.py fits objective and detail into the final budget.
 // Override per-project via options.objectiveChars or JEV_GATE_OBJECTIVE_CHARS.
-function objectiveBudgetOf(options: Record<string, unknown>): number {
+export function objectiveBudgetOf(options: Record<string, unknown>): number {
   const raw = (options.objectiveChars as unknown) ?? process.env.JEV_GATE_OBJECTIVE_CHARS
   const n = typeof raw === "number" ? raw : parseInt(String(raw ?? ""), 10)
   if (!Number.isFinite(n)) return 60000
@@ -828,6 +1168,12 @@ function spawnGate(options: Record<string, unknown>): {
     cwd: repoRoot(options),
     env: minimalEnv(options),
   })
+  // A child that exits before reading its stdin (a crash on import, a bad
+  // argument) closes the pipe, and the write then fails with EPIPE as an
+  // asynchronous 'error' event on the stream. With no listener that event
+  // throws and kills the whole host process, while the child's exit code
+  // already reports the real outcome. The stream error is absorbed here.
+  child.stdin.on("error", () => {})
   let stdout = ""
   let stderr = ""
   const CAP = 256 * 1024
@@ -1019,7 +1365,7 @@ export async function subagentDetailFor(
 ): Promise<string | null> {
   if (!source?.messageID || !source?.id) return null
   try {
-    const messages = await ctx.session.context({ sessionID })
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
     const list = Array.isArray(messages) ? messages : []
     const message = list.find(
       (m): m is { content?: unknown } =>
@@ -1040,6 +1386,55 @@ export async function subagentDetailFor(
       typeof prompt === "string" && prompt ? `prompt: ${prompt}` : "",
     ].filter(Boolean)
     return parts.length ? parts.join("\n") : null
+  } catch {
+    return null
+  }
+}
+
+// opencode 2.2.3 gives the evaluate hook a shell command PRE-SPLIT into
+// simple commands with the operators dropped. The shell tool call that
+// raised the permission still holds the real command at
+// `state.input.command` in the same session-context RPC
+// `subagentDetailFor` already reads, so recover it from there: the
+// kill-list and Jev then see the operators instead of fragments. Any miss
+// or throw returns null, and the caller keeps its pre-existing behaviour.
+// Both lookups below run BEFORE the kill-list and the credential guard, so a
+// session.context call that never settles would hold that permission
+// indefinitely. Past this bound the lookup counts as a miss and the caller
+// keeps its thin resources, the same fail-open as any other miss.
+export const LOOKUP_TIMEOUT_MS = 3000
+
+function withLookupTimeout<T>(pending: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("lookup timeout")), LOOKUP_TIMEOUT_MS)
+  })
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timer))
+}
+
+export async function shellCommandFor(
+  ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+  sessionID: string,
+  source: PermissionSource | null | undefined,
+): Promise<string | null> {
+  if (!source?.messageID || !source?.id) return null
+  try {
+    const messages = await withLookupTimeout(ctx.session.context({ sessionID }))
+    const list = Array.isArray(messages) ? messages : []
+    const message = list.find(
+      (m): m is { content?: unknown } =>
+        !!m && typeof m === "object" && (m as { id?: unknown }).id === source.messageID,
+    )
+    const content = Array.isArray((message as { content?: unknown } | undefined)?.content)
+      ? ((message as { content: unknown[] }).content)
+      : []
+    const call = content.find(
+      (c): c is { state?: unknown } => !!c && typeof c === "object" && (c as { id?: unknown }).id === source.id,
+    )
+    const input = (call as { state?: { input?: unknown } } | undefined)?.state?.input
+    if (!input || typeof input !== "object") return null
+    const command = (input as Record<string, unknown>).command
+    return typeof command === "string" && command.trim() ? command : null
   } catch {
     return null
   }
@@ -1096,6 +1491,12 @@ export interface EvaluateDeps {
     sessionID: string,
     source: PermissionSource | null | undefined,
   ) => Promise<string | null>;
+  // Optional so existing fixtures compile unchanged; setup always passes it.
+  shellCommandFor?: (
+    ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
+    sessionID: string,
+    source: PermissionSource | null | undefined,
+  ) => Promise<string | null>;
   resourceKinds: (resources: string[]) => string;
   DESTRUCTIVE_HINT: RegExp;
   COMMAND_SUBSTITUTION: RegExp;
@@ -1106,6 +1507,15 @@ export interface EvaluateDeps {
   options: Record<string, unknown>;
   endedSessions: Set<string>;
   inst: string;
+}
+
+/**
+ * Message the agent gets when unattended mode holds a request that would
+ * otherwise wait for a human. A deny with no message aborts the whole turn,
+ * so it has to name the cause and offer a way forward.
+ */
+function unattendedHoldMessage(reason: string, redact: (text: string) => string): string {
+  return `Held by jev-decision-gate (unattended mode): ${redact(reason)}. No human is available to approve this; choose a safer, reversible alternative or stop and report what you need.`
 }
 
 /**
@@ -1127,6 +1537,7 @@ export async function evaluatePermission(
   },
 ): Promise<void> {
   const { sessionID, action, resources, source, effect } = input;
+  const unattended = isUnattended(deps.options);
 
   // Respect user's allow/deny config — only intercept when effect is "ask"
   if (effect !== "ask") {
@@ -1148,16 +1559,74 @@ export async function evaluatePermission(
 
   // Convert readonly array to mutable for enrichment
   const mutableResources: string[] = Array.from(resources);
-  let joined = mutableResources.join("\n");
+  const joined = mutableResources.join("\n");
   let resKinds = deps.resourceKinds(mutableResources);
 
-  if (joined.length > MAX_SCANNED_CHARS) {
-    deps.log({ sessionID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: joined.length, detail_sha256: deps.sha256Hex(joined) });
+  // `scanned` is what the oversized check, kill-list, credential guard,
+  // hints, kind and Jev payload all evaluate. Each lookup below only ADDS
+  // text in front of the original resources, never replaces them, and all of
+  // them run before any of those checks: a dispatch prompt or a recovered
+  // command that the lookup finds must be judged too.
+  let scanned = joined;
+  let scannedResources = mutableResources;
+  // The text recovered by a lookup, if any. Jev's detail shows only this
+  // (plus the metadata extras), not the resources it was recovered from.
+  let recovered: string | null = null;
+
+  // Shell commands arrive PRE-SPLIT with the operators dropped (opencode
+  // 2.2.3), so recover the real command and scan that too: pipe-only
+  // kill-list patterns and the destructive/substitution hints need the
+  // operators, and Jev must judge the command, not its fragments. A failed
+  // lookup leaves today's behaviour exactly.
+  if (action === "shell" || action === "bash") {
+    const original = typeof deps.shellCommandFor === "function"
+      ? await deps.shellCommandFor(deps.ctx, sessionID, source)
+      : null;
+    if (original) {
+      recovered = original;
+      scanned = `${original}\n${joined}`;
+      // Extra resource (not a replacement): kindFor's pipeline checks look
+      // at every resource, and the original alone shows the missing pipe.
+      scannedResources = [original, ...mutableResources];
+    }
+  }
+
+  // Subagent/task dispatch: the permission's own resource is only the target
+  // agent's name, while the prompt that would run lives in the tool call. It
+  // is looked up here, before the kill-list and credential guard, so a
+  // dispatch like "run rm -rf ~" or "print ~/.ssh/id_rsa" meets the same
+  // deterministic rules as a shell command.
+  if (action === "subagent" || action === "task") {
+    const enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source);
+    if (enriched) {
+      recovered = enriched;
+      scanned = `${enriched}\n${joined}`;
+      scannedResources = [enriched, ...mutableResources];
+      resKinds = deps.resourceKinds(scannedResources);
+    }
+  }
+
+  if (scanned.length > MAX_SCANNED_CHARS) {
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("oversized-request", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        gateAction: "reject",
+        reason: "oversized-request",
+        detailChars: scanned.length,
+        detail_sha256: deps.sha256Hex(scanned),
+        unattended: true,
+      });
+      return;
+    }
+    deps.log({ sessionID, tool: action, gateAction: "ask-human", reason: "oversized-request", detailChars: scanned.length, detail_sha256: deps.sha256Hex(scanned) });
     return;
   }
 
   // Catastrophic pattern: deny instantly with message, no Jev call
-  if (deps.isCatastrophic(joined)) {
+  if (deps.isCatastrophic(scanned)) {
     input.effect = "deny";
     input.message =
       "Blocked by jev-decision-gate: matches the catastrophic-command kill-list. Do not retry this command or variants of it.";
@@ -1167,22 +1636,35 @@ export async function evaluatePermission(
       kind: "destructive",
       gateAction: "reject",
       reason: "catastrophic-pattern",
-      detail_sha256: deps.sha256Hex(joined),
+      detail_sha256: deps.sha256Hex(scanned),
     });
     return;
   }
 
-  // Subagent/task enrichment
-  if (action === "subagent" || action === "task") {
-    const enriched = await deps.subagentDetailFor(deps.ctx, sessionID, source);
-    if (enriched) {
-      mutableResources[0] = enriched;
-      joined = enriched;
-      resKinds = deps.resourceKinds(mutableResources);
+  // Credential path: a read is an irreversible disclosure, so no Jev call.
+  // Attended leaves the request to the human; unattended denies because
+  // "ask" is auto-approved there. This sits after the kill-list (a wipe is
+  // still blocked outright) and before any gate work.
+  if (touchesCredentialStore(scanned)) {
+    const kind = deps.kindFor(action, scannedResources);
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("credential-path", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "credential-path",
+        unattended: true,
+      });
+      return;
     }
+    deps.log({ sessionID, tool: action, kind, gateAction: "ask-human", reason: "credential-path" });
+    return;
   }
 
-  const kind = deps.kindFor(action, mutableResources);
+  const kind = deps.kindFor(action, scannedResources);
 
   // Build gate event and call Jev
   try {
@@ -1193,11 +1675,16 @@ export async function evaluatePermission(
     const patches = editPatchesOf(input.metadata);
     const metaDetail = metadataDetailFor(action, input.metadata);
     const extra = [patches, metaDetail].filter((x): x is string => !!x).join("\n");
-    const detail = clipHeadTail(deps.redactSecrets(extra ? `${joined}\n${extra}` : joined), DETAIL_MAX_CHARS);
+    // Jev reads the recovered command or dispatch text, or the raw resources
+    // when nothing was recovered. `scanned` is not used here: it repeats the
+    // resources after the recovered text, so Jev would see the same command
+    // twice. The hash below still covers `scanned`.
+    const primary = recovered ?? joined;
+    const detail = clipHeadTail(deps.redactSecrets(extra ? `${primary}\n${extra}` : primary), DETAIL_MAX_CHARS);
     const hintParts: string[] = [];
     if (action === "doom_loop") hintParts.push("doom_loop: identical tool call repeated");
-    if (deps.DESTRUCTIVE_HINT.test(joined) || hasDestructiveCurlOrWget(mutableResources)) hintParts.push("matches destructive-hint");
-    if (deps.COMMAND_SUBSTITUTION.test(joined)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
+    if (deps.DESTRUCTIVE_HINT.test(scanned) || hasDestructiveCurlOrWget(scannedResources)) hintParts.push("matches destructive-hint");
+    if (deps.COMMAND_SUBSTITUTION.test(scanned)) hintParts.push("contains command substitution ($(...) or `...`) — real effect cannot be statically determined");
     if (detail.includes(OMITTED_MARK)) hintParts.push("detail too long: middle omitted, judge head and tail");
     const riskHints = hintParts.join("; ");
 
@@ -1212,12 +1699,15 @@ export async function evaluatePermission(
     const startedAt = Date.now();
     const { decision, retried } = await deps.runGate(deps.options, gateEvent);
     const elapsedMs = Date.now() - startedAt;
+    // "ask" is about to become a deny: record the request as rejected so
+    // the log does not claim a human was asked when none exists.
+    const heldByUnattended = unattended && decision.action !== "allow" && decision.action !== "deny";
 
     deps.log({
       sessionID,
       tool: action,
       kind,
-      gateAction: decision.action,
+      gateAction: heldByUnattended ? "reject" : decision.action,
       reason: decision.reason,
       confidence: decision.confidence,
       model: decision.model,
@@ -1225,12 +1715,13 @@ export async function evaluatePermission(
       pick: decision.pick ?? null,
       elapsedMs,
       objectiveChars: objective.length,
-      detail_sha256: deps.sha256Hex(joined),
+      detail_sha256: deps.sha256Hex(scanned),
       hasKey: deps.apiKeyOf(deps.options) !== "",
       resKinds,
       ...(retried ? { retry: 1 } : {}),
-      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
-      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+      ...(heldByUnattended ? { unattended: true } : {}),
+      ...(typeof decision.error === "string" ? { error_class: deps.redactSecrets(decision.error) } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: deps.redactSecrets(decision.error_detail) } : {}),
     });
 
     if (decision.action === "allow") {
@@ -1239,18 +1730,38 @@ export async function evaluatePermission(
       input.effect = "deny";
       const reason = String(decision.reason ?? "jev-deny");
       input.message = `Denied by jev-decision-gate (Jev): ${deps.redactSecrets(reason)}. Choose a safer alternative or explain why this is needed.`;
+    } else if (heldByUnattended) {
+      // ask-human, or an action we do not recognise: nobody is there to
+      // answer, so hold it instead of letting --auto approve it.
+      input.effect = "deny";
+      input.message = unattendedHoldMessage(String(decision.reason ?? decision.action ?? "ask-human"), deps.redactSecrets);
     } else {
       // ask-human or unknown -> leave effect as "ask"
     }
   } catch (err) {
-    // Fail-open: never silent allow, always leave effect as "ask"
+    // Fail-open: never silent allow, always leave effect as "ask" — unless
+    // nobody is there to answer it, where "ask" means "allow" to --auto.
+    if (unattended) {
+      input.effect = "deny";
+      input.message = unattendedHoldMessage("fail-open", deps.redactSecrets);
+      deps.log({
+        sessionID,
+        tool: action,
+        kind,
+        gateAction: "reject",
+        reason: "fail-open",
+        error_class: deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120),
+        unattended: true,
+      });
+      return;
+    }
     deps.log({
       sessionID,
       tool: action,
       kind,
       gateAction: "ask-human",
       reason: "fail-open",
-      error_class: err instanceof Error ? err.message.slice(0, 120) : "exception",
+      error_class: deps.redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120),
     });
     // effect remains "ask"
   }
@@ -1315,7 +1826,7 @@ async function sessionIsEnded(
   }
 }
 
-async function objectiveFor(
+export async function objectiveFor(
   ctx: { session: { context: (input: { sessionID: string }) => Promise<unknown> } },
   sessionID: string,
   ended: Set<string>,
@@ -1349,10 +1860,10 @@ async function objectiveFor(
   }
 }
 
-// Question tool calls whose questions Jev could not answer and were handed
-// to the tool's own execute (which opens the human form). The form path
-// skips those forms instead of asking Jev the same thing again.
-// opencode loads a separate copy of this module for every setup()
+// Question tool calls are never handed back to the built-in form path
+// (that form hangs the TUI on 2.2.3), so there is no "already declined"
+// marker to share; the form poller only serves forms raised by other
+// tools. opencode loads a separate copy of this module for every setup()
 // instance (one per project directory), so module-level state is NOT
 // shared between instances: a "one poller per process" design that
 // leaves this on module-level state ends up as one poller per
@@ -1360,7 +1871,6 @@ async function objectiveFor(
 // globalThis. The versioned key keeps a future incompatible shape from
 // colliding with an instance still running older code.
 type SharedState = {
-  questionsLeftForHuman: Set<string>
   pollHandlers: Set<PollHandler>
   pollDirRefs: Map<string, number>
   formSeen: Set<string>
@@ -1369,7 +1879,6 @@ type SharedState = {
   pollCursor: number
 }
 const SHARED: SharedState = ((globalThis as Record<symbol, unknown>)[Symbol.for("jev-decision-gate.shared.v1")] ??= {
-  questionsLeftForHuman: new Set<string>(),
   pollHandlers: new Set<PollHandler>(),
   pollDirRefs: new Map<string, number>(),
   formSeen: new Set<string>(),
@@ -1377,7 +1886,6 @@ const SHARED: SharedState = ((globalThis as Record<symbol, unknown>)[Symbol.for(
   pollInFlight: false,
   pollCursor: 0,
 }) as SharedState
-const questionsLeftForHuman = SHARED.questionsLeftForHuman
 
 export type QuestionToolInput = {
   questions?: Array<{ question?: unknown; header?: unknown; multiple?: unknown; options?: unknown }>
@@ -1399,10 +1907,45 @@ export function questionToolResult(
   }
 }
 
+// Result when Jev cannot answer: the agent asks the user in chat instead
+// of opening the question form. Calling the original execute creates a
+// form server-side that the TUI never renders on opencode 2.2.3 (the SDK
+// promise adapter runs the host effect in the plugin runtime), which
+// hangs the turn forever; a chat question always reaches the user.
+// `answers` is empty on purpose: nothing is invented.
+export function questionHandoffResult(
+  input: QuestionToolInput,
+  reason: string,
+  options: Record<string, unknown> = {},
+): { output: { answers: string[][] }; content: string; metadata: { answers: string[][] } } {
+  const qs = Array.isArray(input.questions) ? input.questions : []
+  const answers = qs.map(() => [] as string[])
+  const listed = qs
+    .map((q, i) => {
+      const labels = (Array.isArray(q?.options) ? q.options : [])
+        .map((o) => (o && typeof o === "object" ? (o as { label?: unknown }).label : o))
+        .filter((l): l is string => typeof l === "string" && l.length > 0)
+        .map((l) => `"${l}"`)
+        .join(", ")
+      return `${i + 1}. "${String(q?.question ?? "")}"${labels ? ` (options: ${labels})` : ""}`
+    })
+    .join("\n")
+  const details = redactSecrets(listed)
+  const why = redactSecrets(reason)
+  const instruction = isUnattended(options)
+    ? `jev-decision-gate could not answer these questions on the user's behalf (${why}), and no human is available in this session: do not guess or pick an option yourself. Stop and report what you need.`
+    : `jev-decision-gate could not answer these questions on the user's behalf (${why}): do not guess or pick an option yourself. Ask the user these questions directly in your reply, then end your turn and wait for the user's answer.`
+  return {
+    output: { answers },
+    content: details ? `${instruction}\n${details}` : instruction,
+    metadata: { answers },
+  }
+}
+
 // Asks Jev each question of one question-tool call. Returns one [label] per
 // question, or null as soon as one cannot be answered (not allow, pick not
 // offered, ambiguous after redaction, or no options): the caller then
-// falls back to the human form for the whole call.
+// hands the whole call to the human in chat (never the built-in form).
 export async function answerQuestionsWithJev(
   deps: {
     runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>
@@ -1452,8 +1995,8 @@ export async function answerQuestionsWithJev(
       elapsedMs: Date.now() - startedAt,
       optionsCount: labels.length,
       ...(retried ? { retry: 1 } : {}),
-      ...(typeof decision.error === "string" ? { error_class: decision.error } : {}),
-      ...(typeof decision.error_detail === "string" ? { error_detail: decision.error_detail } : {}),
+      ...(typeof decision.error === "string" ? { error_class: redactSecrets(decision.error) } : {}),
+      ...(typeof decision.error_detail === "string" ? { error_detail: redactSecrets(decision.error_detail) } : {}),
     })
     const pick = decision.pick
     if (decision.action !== "allow" || typeof pick !== "string" || !pick) {
@@ -1472,6 +2015,57 @@ export async function answerQuestionsWithJev(
     answers.push([matches[0] as string])
   }
   return answers
+}
+
+// Wraps the question tool's execute so Jev can answer it in-process.
+// `original` is accepted to keep the tool's contract but is NEVER called:
+// on opencode 2.2.3 the form it creates never reaches the TUI and the
+// agent's turn hangs (see docs/ARCHITECTURE.md, "Question tool" ADR).
+// When Jev cannot answer, the agent asks the user in chat and ends its
+// turn; no answer is ever invented.
+export type QuestionWrapDeps = {
+  runGate: (options: Record<string, unknown>, event: Record<string, unknown>) => Promise<{ decision: Record<string, unknown>; retried: boolean }>
+  objectiveFor: (sessionID: string) => Promise<string>
+  log: (entry: Record<string, unknown>) => void
+  options: Record<string, unknown>
+}
+
+export function wrapQuestionExecute(
+  original: (input: unknown, context: unknown) => Promise<unknown>,
+  deps: QuestionWrapDeps,
+): (input: unknown, context: unknown) => Promise<unknown> {
+  void original
+  return async (input, context) => {
+    const c = (context ?? {}) as { sessionID?: unknown; messageID?: unknown; id?: unknown }
+    const sessionID = String(c.sessionID ?? "")
+    const callKey = `${String(c.messageID ?? "")}:${String(c.id ?? "")}`
+    const qInput = (input ?? {}) as QuestionToolInput
+    let handoffReason = "Jev did not return a usable pick"
+    try {
+      const answers = await answerQuestionsWithJev(
+        {
+          runGate: deps.runGate,
+          objective: () => deps.objectiveFor(sessionID),
+          log: deps.log,
+          options: deps.options,
+        },
+        sessionID,
+        callKey,
+        qInput,
+      )
+      if (answers) {
+        deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "allow", reason: "question-answered", phase: "question-tool", pick: answers.map((a) => a.join(", ")).join(" | ") })
+        return questionToolResult(qInput, answers)
+      }
+    } catch (err) {
+      // Redacted before it reaches the log AND the agent-facing handoff text.
+      const errorClass = redactSecrets(err instanceof Error ? err.message : "exception").slice(0, 120)
+      deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "fail-open", phase: "question-tool", error_class: errorClass })
+      handoffReason = `gate error: ${errorClass}`
+    }
+    deps.log({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "question-handoff-chat", phase: "question-tool" })
+    return questionHandoffResult(qInput, handoffReason, deps.options)
+  }
 }
 
 // Shared form poller: setup() runs once per project directory, so a
@@ -1580,45 +2174,25 @@ export default Plugin.define({
     // Answer the question tool in-process: wrapping its execute means
     // Jev's pick is returned as the tool result directly, with no form and
     // no reply through `opencode api` (which only reaches the background
-    // service). When Jev cannot answer, the original execute opens the
-    // human form as before. The marker keeps sibling setup() instances
+    // service). The original execute is never called: its form never
+    // reaches the TUI on 2.2.3, so when Jev cannot answer the agent asks
+    // the user in chat instead. The marker keeps sibling setup() instances
     // from wrapping the same tool twice.
     try {
       await ctx.tool.transform((editor) => {
         editor.update("question", (tool) => {
           const t = tool as { execute: (input: unknown, context: unknown) => Promise<unknown>; __jevWrapped?: boolean }
           if (t.__jevWrapped) return
-          const original = t.execute
           t.__jevWrapped = true
-          t.execute = async (input: unknown, context: unknown) => {
-            const c = (context ?? {}) as { sessionID?: unknown; messageID?: unknown; id?: unknown }
-            const sessionID = String(c.sessionID ?? "")
-            const callKey = `${String(c.messageID ?? "")}:${String(c.id ?? "")}`
-            try {
-              const answers = await answerQuestionsWithJev(
-                {
-                  runGate,
-                  objective: () =>
-                    objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options))).catch(
-                      () => "Answer the agent's multiple-choice question to unblock the session",
-                    ),
-                  log: logEv,
-                  options,
-                },
-                sessionID,
-                callKey,
-                (input ?? {}) as QuestionToolInput,
-              )
-              if (answers) {
-                logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "allow", reason: "question-answered", phase: "question-tool", pick: answers.map((a) => a.join(", ")).join(" | ") })
-                return questionToolResult((input ?? {}) as QuestionToolInput, answers)
-              }
-            } catch (err) {
-              logEv({ sessionID, requestID: callKey, tool: "question", gateAction: "ask-human", reason: "fail-open", phase: "question-tool", error_class: err instanceof Error ? err.message.slice(0, 120) : "exception" })
-            }
-            capped(questionsLeftForHuman).add(callKey)
-            return original(input, context)
-          }
+          t.execute = wrapQuestionExecute(t.execute, {
+            runGate,
+            objectiveFor: (sessionID) =>
+              objectiveFor(ctx, sessionID, endedSessions, Math.min(1500, objectiveBudgetOf(options))).catch(
+                () => "Answer the agent's multiple-choice question to unblock the session",
+              ),
+            log: logEv,
+            options,
+          })
         })
       })
     } catch (err) {
@@ -1653,6 +2227,7 @@ export default Plugin.define({
           sha256Hex,
           isCatastrophic,
           subagentDetailFor,
+          shellCommandFor,
           resourceKinds,
           DESTRUCTIVE_HINT,
           COMMAND_SUBSTITUTION,
@@ -1850,12 +2425,6 @@ export async function handleFormAsked(
   const formID = String(payload.id ?? "")
   if (!sessionID || !formID) {
     log({ sessionID: sessionID || null, requestID: formID || null, tool: "question", gateAction: "ask-human", reason: "missing-ids" })
-    return
-  }
-  const toolRef = (payload.metadata as { tool?: { messageID?: unknown; id?: unknown } } | undefined)?.tool
-  if (toolRef && questionsLeftForHuman.has(`${String(toolRef.messageID ?? "")}:${String(toolRef.id ?? "")}`)) {
-    // Jev already declined this question in the tool wrapper; asking
-    // again here would just repeat the same call. It is the human's.
     return
   }
   const claim = claimReply(options, `form:${formID}`, inst)

@@ -39,7 +39,7 @@ gate logic — the "why" for each design choice lives there, not here.
 
 This gate targets the `@opencode/plugin` API line (the one with
 `permission.asked` events), installed as plain `opencode`, currently
-2.1.x (types pinned to `@opencode/plugin` 2.1.4). That line and the older, much more widely-used
+verified on opencode 2.2.3 (2026-11-05), SDK types pinned to `@opencode/plugin` 2.1.4. That line and the older, much more widely-used
 `@opencode-ai/plugin` line (1.18.x) ship from the same
 `anomalyco/opencode` repo as two parallel plugin API generations, not
 two separate products — but they are NOT interchangeable and a given
@@ -80,6 +80,9 @@ bug.
 | `scripts/measure.py` | reads the JSONL log: rates, p95, cost, by-session |
 | `scripts/verify_autonomy.py` | non-interactive live check that the plugin answers the question tool (log resolved like `measure.py`) |
 | `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a decision-logic/kind change without a new case here is unreviewed |
+| `plugin/jev-decision-gate/redteam.ts` | red-team harness: drives the real `evaluatePermission` over `eval/redteam.json` (offline stub or live Jev) |
+| `eval/` | red-team corpus (`redteam.json`, 96 cases) and dated results (`results/`); method and numbers in `docs/EVALUATION.md` |
+| `scripts/demo.sh` | one-command live demo in an isolated sandbox (needs `TYPESAFE_API_KEY`) |
 
 ## Non-negotiables (see `CONTRIBUTING.md` "Safety contract")
 
@@ -100,15 +103,18 @@ bug.
    (`reason: "question-permission-passthrough"`). The answer itself
    comes from the wrapped `question` tool (`ctx.tool.transform`,
    `phase: "question-tool"`), which asks Jev each field in-process and
-   answers there whenever Jev can decide; the form path
-   (OpenCode opens a form, `metadata.kind=question`, listed at
-   `GET /api/form`) is the human fallback for when it can't. The plugin
-   polls `/api/form` (and also listens for `form.created` / legacy
-   question events); Jev picks; the plugin replies with
+   answers there whenever Jev can decide. When Jev can't decide, the
+   wrapped tool **never calls the original `execute`**: on opencode
+   2.2.3 the form it creates never reaches the TUI (the SDK promise
+   adapter runs the host effect in the plugin runtime) and the turn
+   hangs. Instead it returns `questionHandoffResult`: the agent asks
+   the user the questions directly in chat and ends its turn
+   (`reason: question-handoff-chat`). The `/api/form` poller remains
+   for forms raised by other tools (Jev picks, then
    `POST /api/session/{sessionID}/form/{formID}/reply` body
-   `{"answer":{"q0":"<pick>"}}`. Log shows `phase: form-answer` then
-   `reason: question-answered`. Read `docs/TROUBLESHOOTING.md`
-   "Question dialog hangs" before changing this path again.
+   `{"answer":{"q0":"<pick>"}}`, `phase: form-answer`). Read
+   `docs/TROUBLESHOOTING.md` "Question dialog: how auto-answer works"
+   before changing this path again.
 5. **`setup()` runs once per project directory, so many times per
    opencode process.** A new `inst` appears for each new session
    directory, and every instance sees the process-wide event stream.
@@ -151,6 +157,7 @@ bandit -r src scripts --severity-level medium       # SAST (medium+ only, see ci
 npm --prefix plugin exec --no -- tsc --noEmit -p plugin/jev-decision-gate   # TS typecheck
 npm --prefix plugin test                          # TS unit tests (isCatastrophic/normalizeCommand,
                                                     # redactSecrets, kindFor, claimReply, postApiReply)
+npm --prefix plugin run redteam                    # offline red-team corpus, no API key (Jev stubbed as ask-human)
 
 python3 -m jev_gate.doctor            # install/env diagnostics
 python3 scripts/measure.py            # read the decision log

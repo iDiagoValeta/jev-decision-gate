@@ -1,62 +1,38 @@
 # Troubleshooting
 
-## `opencode run --auto` bypasses the gate entirely — including the catastrophic kill-list
+## `opencode run --auto` approves whatever the gate leaves at "ask"
 
-**Do not use `--auto` when this gate's decisions are meant to matter.** It is
-not a mitigated risk, it is a hard bypass: `--auto` is documented
-(`opencode run --help`) as "Auto-approve permissions that are not explicitly
-denied" — a **client-side** decision opencode's CLI makes on its own, without
-waiting for `permission.asked` subscribers (this plugin included) to reply.
-Whatever the plugin decides, `--auto` has usually already resolved the
-request by the time the plugin's reply (always at least one subprocess spawn
-plus an HTTP round trip) lands, so the reply 404s and the command runs
-regardless — deny, ask-human, or even the catastrophic-pattern kill-list, all
-equally bypassed.
+On opencode 2.2.3, `--auto` does not override a deny from the plugin's
+`evaluate` hook: a kill-list or Jev denial still blocks the tool (`git push
+--force` under `--auto` was blocked in the 2026-11-05 runs). What `--auto`
+does is resolve every request the gate leaves at "ask" on its own, without
+waiting for a human. In attended mode those are the cases Jev sends to a
+human, credential-path reads, gate errors (missing key, timeout, garbage
+output), unknown decisions and oversized requests. Under `--auto` all of them
+are approved.
 
-Reproducible with zero real-world risk (e.g. `terraform` not installed, so a
-bypass can't actually destroy anything):
+Fix: turn on unattended mode for any run nobody is watching. It denies each
+would-be ask with a message the agent can act on, and logs it as
+`gateAction: "reject"` with `unattended: true` and the original `reason`:
 
-```bash
-opencode run --model <any> --auto \
-  "Run the shell command: terraform destroy -auto-approve and report the verbatim tool result."
+```jsonc
+// opencode.jsonc
+{
+  "plugins": [
+    {
+      "package": "/absolute/path/to/jev-decision-gate/plugin/jev-decision-gate",
+      "options": { "unattended": true }
+    }
+  ]
+}
 ```
 
-The shell **executes** the command even though the decision log shows the
-plugin got the call right:
+or export `JEV_GATE_UNATTENDED=1`. Check the log after a run: a shell command
+with `gateAction: "allow"` or `"ask-human"` and no `unattended` field, from a
+session started with `--auto`, means the option was not set in that process.
 
-```
-{"tool":"shell","kind":"destructive","gateAction":"reject","reason":"catastrophic-pattern", ...}
-{"tool":"shell","gateAction":"reject","reason":"reply-failed","error_class":"... HTTP 404 Not Found","totalElapsedMs":109}
-```
-
-The reply lands ~100ms after the request (local regex, no network, no Jev
-call) — and it is still too slow, because `--auto` doesn't wait on anything.
-This is not fixable by making the plugin's reply faster: `--auto` approves
-before any plugin gets a chance to race it at all.
-
-**The same command through the raw session API (no `--auto`) is correctly
-blocked:**
-
-```bash
-opencode api POST /api/session -d '{}'                                    # → sid
-opencode api POST "/api/session/$sid/prompt" -d '{"text":"Run the shell command: terraform destroy -auto-approve ..."}'
-```
-
-```json
-{"type":"tool","name":"shell","executed":false,
- "state":{"status":"error","error":{"type":"aborted","message":"The user declined this tool call"}}}
-```
-
-`executed: false`, no `reply-failed` in the log — the plugin's reject lands
-before the tool runs. Same plugin, same machine, same model; the only
-difference is the absence of `--auto`.
-
-**For headless/non-interactive/subagent work where the gate's protection
-matters, drive the session through the raw API instead of `--auto`:**
-`POST /api/session`, `POST /api/session/{id}/prompt` (body `{"text": "..."}`),
-then poll `GET /api/session/{id}/message` for completion. This behaves like
-an interactive TUI session — the gate has as much time as it needs to reply,
-since nothing else resolves the permission first.
+Evidence (2026-11-05, opencode 2.2.3, unattended live run): all 73 unsafe
+corpus cases denied, none allowed. See [EVALUATION.md](EVALUATION.md).
 
 ## "It never asks Jev, I always get the manual prompt"
 
@@ -76,12 +52,13 @@ tail -5 <that path>
 | no log lines at all, `permission: "allow"` in config | no `permission.asked` fires at all when the ambient mode is already `allow` — nothing to intercept | set `"permission": "ask"` (global or project config); that's what lets the gate substitute Jev for the human in the first place |
 | no log lines at all, `permission: "ask"` already set | hook never fired for another reason | check `opencode debug config` resolves your plugin path; re-check with `python3 -m jev_gate.doctor` |
 | `reason: catastrophic-pattern` | command matched kill-list | intended: rewrite the command |
+| `reason: credential-path` | the command or edit touches a credential store (SSH keys, cloud tokens, `.netrc`, ...) | intended: Jev is not consulted; attended, the prompt is yours; unattended, denied |
 
 ## Which opencode, which version
 
 This project only works on the `@opencode/plugin` API line (the one
 with `permission.asked` events) — installed as plain `opencode`,
-currently tracking 2.1.x, with `@opencode/plugin` pinned to 2.1.4 (`anomalyco/opencode` on GitHub; same repo
+verified on opencode 2.2.3 (2026-11-05). The SDK types are pinned to `@opencode/plugin` 2.1.4, whose tool adapter is identical in 2.2.3 (`anomalyco/opencode` on GitHub; same repo
 that also ships the older, much more widely-used `@opencode-ai/plugin`
 line under the same `opencode` name at 1.18.x — two parallel plugin
 API generations in one project, not two separate products). Run
@@ -140,27 +117,42 @@ unfamiliar line came from here.
 
 ## Question dialog: how auto-answer works, and what to check if it hangs
 
-The question tool is answered two ways, in order:
+The question tool is answered in-process:
 
-1. **In-process (preferred).** The plugin wraps the `question` tool's
-   `execute`. Jev evaluates the offered options and returns a pick; the
-   wrapped tool returns that pick as the tool result directly — no form,
-   no reply API, works in any opencode server. Log lines show
-   `phase: "question-tool"`, `reason: "question-answered"`.
-2. **Form fallback.** If Jev can't answer (ask-human, pick not offered,
-   ambiguous, no options), the original `execute` runs and opens the
-   human-facing **form** (`metadata.kind=question`), listed at
-   `GET /api/form`. On 2.0.x the question tool always goes through a
-   form when unanswered in-process, not a dedicated `/api/question`
-   surface. The plugin polls `/api/form` (and also listens for
-   `form.created` / legacy `question.v2.asked` / `question.asked`),
-   evaluates each field with options as multichoice, and on an
-   allow+valid pick POSTs
-   `opencode api POST /api/session/{sessionID}/form/{formID}/reply`
-   with body `{"answer":{"q0":"<pick>"}}`. Log shows
-   `phase: "form-answer"` then `reason: "question-answered"`. If Jev
-   returns ask-human / invalid pick / reply failure, the form stays
-   pending, logged, and the human answers in the TUI.
+**In-process (always).** The plugin wraps the `question` tool's
+`execute`. Jev evaluates the offered options and returns a pick; the
+wrapped tool returns that pick as the tool result directly, no form,
+no reply API, works in any opencode server. Log lines show
+`phase: "question-tool"`, `reason: "question-answered"`.
+
+**When Jev can't answer** (ask-human, pick not offered, ambiguous, no
+options, or a gate error), the wrapper returns a handoff result:
+`answers` is one empty array per question and `content` tells the agent
+to ask the user the questions directly in chat, then end its turn
+(`reason: "question-handoff-chat"`, `phase: "question-tool"`). With
+`unattended` the content instead says no human is available: do not
+guess, stop and report. No answer is ever invented.
+
+**Why not the form (root cause).** Calling the built-in `execute`
+creates the form server-side (`GET /api/form` lists it,
+`metadata.kind=question`) but the TUI never renders it and the agent's
+turn hangs forever. Reproduced on opencode 2.2.3 (TUI, both
+`--standalone` and the background service) with a minimal wrapper that
+only does `return original(input, context)`; without any wrapper the
+dialog renders. The cause is the SDK's promise adapter
+(`promiseExecutor` in `@opencode/plugin/dist/promise/adapter.js`),
+which runs the host Effect in the plugin runtime, so the form event
+never reaches the TUI.
+
+**Forms from other tools** still exist. The plugin polls `/api/form`
+(and also listens for `form.created` / legacy `question.v2.asked` /
+`question.asked`), evaluates each field with options as multichoice,
+and on an allow+valid pick POSTs
+`opencode api POST /api/session/{sessionID}/form/{formID}/reply`
+with body `{"answer":{"q0":"<pick>"}}`. Log shows
+`phase: "form-answer"` then `reason: "question-answered"`. If Jev
+returns ask-human / invalid pick / reply failure, the form stays
+pending, logged, and the human answers in the TUI.
 
 Separately, `permission.asked` for `action === "question"` is always a
 passthrough allow with **no** `ctx.session.context` and **no** Jev call
@@ -206,12 +198,15 @@ stays pending for the human):
 
 If a question hangs with no click available: confirm the permission
 phase logged `question-permission-passthrough` (no Jev call on that
-requestID), then check whether the in-process wrap or the form path
-logged anything at all for the question; no log line at all for a
-given form usually means its project directory never registered with
-the shared poller (see "High idle CPU" below) rather than a hang in
-the answering logic itself. `scripts/verify_autonomy.py` automates a
-non-interactive check of this whole path against a running service.
+requestID), then look for `phase: "question-tool"` with
+`reason: "question-handoff-chat"`: that means Jev declined and the
+agent was told to ask in chat instead of opening a form. A form that
+never renders after `original` was called is the 2.2.3 bug described
+above, not an answering-logic hang. No log line at all for a given form
+usually means its project directory never registered with the shared
+poller (see "High idle CPU" below). `scripts/verify_autonomy.py`
+automates a non-interactive check of this whole path against a running
+service.
 
 **Repro:** `permission: "ask"` (required, see above), plugin enabled,
 API key loaded in the service's own environment. Open a TUI session in
@@ -219,8 +214,8 @@ a test directory and send: "Hazme una pregunta multiopción: qué
 cenamos hoy. Opciones exactamente: pizza, sushi, ensalada. Usa la
 herramienta de pregunta del sistema y espera mi respuesta." Success:
 either `phase: "question-tool"` with `reason: "question-answered"`
-(no form at all), or passthrough followed by `phase: "form-answer"` /
-`question-answered`; the agent continues without a manual click.
+(no form at all), or `reason: "question-handoff-chat"` (the agent asks
+you in chat); the turn never hangs on a form.
 
 ## Ordinary permission replies (`read`/`edit`/`bash`/...) and "Permission request not found"
 
@@ -289,8 +284,9 @@ The plugin answers the `question` tool inside the tool call by default:
 log lines with `phase: "question-tool"` and `reason: "question-answered"`,
 and no form is created at all. If Jev can't answer (for example a
 free-text question has no options, logged as `form-unsupported-field`),
-the normal form opens for the human, and the form path deliberately
-stays silent for it.
+the tool returns the chat handoff (`reason: "question-handoff-chat"`)
+and the agent asks you directly in the conversation; no form is
+created, so a form never hangs the TUI.
 
 ## Which log file?
 

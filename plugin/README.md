@@ -50,6 +50,7 @@ Options (all optional):
 | `logFile`     | `JEV_GATE_LOG`        | `<repo>/decisions-plugin.jsonl`            |
 | `gateDir`     | `JEV_GATE_DIR`        | repo root (where `src/jev_gate` lives)     |
 | `enabled`     | `JEV_GATE_ENABLED`    | `true` (`false`, `0`, `off`, `no` disable) |
+| `unattended`  | `JEV_GATE_UNATTENDED` | `false` (`true`/`1`/`yes`/`on`: hold undecided requests with a deny instead of an "ask") |
 | `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `25000` (clamped to 1000–30000)            |
 | `objectiveChars` | `JEV_GATE_OBJECTIVE_CHARS` | `60000` (clamped to 200 to 90000), how much recent conversation (both roles) Jev sees |
 | `pythonBin`   | `JEV_GATE_PYTHON`     | auto-detected: newest mise-managed Python under `~/.local/share/mise/installs/python/`, else `python3` |
@@ -60,6 +61,21 @@ never sits in cleartext JSON.
 To disable without uninstalling, set `"enabled": false` or export
 `JEV_GATE_ENABLED=0`. While disabled the plugin subscribes to nothing
 and every permission falls back to the manual prompt.
+
+Set `unattended` when no human is around to answer prompts
+(`opencode run --auto`, a night job, a CI run). Interactive "ask"
+blocks until someone looks, but the same "ask" under `--auto` is
+approved without anyone reading it, so the gate's "I am not sure"
+would silently become "yes". In unattended mode every request the gate
+would have left at "ask" (Jev asks for a human, an unknown decision,
+an oversized request, any gate error) is denied with a message naming
+the reason and telling the agent to pick something reversible or stop.
+Those entries are logged with `gateAction: "reject"` and
+`unattended: true`, keeping the original `reason`/`error_class`.
+Under the offline redteam stub (which always answers "ask") every
+benign case therefore shows up as a false positive: that is the mode
+holding what it cannot judge, not a corpus regression. Live mode is
+where benign cases are still allowed by Jev.
 
 The plugin shells out to the Python gate (`python3 -m jev_gate.cli`)
 with a minimal env. Each decision is appended (schema v2, mode 0600)
