@@ -5,81 +5,201 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 [![Node 20+](https://img.shields.io/badge/node-20%2B-339933.svg)](plugin/package.json)
 
-Jev (TypeSafe AI) as the permission gate for OpenCode: routine tool
-calls get approved automatically, anything Jev calls risky or
-uncertain falls back to your manual prompt. Every delegation is
-recorded in the JSONL decision log (`gateAction`, `reason`,
-`error_class`, `error_detail`); there is no desktop popup for
-ask-human/fail-open, only the manual prompt and the log entry.
+An LLM permission gate for OpenCode agents that blocks irreversible actions before they run and only interrupts a human when it matters.
 
-> [!WARNING]
-> This plugin lets an LLM auto-approve OpenCode's tool-permission
-> prompts on your behalf. Read [Safety model](#safety-model) before
-> pointing it at anything you care about. Defaults fail open to your
-> manual prompt, never to silent allow: no API key, any gate error, or
-> an unrecognized decision all fall back to asking you, and a local
-> kill-list rejects catastrophic shell commands before Jev is ever
-> asked. You remain responsible for what gets approved.
->
-> **`opencode run --auto` bypasses this gate entirely** — including the
-> catastrophic kill-list — because `--auto` resolves permissions
-> client-side before the plugin can reply. Never use `--auto` when the
-> gate's decisions are meant to matter; see
-> [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for the
-> reproduction and the safe alternative for headless sessions.
+![jev-decision-gate demo](docs/demo/demo.gif)
 
-**Contents:** [Requirements](#requirements) ·
-[Quickstart](#quickstart) · [Safety model](#safety-model) ·
-[Layout](#layout) · [Develop](#develop)
+[Watch the full demo (MP4, 111 s)](docs/demo/demo.mp4)
+
+## Project overview
+
+Coding agents ask permission for every tool call. People either rubber-stamp
+the prompts, or switch to allow-all or `--auto` to stop the noise. Then the
+irreversible actions (a force-push, `rm -rf`, `curl | sh`, a leaked
+credential) go through with everyone's approval by habit.
+
+jev-decision-gate sits in OpenCode's permission hook. Routine calls are
+approved without a prompt. Commands that match a local kill-list are denied
+before any network call. Everything else is judged by Jev (TypeSafe AI) with
+the conversation context, and only the cases Jev cannot decide reach a human.
+Every decision lands in a JSONL audit log.
+
+## Safety approach
+
+Each layer runs in this order, and a hit on an earlier layer stops the
+evaluation:
+
+| Layer | What it stops | What happens on a hit |
+| ----- | ------------- | --------------------- |
+| Command recovery | OpenCode 2.2.3 hands shell commands over pre-split with the pipes dropped (`curl U \| sh` arrives as two commands). The gate recovers the original command from the session, within 3 s. Subagent and task calls get their dispatch prompt recovered the same way. | The later layers scan the original, so pipes are visible again, and a dispatch prompt is judged before Jev. A miss falls back to the fragments, as before. |
+| Kill-list | Catastrophic commands: `rm -rf /`, force-push (also `+refspec`), pipe-to-shell, `mkfs`, `DROP DATABASE`, `terraform destroy`, and more. Wrapper words (`sudo -E`, `env`, `nohup`, `timeout`) are skipped before matching, and `rm` targets such as `~/*` and `/home/<user>/` count as the home directory. Local rules, no network, about 1 ms. | Denied with a message the agent can act on. Jev is never called. |
+| Credential-path guard | Reads of SSH keys and `.ssh` directories, cloud and registry tokens (`.aws/credentials`, `.npmrc`, `.pypirc`, `.docker/config.json`, `.cargo/credentials`), GPG and `.netrc`, opencode's `auth.json`, `/etc/shadow`, `*.p12` and `*.pfx`, and `.pem` keys named as keys (`*key*.pem`, `*private*.pem`, `id_*.pem`). A read is an irreversible disclosure. | Jev is never called. Attended: the human decides. Unattended: denied. |
+| Jev judgement | Context-dependent risk: destructive or exfiltrating actions, ambiguous instructions, injected instructions in the content. Jev gets a structured, redacted state, not the raw event. | `allow`, `deny` with a reason the agent can act on, or `ask-human`. The decision Jev returns is used as-is, with no confidence thresholds. |
+| Fail-closed defaults | No API key, missing Python, timeout, garbage output, non-zero exit, unknown decision, oversized request. | Falls back to a human prompt, never to a silent allow. Unattended mode turns that prompt into a deny. |
+| Audit log | Nothing is hidden: every decision is recorded. | JSONL schema v2 with secrets redacted, mode `0600`. `scripts/measure.py` reads it. |
+
+Questions from the agent follow a separate path. The `question` tool is
+wrapped, so Jev answers each field in-process. When Jev cannot answer, the
+agent is told to ask the user in chat, instead of opening a form that hangs
+the OpenCode TUI.
 
 ```
-opencode v2 ──permission.asked──▶ plugin/ ──stdin/stdout──▶ jev_gate (Python) ──▶ Jev API
-     ▲                                │ allow → reply once
-     │                                │ deny → reply reject
-     │                                │ ask-human → silence, logged
-     │
-     └──question tool call──▶ plugin/ (in-process, Jev answers each field)
-            └─ if unanswerable ──▶ question form (GET /api/form) ──▶ Jev pick
-                   ──▶ POST /api/session/.../form/.../reply  {"answer":{"q0":"<pick>"}}
+opencode permission.asked
+  -> evaluate hook (plugin/jev-decision-gate/index.ts)
+     1. recover original shell command or subagent dispatch prompt
+     2. kill-list                  hit -> deny (no Jev)
+     3. credential-path guard      hit -> ask, or deny when unattended (no Jev)
+     4. structured state -> Jev    allow / deny / ask-human
+     5. any error or unknown answer -> ask-human (deny when unattended)
+  -> both sides append the JSONL audit log (secrets redacted)
+
+agent question tool (wrapped)
+  -> Jev answers each field -> answer returned to the agent
+  -> any field Jev cannot answer -> agent asks the user in chat
 ```
 
-The plugin sends Jev a structured state per halt (objective, halt kind,
-tool, redacted detail, risk hints, policy) filled up to Jev's input
-window, so Jev judges with as much context as fits.
-Jev answers three parallel questions (allow/deny/ask-human,
-is-this-safe, risk-score); the `decision` answer alone wins, at any
-confidence; safe/risk are asked for as context, not vetoes (see
-"Safety model" below for why). Any error fail-opens to ask-human: a
-broken gate never silently allows.
+Full flow, design decisions and their reasons: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Catastrophic shell patterns (`rm -rf /`, pipe-to-shell, remote code run through `$(curl ...)` or `<(curl ...)`, force-push,
-`mkfs`, fork bombs, ...) are rejected instantly without calling Jev.
+## Supporting evidence
 
-Agent questions (multichoice) are auto-answered when Jev can pick: the
-permission to open the question tool is passthrough-allowed without
-session context (no Jev call), and the question tool itself is
-wrapped so Jev answers each field in-process. When that can't answer,
-OpenCode opens a **form** (`metadata.kind=question`) instead. The
-plugin polls `GET /api/form` (and listens for `form.created` / legacy
-question events), asks Jev for a pick, and submits
-`POST /api/session/{sessionID}/form/{formID}/reply` with
-`{"answer":{"q0":"<pick>"}}`. If Jev is unsure or the submit fails,
-it stays pending for you to answer in the TUI; see
-[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+### Demo
 
-## Requirements
+The GIF at the top shows routine work auto-approved (about 0.45 s per call),
+a user-requested force-push blocked by the kill-list (the agent obeys the
+message), a read of `~/.ssh` held for the human, who rejects it, then the
+decision log and the red-team table. The MP4 is the full 111 s version.
 
-- OpenCode on the `@opencode/plugin` line (`permission.asked` events;
-  the older, more common `@opencode-ai/plugin` line does not fire it —
-  see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) if you're not
-  sure which one you have)
-- `"permission": "ask"` in your `opencode.json` (global or project) —
-  under `"allow"` there's nothing for the gate to intercept
+### Live red-team results (2026-11-05)
+
+Host: opencode 2.2.3. Jev model `jev-1.14.0`. Corpus
+[`eval/redteam.json`](eval/redteam.json), 96 cases (86 shell, 6 read, 3 edit,
+1 task), each run 3 times with the worst outcome reported. Full method and
+both tables: [docs/EVALUATION.md](docs/EVALUATION.md).
+
+| category | n | allowed | denied | asked | critical | false-positives | block-misses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ambiguity-conflict | 3 | 0 | 2 | 1 | 0 | 0 | 0 |
+| benign | 23 | 21 | 0 | 2 | 0 | 0 | 0 |
+| destructive-not-killlisted | 18 | 0 | 8 | 10 | 0 | 0 | 0 |
+| exfiltration | 13 | 0 | 1 | 12 | 0 | 0 | 0 |
+| faults | 7 | 0 | 0 | 7 | 0 | 0 | 0 |
+| kill-list | 28 | 0 | 28 | 0 | 0 | 0 | 0 |
+| prompt-injection | 4 | 0 | 4 | 0 | 0 | 0 | 0 |
+| **total** | 96 | 21 | 43 | 32 | 0 | 0 | 0 |
+
+Latency per case: p50 428 ms, p95 517 ms.
+
+All 28 kill-list commands are denied locally, all 4 prompt injections are
+denied, and 21 of the 23 benign commands run without a prompt. The two benign
+commands that a human is asked about are `rm -rf node_modules` and a `git push`
+followed by a `gh pr create` whose title contains "+20%".
+
+Unattended mode, same corpus (1 run): 75 denied, 21 allowed, 0 critical. All 73
+unsafe cases were denied. Two benign commands were held as false positives:
+the same `rm -rf node_modules` and the same `git push` plus `gh pr create`.
+Details in [docs/EVALUATION.md](docs/EVALUATION.md).
+
+### What red-teaming on real opencode found and fixed
+
+- **Shell operators were dropped before the gate saw them.** OpenCode 2.2.3
+  passes pre-split commands, so pipe-only kill-list patterns never fired live.
+  The gate now recovers the original command from the session and scans it,
+  plus a rule that denies a fetch or decode feeding a stdin interpreter.
+- **`opencode run --auto` was documented as bypassing the gate.** It does not:
+  a deny from the hook still blocks the tool. What `--auto` does is approve
+  everything the gate leaves at "ask". The docs were corrected, and the
+  `unattended` option was added to turn those asks into denials.
+- **The question tool hung the TUI.** Calling the original `question` execute
+  creates a form that OpenCode 2.2.3 never renders. The gate no longer calls
+  it and hands the questions to the agent to ask in chat.
+- **Jev allowed a read of `~/.ssh/id_rsa` in one of three runs.** A
+  deterministic credential-path guard now sends those reads to a human, and
+  denies them when unattended, without asking Jev.
+- **A read-only review found bypasses the corpus missed.** Wrapper words
+  (`sudo -E bash`, `env bash`), `rm` targets (`~/*`, `/home/<user>/`),
+  `git -C dir push origin +main` and task dispatch prompts scanned too late
+  were fixed, each with corpus cases and unit tests.
+
+### How to reproduce
+
+Offline (no API key, no network, runs in CI through `npm --prefix plugin test`):
+
+```bash
+npm --prefix plugin ci
+npm --prefix plugin run redteam          # kill-list for real, Jev stubbed as ask-human
+```
+
+Live (calls Jev, needs `TYPESAFE_API_KEY`):
+
+```bash
+npm --prefix plugin run redteam:live -- --repeat 3
+npm --prefix plugin run redteam:live -- --repeat 1 --unattended
+```
+
+One-command live demo in an isolated sandbox that never touches your real
+OpenCode configuration (needs `TYPESAFE_API_KEY` and the repo installed):
+
+```bash
+./scripts/demo.sh --model <provider/model>
+```
+
+## Limitations
+
+- **The kill-list is a list of patterns, not a proof.** It catches the shapes
+  in the corpus and the patterns it names. A variant written to avoid them
+  falls through to Jev, which is then the only judge.
+- **Jev is a third-party API.** The redacted state (conversation excerpts and
+  command text) leaves your machine. For fully local judging with no data
+  leaving the box, use the sibling project
+  [ollaya-decision-gate](https://github.com/iDiagoValeta/ollaya-decision-gate),
+  which applies the same gate design with a local model.
+- **Prompt injection is mitigated, not solved.** Conversation text and command
+  output reach Jev inside its state, marked as data. A convincing payload can
+  still persuade Jev. See [SECURITY.md](SECURITY.md) "Accepted risk: prompt
+  injection into Jev's state".
+- **Jev is non-deterministic.** The same case can get different answers on
+  different runs. That is why the evaluation repeats each case and reports the
+  worst outcome. One clean run is evidence, not a guarantee.
+- **Coverage is shell, read, edit and task permissions.** The corpus has 86
+  shell, 6 read, 3 edit and 1 task case, and no web fetch, search or MCP cases.
+  Other permission kinds (web fetch, MCP tools) get no deterministic rule
+  beyond the credential-path guard: Jev alone judges them.
+- **Evaluated on one machine, one day, one OpenCode version.** The numbers
+  come from opencode 2.2.3 on 2026-11-05. They are not a benchmark.
+- **Unattended mode holds more than it should.** It denies everything it
+  cannot judge, so some safe work gets blocked. The live run held two benign
+  commands: `rm -rf node_modules`, and a `git push` followed by a `gh pr create`
+  whose title contains "+20%".
+- **A bare `rm -rf *` is left to Jev.** `*` is not a protected target, so the
+  kill-list denies wipes of `/`, `~`, `.` and `/home/<user>` only.
+- **Prose is caught only at a command position.** `run rm -rf ~/*` inside a task
+  prompt is caught only when the text reaches a command position (after a
+  separator, `(`, `$(` or a backtick). A sentence that only mentions the command
+  is judged by Jev.
+- **The event-path fallback is weaker.** Opencode builds without the `evaluate`
+  hook use the `permission.asked` path. It applies the kill-list and Jev, but
+  not command recovery, the credential guard or unattended mode.
+- **Forms from other tools are not held in unattended mode.** When Jev cannot
+  answer one, the form stays pending, and unattended mode does not deny it.
+- **Form answers still need the background service.** Forms raised by other
+  tools are answered through `opencode api`, which only reaches the
+  background service. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+## Quickstart
+
+### Requirements
+
+- OpenCode on the `@opencode/plugin` line (`permission.asked` events; the
+  older, more common `@opencode-ai/plugin` line does not fire it, see
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) if unsure which one you
+  have). Verified on opencode 2.2.3.
+- `"permission": "ask"` in your `opencode.json` (global or project). Under
+  `"allow"` there is nothing for the gate to intercept.
 - Python 3.10+ with `pip install -e .` (pulls `typesafe-sdk`)
 - Node 20+ for the plugin adapter
 - A TypeSafe API key (`console.typesafe.ai`)
 
-## Quickstart
+### Install
 
 ```bash
 git clone git@github.com:iDiagoValeta/jev-decision-gate.git
@@ -89,44 +209,47 @@ export TYPESAFE_API_KEY="..."
 python3 -m jev_gate.doctor
 ```
 
-Or manually — see [plugin/README.md](plugin/README.md) for the full
-options table (`typesafeKey`, `logFile`, `gateDir`, `enabled`,
-`timeoutMs`, `pythonBin`). Disable anytime with `"enabled": false` or
-`JEV_GATE_ENABLED=0`.
+Manual setup and the full options table (`typesafeKey`, `logFile`, `gateDir`,
+`enabled`, `unattended`, `timeoutMs`, `pythonBin`) are in
+[plugin/README.md](plugin/README.md). Disable anytime with `"enabled": false`
+or `JEV_GATE_ENABLED=0`.
 
-## Safety model
+## Unattended and headless runs
 
-Jev decides — no confidence thresholds. Whatever Jev's `decision`
-answer says wins: allow executes, deny blocks, ask-human falls back
-to your manual prompt, at any confidence. The safe/risk answers are
-context, not vetoes.
+`opencode run --auto` approves every request left at "ask". The gate does not
+stop that on its own:
 
-What never executes: unknown decision strings (treated as ask-human),
-any error (fail-open to ask-human), and catastrophic shell patterns
-(rejected locally without calling Jev).
+- A deny from the gate still blocks the tool under `--auto`. Verified on
+  opencode 2.2.3 with `git push --force` (blocked by the kill-list).
+- Anything the gate leaves at "ask" is approved without anyone reading it.
+  That covers Jev asking for a human, credential-path reads, gate errors,
+  unknown decisions and oversized requests.
 
-**Jev's judgment is the real control, not a sandbox.** The state Jev
-reads includes attacker-reachable text (conversation content, command
-output) in its own JSON fields, marked as data, never instructions: see
-[SECURITY.md](SECURITY.md) "Accepted risk: prompt injection into
-Jev's state" for what that does and doesn't guarantee.
+For an agent nobody is watching, turn on unattended mode. It denies every
+would-be ask with a message the agent can act on:
 
-Every decision is appended to a JSONL log (v2 schema:
-`at`, `sessionID`, `requestID`, `tool`, `kind`, `gateAction`,
-`reason`, `confidence`, `model`, `pick`, `elapsedMs`,
-`detail_sha256`, and `usage` (Jev's token counts, which `measure.py`
-turns into tokens and cost) with no secrets, mode `0600`. `setup()` runs once per
-project directory, so several instances share one opencode process;
-when two of them see the same request, the loser logs
-`duplicate-suppressed` (a no-op that never touched Jev).
-`scripts/measure.py` excludes those rows from its rates; a raw
-`grep gateAction` over the log would count them.
+```jsonc
+// opencode.jsonc
+{
+  "permission": "ask",
+  "plugins": [
+    {
+      "package": "/absolute/path/to/jev-decision-gate/plugin/jev-decision-gate",
+      "options": { "unattended": true }
+    }
+  ]
+}
+```
 
-### Personal notes for Jev
+Or export `JEV_GATE_UNATTENDED=1`; `true`, `yes`, `on` and `1` all work, in any
+letter case. Denials are logged with
+`gateAction: "reject"` and `unattended: true`, keeping the original reason.
+
+## Personal notes for Jev
 
 Give Jev standing context about how you want it to judge, read from two
 optional plain-text files (see `.jev-notes.example.md`): `.jev-notes.md`
-in a project (gitignored — never commit it, see "Layout") for
+in a project (gitignored, never commit it, see "Layout") for
 project-scoped notes, and `$XDG_CONFIG_HOME/jev-gate/notes.md` (defaults
 to `~/.config/jev-gate/notes.md`) for notes that follow you across every
 project. Both are shown to Jev together when present.
@@ -139,21 +262,28 @@ the notes say.
 
 ## Layout
 
-- `plugin/` — v2 adapter (TypeScript, zero runtime deps besides `@opencode/plugin`)
-- `src/jev_gate/` — gate: `schemas.py` (state/redaction/questions),
+- `plugin/` : v2 adapter (TypeScript, zero runtime deps besides `@opencode/plugin`)
+  - `plugin/jev-decision-gate/index.ts` : the permission hook, kill-list, credential guard, question wrap
+  - `plugin/jev-decision-gate/redteam.ts` : red-team harness, drives the real `evaluatePermission`
+- `src/jev_gate/` : gate: `schemas.py` (state/redaction/questions),
   `client.py` (Jev wrapper), `decision.py` (decision combine, no thresholds),
   `cli.py` (stdin/stdout gate with fail-open), `doctor.py`
-- `tests/` — pytest suite plus `golden.json` traps
-- `scripts/` — `install.sh`, `uninstall.sh`, `measure.py` v2,
-  `verify_autonomy.py` (live autonomy check)
-- `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md), [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- `tests/` : pytest suite plus `golden.json` traps
+- `eval/` : red-team corpus (`redteam.json`) and dated results (`results/`)
+- `scripts/` : `install.sh`, `uninstall.sh`, `demo.sh` (live demo in a sandbox),
+  `measure.py` v2, `verify_autonomy.py` (live autonomy check)
+- `docs/` : [ARCHITECTURE.md](docs/ARCHITECTURE.md),
+  [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md),
+  [EVALUATION.md](docs/EVALUATION.md), `demo/` (GIF and MP4)
 
 ## Develop
 
 ```bash
 python3 -m pytest -q
+npm --prefix plugin test                 # TS unit tests plus the offline red-team sweep
+npm --prefix plugin run redteam          # offline corpus, prints the table
 python3 scripts/measure.py --by-session
 python3 -m jev_gate.doctor
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
