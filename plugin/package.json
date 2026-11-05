@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "tsc -p tsconfig.build.json && node --test dist/index.test.js"
+    "test": "tsc -p tsconfig.build.json && node --test dist/index.test.js dist/redteam.test.js",
+    "redteam": "tsc -p tsconfig.build.json && node dist/redteam.js --offline",
+    "redteam:live": "tsc -p tsconfig.build.json && node dist/redteam.js --live"
   },
   "dependencies": {
     "@opencode/plugin": "2.1.4"
