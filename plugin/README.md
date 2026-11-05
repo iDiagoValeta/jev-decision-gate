@@ -9,11 +9,11 @@ can't answer, OpenCode opens a **form** (`metadata.kind=question`)
 that the plugin polls for (`GET /api/form`) and answers on Jev's
 behalf via `POST /api/session/{sessionID}/form/{formID}/reply`. If Jev
 is unsure or the reply fails, it stays pending for you to answer in
-the TUI — see the repo's `docs/ARCHITECTURE.md` and
+the TUI, see the repo's `docs/ARCHITECTURE.md` and
 `docs/TROUBLESHOOTING.md` for the full flow and its known limits.
 
 Requires OpenCode on the `@opencode/plugin` line (`permission.asked`
-events — the more common `@opencode-ai/plugin` line does not fire it,
+events, the more common `@opencode-ai/plugin` line does not fire it,
 see the repo's `docs/TROUBLESHOOTING.md`), `"permission": "ask"` in
 your config, Python 3.10+ with the repo installed (`pip install -e .`
 for `typesafe-sdk` + `jev_gate`), and a TypeSafe API key.
@@ -50,8 +50,8 @@ Options (all optional):
 | `logFile`     | `JEV_GATE_LOG`        | `<repo>/decisions-plugin.jsonl`            |
 | `gateDir`     | `JEV_GATE_DIR`        | repo root (where `src/jev_gate` lives)     |
 | `enabled`     | `JEV_GATE_ENABLED`    | `true` (`false`, `0`, `off`, `no` disable) |
-| `unattended`  | `JEV_GATE_UNATTENDED` | `false` (`true`/`1`/`yes`/`on`: hold undecided requests with a deny instead of an "ask") |
-| `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `25000` (clamped to 1000–30000)            |
+| `unattended`  | `JEV_GATE_UNATTENDED` | `false`. `true`, `1`, `yes` and `on` hold undecided requests with a deny instead of an "ask". `false`, `0`, `no`, `off` and an empty value keep the gate attended. Any other value is read as on and logged once as `config-unattended-unrecognised`. The option and the variable are both read: either one that is on turns it on |
+| `timeoutMs`   | `JEV_GATE_TIMEOUT_MS` | `25000` (clamped to 1000 to 30000)            |
 | `objectiveChars` | `JEV_GATE_OBJECTIVE_CHARS` | `60000` (clamped to 200 to 90000), how much recent conversation (both roles) Jev sees |
 | `pythonBin`   | `JEV_GATE_PYTHON`     | auto-detected: newest mise-managed Python under `~/.local/share/mise/installs/python/`, else `python3` |
 
@@ -68,12 +68,13 @@ blocks until someone looks, but the same "ask" under `--auto` is
 approved without anyone reading it, so the gate's "I am not sure"
 would silently become "yes". In unattended mode every request the gate
 would have left at "ask" (Jev asks for a human, an unknown decision,
-an oversized request, any gate error) is denied with a message naming
+an oversized request, any gate error, a dispatch prompt flagged only in its
+prose, a session lookup that fails) is denied with a message naming
 the reason and telling the agent to pick something reversible or stop.
 Those entries are logged with `gateAction: "reject"` and
 `unattended: true`, keeping the original `reason`/`error_class`.
-Under the offline redteam stub (which always answers "ask") every
-benign case therefore shows up as a false positive: that is the mode
+Under the offline redteam stub (which always answers "ask") every benign case
+is reported as `unverified`, because Jev never judged it: that is the mode
 holding what it cannot judge, not a corpus regression. Live mode is
 where benign cases are still allowed by Jev.
 

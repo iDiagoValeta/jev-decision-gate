@@ -8,7 +8,8 @@ On opencode 2.2.3, `--auto` does not override a deny from the plugin's
 does is resolve every request the gate leaves at "ask" on its own, without
 waiting for a human. In attended mode those are the cases Jev sends to a
 human, credential-path reads, gate errors (missing key, timeout, garbage
-output), unknown decisions and oversized requests. Under `--auto` all of them
+output), unknown decisions, oversized requests, dispatch prompts flagged only in their
+prose and session lookups that fail. Under `--auto` all of them
 are approved.
 
 Fix: turn on unattended mode for any run nobody is watching. It denies each
@@ -31,12 +32,13 @@ or export `JEV_GATE_UNATTENDED=1`. Check the log after a run: a shell command
 with `gateAction: "allow"` or `"ask-human"` and no `unattended` field, from a
 session started with `--auto`, means the option was not set in that process.
 
-Evidence (2026-11-05, opencode 2.2.3, unattended live run): all 73 unsafe
-corpus cases denied, none allowed. See [EVALUATION.md](EVALUATION.md).
+Evidence (2026-11-05, opencode 2.2.3, unattended live run): all 81 unsafe
+corpus cases denied, none allowed. The five benign cases that the attended run
+held for a human were denied. See [EVALUATION.md](EVALUATION.md).
 
 ## "It never asks Jev, I always get the manual prompt"
 
-That IS the fail-open design — but find out why:
+That IS the fail-open design, but find out why:
 
 ```bash
 python3 -m jev_gate.doctor      # "log writable (<path>)" is the log the plugin writes
@@ -46,27 +48,30 @@ tail -5 <that path>
 
 | Symptom in log | Cause | Fix |
 | -------------- | ----- | --- |
-| `reason: fail-open, error_class: missing-key` | no API key | `export TYPESAFE_API_KEY=...` (must be set in the *service's* env — see below) |
+| `reason: fail-open, error_class: missing-key` | no API key | `export TYPESAFE_API_KEY=...` (must be set in the *service's* env, see below) |
 | `error_class: transport` / `missing-sdk` | `typesafe-sdk` missing on the Python the plugin spawns (often the service's `/usr/bin/python3`) | `pip install -e .` into that env, or set `pythonBin` / `JEV_GATE_PYTHON` to a mise/user interpreter (plugin also auto-detects mise and sets `PYTHONPATH=src`) |
 | `error_class: gate timeout` | Jev slow / offline | raise `timeoutMs` (max 30000) |
-| no log lines at all, `permission: "allow"` in config | no `permission.asked` fires at all when the ambient mode is already `allow` — nothing to intercept | set `"permission": "ask"` (global or project config); that's what lets the gate substitute Jev for the human in the first place |
+| no log lines at all, `permission: "allow"` in config | no `permission.asked` fires at all when the ambient mode is already `allow`, nothing to intercept | set `"permission": "ask"` (global or project config); that's what lets the gate substitute Jev for the human in the first place |
 | no log lines at all, `permission: "ask"` already set | hook never fired for another reason | check `opencode debug config` resolves your plugin path; re-check with `python3 -m jev_gate.doctor` |
 | `reason: catastrophic-pattern` | command matched kill-list | intended: rewrite the command |
 | `reason: credential-path` | the command or edit touches a credential store (SSH keys, cloud tokens, `.netrc`, ...) | intended: Jev is not consulted; attended, the prompt is yours; unattended, denied |
+| `reason: subagent-prompt-flagged` | a task or subagent dispatch prompt matches a kill-list pattern only in its prose, for example `shutdown` or `drop table` in a sentence about a migration | intended: the prompt is prose, so this match alone is not a hard deny; attended, the human decides; unattended, denied with the hold message. If it is a false positive, reword the prompt so the pattern is not in it |
+| `reason: context-lookup-failed` | the session lookup that recovers the shell command or the dispatch prompt threw, or went past 3 s (`error_class: lookup timeout`) | intended: the gate holds the request rather than judge fragments; attended, the human decides; unattended, denied. Repeated timeouts point at a slow or stuck opencode service |
+| `reason: config-unattended-unrecognised` | `unattended` in the plugin options or `JEV_GATE_UNATTENDED` holds a value that is neither a known on nor a known off spelling (a typo such as `ture`, a number other than 0 or 1, an object) | logged once per setup, without the value. The value is treated as on. Set `true` or `false`, or unset the variable |
 
 ## Which opencode, which version
 
 This project only works on the `@opencode/plugin` API line (the one
-with `permission.asked` events) — installed as plain `opencode`,
+with `permission.asked` events), installed as plain `opencode`,
 verified on opencode 2.2.3 (2026-11-05). The SDK types are pinned to `@opencode/plugin` 2.1.4, whose tool adapter is identical in 2.2.3 (`anomalyco/opencode` on GitHub; same repo
 that also ships the older, much more widely-used `@opencode-ai/plugin`
-line under the same `opencode` name at 1.18.x — two parallel plugin
+line under the same `opencode` name at 1.18.x, two parallel plugin
 API generations in one project, not two separate products). Run
 `python3 -m jev_gate.doctor`, which reports the resolved version and
 whether it looks like the 2.x line.
 
 **Do not rely on the 1.18.x line for this gate.** Its `permission.ask`
-plugin hook is dead code — a plugin registering it loads cleanly and
+plugin hook is dead code, a plugin registering it loads cleanly and
 simply never gets consulted, which is *worse* than the 2.x line's known
 issues because there is no error to notice. If a future `opencode`
 release finally fixes that and you want to port this gate to
@@ -77,7 +82,7 @@ release finally fixes that and you want to port this gate to
 **Community v1 plugins on the 2.x line:** before removing a v1-only
 plugin, check whether its package ships a *native* v2 build under an
 alternate export subpath (`npm view <pkg> exports` and `main` is the
-fast way to check) — no `/v2`-shaped alternate export means there's
+fast way to check), no `/v2`-shaped alternate export means there's
 nothing native to point at, and the plugin should be removed from
 config rather than left erroring. A hand-written v1→v2 compatibility
 shim is deliberately avoided for auth plugins in particular: a shim bug
@@ -86,13 +91,13 @@ simply not loading.
 
 **"It worked on an older opencode 2.x, breaks on the newest one":** the
 `@opencode/plugin` SDK package (npm, pinned in `plugin/package.json`)
-and the `opencode` CLI binary are versioned independently — a newer
+and the `opencode` CLI binary are versioned independently, a newer
 CLI can ship a `permission.asked`/`ctx.session.context` shape the
 pinned SDK types don't match, or vice versa. Before filing a bug,
 capture the exact runtime version (`opencode --version`) next to the
 SDK version, and downgrade via the *direct* installer
 (`curl -fsSL https://opencode.ai/v2/install | bash -s -- --version <old>`)
-rather than `opencode upgrade <version>` — that command always targets
+rather than `opencode upgrade <version>`, that command always targets
 the single canonical `~/.opencode/bin/opencode`, so if you ever run it
 from a renamed/copied binary meant to preserve an old version
 side-by-side, it silently overwrites the *canonical* install instead,
@@ -101,17 +106,17 @@ different name to "pin" a version.
 
 Global `~/.config/opencode/opencode.json`:
 
-- `plugin` — 1.18.x-line plugins (npm names / git specs)
-- `plugins` — 2.x-line plugins, this gate among them, as
+- `plugin`: 1.18.x-line plugins (npm names / git specs)
+- `plugins`: 2.x-line plugins, this gate among them, as
   `{package, options}` objects. Put the API key in `TYPESAFE_API_KEY`
   (e.g. `~/.config/opencode/secrets.env`, sourced from `.zshrc`), not
-  in JSON. That source line only runs in an *interactive* shell — a
+  in JSON. That source line only runs in an *interactive* shell, a
   background `opencode service start` launched from a non-interactive
   script/session won't have the key unless you source it first in that
   same shell before starting the service.
 
-Anything else in that config — other `instructions` entries, other
-plugins in either list — belongs to whatever else you've installed
+Anything else in that config, other `instructions` entries, other
+plugins in either list, belongs to whatever else you've installed
 globally, not to this gate. Check `plugin/README.md` before assuming an
 unfamiliar line came from here.
 
@@ -156,7 +161,7 @@ pending, logged, and the human answers in the TUI.
 
 Separately, `permission.asked` for `action === "question"` is always a
 passthrough allow with **no** `ctx.session.context` and **no** Jev call
-(`reason: "question-permission-passthrough"`) — this only unlocks the
+(`reason: "question-permission-passthrough"`), this only unlocks the
 tool call; it never answers the question itself.
 
 **Field-level behavior on the form path:**
@@ -169,14 +174,14 @@ tool call; it never answers the question itself.
 - `hidden: true` fields are never answered. A field with
   `when: [{key, op: "eq"|"neq", value}]` is answered only when **all**
   conditions hold against the answers already decided for earlier
-  fields, compared with `===` (no coercion — a numeric `value` won't
+  fields, compared with `===` (no coercion, a numeric `value` won't
   match a string answer, which is the safe direction). An
   unreferenced `key` counts as unanswered: `eq` is false, `neq` is
-  true. A not-visible field is **omitted from the reply entirely** —
+  true. A not-visible field is **omitted from the reply entirely**,
   the server 400s on a reply that includes a field whose `when`
   isn't satisfied.
 - A visible field with **no options and a non-multiselect type**
-  (boolean / number / free-string) can't be answered by a pick — Jev
+  (boolean / number / free-string) can't be answered by a pick, Jev
   is not called for it. If it's not `required` it's skipped and the
   rest of the form is still auto-answered; if it is `required` the
   whole form stays pending for the human.
@@ -185,7 +190,7 @@ tool call; it never answers the question itself.
 
 Every early exit while walking a form's fields logs a line with
 `tool: "question"`, `requestID` = formID, `fieldKey`, and one
-distinct `reason` (all `gateAction: "ask-human"` — the field/form
+distinct `reason` (all `gateAction: "ask-human"`, the field/form
 stays pending for the human):
 
 | reason | meaning |
@@ -261,7 +266,7 @@ noticeable idle CPU with no active session.
 module): the first `setup()` instance starts it, the rest only
 register, the last cleanup stops it, and at most one tick runs at a
 time. If you see one poll process per project directory instead of one
-per opencode process, the shared state is not actually being shared —
+per opencode process, the shared state is not actually being shared,
 check it lives on `globalThis`, not in module scope.
 
 The bare `GET /api/form` only lists the service's own directory
@@ -270,10 +275,10 @@ project directory explicitly via
 `GET /api/form?location[directory]=<dir>`. A question form in a
 project that is never auto-answered (no `phase: form-answer` line at
 all, not even ask-human) means its directory never registered with the
-poller — check the service actually has that project open.
+poller, check the service actually has that project open.
 
 On the form path, a losing cross-instance claim logs nothing at all
-(not even `duplicate-suppressed`) — with many sibling instances racing
+(not even `duplicate-suppressed`), with many sibling instances racing
 every form, losing is the expected outcome and not worth a log row.
 `duplicate-suppressed` in the log means the permission (fallback) path
 only. `scripts/measure.py` excludes it from rates either way.
@@ -295,7 +300,7 @@ Canonical: the path in `logFile` / `JEV_GATE_LOG`, default
 order: `--log` flag (if given), then `JEV_GATE_LOG` env, then
 `logFile` from `~/.config/opencode/opencode.json` (looks in the
 `plugins` array for an object whose `package` contains
-`jev-decision-gate` and uses `options.logFile` if present — tolerates
+`jev-decision-gate` and uses `options.logFile` if present, tolerates
 a missing file or invalid JSON and falls through). The first source
 found is the only one read; the `decisions-plugin.jsonl` /
 `decisions.jsonl` cwd files are read only when none is configured. The

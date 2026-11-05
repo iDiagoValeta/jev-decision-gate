@@ -22,24 +22,37 @@ permission evaluate hook (ctx.permission.hook("evaluate"))
   → action subagent/task: recover the dispatch prompt from the same kind of
         tool-call part (same 3 s bound) and scan "<prompt>\n<resources>". This runs
         before the kill-list and the credential guard, so a dispatch meets the same
-        deterministic rules as a shell command
+        deterministic rules as a shell command. A match in the agent's name (the
+        resources) is a hard deny. A match that comes only from the prompt's prose
+        goes to the human as subagent-prompt-flagged (denied when unattended)
   → requests over 256 KiB (MAX_SCANNED_CHARS) → left to the human, or denied when
         unattended; reason oversized-request (no scan, no Jev)
   → catastrophic check (deterministic, no network, over the scanned text):
-        → fetch or decode followed by a later stdin interpreter (fetchFeedsInterpreter)
+        → fetch or decode feeding a stdin interpreter: a real pipe in one pipeline
+          or, when the original command was not recovered, a later segment
+          (fetchFeedsInterpreter). `python3 --version`, `node --test`, `bash setup.sh`
+          and `command -v` do not read stdin
         → rm with a recursive and a force flag on a protected target (rmRemovesProtectedTarget)
         → `+refspec` force push, matched per git command (forcePushRefspec)
         → the regex kill-list over overlapping 4000-char windows
         Every simple command is read after its wrapper words are skipped: sudo
-        (with its options), doas, env, nice, timeout, nohup, command, exec, time
+        (with its options, long ones included), doas, env, nice, timeout, nohup,
+        command (but not `command -v`, which only looks up), exec, time, xargs,
+        stdbuf and busybox. Quotes and backslashes in a command word are removed
+        first, so `"rm"` and `\bash` read as rm and bash
         → effect=deny + message "Blocked by jev-decision-gate: ... kill-list"
   → credential-path check (deterministic, same scanned text; the list is in the
         credential ADR below)
         → no Jev: attended leaves effect "ask", reason credential-path;
           unattended denies with the hold message
+  → lookup failed (the session lookup threw, or passed its 3 s bound; the error
+        class is logged)
+        → no Jev: attended asks the human, reason context-lookup-failed;
+          unattended denies with the hold message
   → kindFor(action, resources, recovered text as an extra resource):
         read | write | destructive
-  → objectiveFor(sessionID): recent conversation, both roles, redacted,
+  → objectiveFor(sessionID), 3 s bound (a timeout falls back to the generic
+    objective): recent conversation, both roles, redacted,
                               ≤60000 chars default (options.objectiveChars /
                               JEV_GATE_OBJECTIVE_CHARS, max 90000)
   → gateEvent { objective, halt {kind,tool,detail: the recovered command or
@@ -161,7 +174,11 @@ Live autonomy check (non-interactive, against a running service):
   that fires before `--auto` commits, so this is the only lever inside
   the plugin. Opt-in, because an interactive session is better served by
   a prompt than by a denial. The values `true`, `yes`, `on` and `1` switch it on,
-  in any letter case, from `options.unattended` or `JEV_GATE_UNATTENDED`. Forms
+  in any letter case, from `options.unattended` or `JEV_GATE_UNATTENDED`. The
+  two sources are combined, so either one that is on turns it on. `false`,
+  `0`, `no`, `off`, an empty value or nothing set is off. Any other value is
+  read as on (the safe direction for an ask) and logged once per setup as
+  `config-unattended-unrecognised`, without echoing the value. Forms
   raised by other tools are not held: an unanswered form stays pending.
 - **Reply via `opencode api POST`, never `ctx.permission.reply()`.**
   The SDK method proved unreliable for replying to `permission.asked`
@@ -263,11 +280,31 @@ Live autonomy check (non-interactive, against a running service):
   receives the recovered command once, without its fragments; the hash in
   the log covers the whole scanned text. Both lookups are bounded to 3 s
   (`LOOKUP_TIMEOUT_MS`) and run before the deterministic checks, so a stuck
-  session call cannot hold a permission indefinitely. A miss or a timeout
-  keeps the pre-existing behaviour exactly, and `fetchFeedsInterpreter`
-  still denies a fetch/decode segment followed by a later stdin interpreter
-  (`sh`, `bash`, `python3 -`, `bash -s`, ...) even with the pipe gone. The
+  session call cannot hold a permission indefinitely. A miss (no record found)
+  keeps the pre-existing behaviour exactly. A lookup that throws or times out
+  is not a miss: the request is held (see the `context-lookup-failed` ADR
+  below). When the original is not recovered, `fetchFeedsInterpreter` still
+  denies a fetch/decode followed by a later stdin interpreter (`sh`, `bash`,
+  `python3 -`, `bash -s`, ...) even with the pipe gone; when it is recovered,
+  only real pipes count. The
   same lookup recovers a subagent or task dispatch prompt, scanned the same way.
+- **A dispatch prompt is prose, so a match in it goes to a human.** A task or
+  subagent prompt is text written for another model, and nothing runs it as a
+  command. A kill-list pattern in the resources (the agent's name) is still a
+  hard deny. A pattern found only in the prompt's prose, such as `shutdown` or
+  `drop table` in a sentence about a migration, goes to the human with
+  `reason: subagent-prompt-flagged`, and is denied when unattended. The cost is
+  that a prompt telling the subagent to run `rm -rf ~` is held rather than
+  denied outright. The corpus case `dn-task-rm-home` checks that it is never
+  allowed. The live run of 2026-11-05 held two benign prompts this way.
+- **A failed lookup is held, not judged.** The lookup that recovers a shell
+  command or a dispatch prompt can throw, or run past its 3 s bound. Jev would
+  then judge only the fragments (a bare `rm` with no target, a `curl` with no
+  pipe), so the gate asks the human instead, with `reason: context-lookup-failed`
+  and the error class in the log. Unattended mode denies it. A lookup that finds
+  no record is not a failure and keeps the old behaviour. The objective lookup
+  (`objectiveFor`) is bounded the same way, and a timeout there falls back to the
+  generic objective.
 - **Redact before send.** Secrets never leave the box: redaction
   runs in TS (before spawn) and Python (before Jev call); logs store
   `detail_sha256`, not detail. Both layers give identical output: a
@@ -310,7 +347,8 @@ Live autonomy check (non-interactive, against a running service):
   `"${HOME}"/*` and `./*` equal `~` and `.`, and `/home/<user>/` equals
   `/home/<user>`. `forcePushRefspec` looks for a `+refspec` only among the
   arguments of a `git push`, after its global options (`git -C dir`,
-  `git -c k=v`), so a `+` in another command's argument does not fire.
+  `git -c k=v`), so a `+` in another command's argument does not fire. A
+  short-flag cluster that holds `f` (`-fu`, `-uf`) is a force push too.
 - **Credential stores are deterministic, not Jev's call.**
   `touchesCredentialStore` scans the same recovered text as the
   kill-list and, for every action except `question`, stops before any
@@ -321,13 +359,21 @@ Live autonomy check (non-interactive, against a running service):
   human decides); unattended denies with the hold message, because
   `--auto` would turn that ask into an allow. The match is
   prefix-agnostic, so `~`, `$HOME`, `${HOME}`, `/home/<user>` and
-  `/root` are the same case. It matches credential paths and file names,
+  `/root` are the same case. Both the raw text and its normalized form are checked, so
+  quotes or backslashes spliced into a path (`~/.s"s"h/id_rsa`) do not hide it.
+  It matches credential paths and file names,
   not the word `ssh`: `docs/ssh-setup.md` and a standalone `*.pub` do
   not fire. The list is:
-  - `.ssh` as a directory only (`~/.ssh/config`, `~/.ssh`), never `www.ssh.com`
-  - `.aws/credentials`, `.npmrc`, `.pypirc`, `.docker/config.json`, `.kube/config`
-  - `.cargo/credentials` (and `.toml`), `.config/git/credentials`, `.git-credentials`, `.netrc`, `.config/gh`
-  - `.gnupg`, opencode's own `.local/share/opencode/auth.json`, `/etc/shadow`, `/etc/sudoers`
+  - the `.ssh`, `.aws`, `.docker`, `.kube` and `.gnupg` directories, whole: the
+    name must end after the word (`~/.ssh/config`, `~/.aws/cred*` and
+    `~/.docker/config.json` match; `www.ssh.com`, `.ssh-agent-notes.md` and
+    `.dockerignore` do not)
+  - opencode's data directory, `.local/share/opencode` (its `auth.json` and the
+    session history)
+  - `kubectl config view` with `--raw`, which prints every credential unredacted
+  - `.npmrc`, `.pypirc`, `.cargo/credentials` (and `.toml`),
+    `.config/git/credentials`, `.git-credentials`, `.netrc`, `.config/gh`
+  - `/etc/shadow`, `/etc/sudoers`
   - `*.p12` and `*.pfx`
   - `.pem` files named as keys only (`*key*.pem`, `*private*.pem`, `id_*.pem`), so a CA bundle such as `ca.pem` is not matched
   - `id_rsa`, `id_ed25519` and `id_ecdsa`

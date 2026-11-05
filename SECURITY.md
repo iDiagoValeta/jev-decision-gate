@@ -16,13 +16,15 @@ publicly. We aim to respond within 72h and disclose within 90 days.
 - The gate **fail-opens to ask-human**: a broken gate never silently allows.
 - API keys are never logged; secrets are redacted before Jev calls.
 - Catastrophic shell patterns are rejected locally without calling Jev.
-- Credential stores never reach Jev: SSH keys and `.ssh` directories, cloud
-  and registry tokens (`.aws/credentials`, `.npmrc`, `.pypirc`,
-  `.docker/config.json`, `.cargo/credentials`, `.config/git/credentials`),
-  GPG and netrc files, opencode's own `auth.json`, `/etc/shadow`, `*.p12` and
-  `*.pfx` files, and `.pem` keys named as keys (`*key*.pem`, `*private*.pem`,
-  `id_*.pem`). A read is treated as an irreversible disclosure, not a
-  reversible operation: attended requests go to the human, and unattended
+- Unattended mode fails closed: a value of `unattended` that is not a known on or off
+  spelling is read as on, and the log records that once.
+- Credential stores never reach Jev: SSH keys, the `.ssh`, `.aws`, `.docker`,
+  `.kube` and `.gnupg` directories, opencode's data directory (`auth.json` and the
+  session history), `kubectl config view --raw`, registry and package tokens
+  (`.npmrc`, `.pypirc`, `.cargo/credentials`), `.config/git/credentials`, GPG and
+  netrc files, `/etc/shadow`, `*.p12` and `*.pfx` files, and `.pem` keys named as
+  keys (`*key*.pem`, `*private*.pem`, `id_*.pem`). A read is treated as an
+  irreversible disclosure, not a reversible operation: attended requests go to the human, and unattended
   requests are denied.
 - Log files are written with `0600` permissions.
 

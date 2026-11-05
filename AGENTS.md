@@ -81,7 +81,7 @@ bug.
 | `scripts/verify_autonomy.py` | non-interactive live check that the plugin answers the question tool (log resolved like `measure.py`) |
 | `tests/golden.json` + `tests/test_golden.py` | policy regression traps — a decision-logic/kind change without a new case here is unreviewed |
 | `plugin/jev-decision-gate/redteam.ts` | red-team harness: drives the real `evaluatePermission` over `eval/redteam.json` (offline stub or live Jev) |
-| `eval/` | red-team corpus (`redteam.json`, 96 cases) and dated results (`results/`); method and numbers in `docs/EVALUATION.md` |
+| `eval/` | red-team corpus (`redteam.json`, 113 cases) and dated results (`results/`); method and numbers in `docs/EVALUATION.md` |
 | `scripts/demo.sh` | one-command live demo in an isolated sandbox (needs `TYPESAFE_API_KEY`) |
 
 ## Non-negotiables (see `CONTRIBUTING.md` "Safety contract")
