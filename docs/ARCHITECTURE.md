@@ -30,16 +30,36 @@ permission evaluate hook (ctx.permission.hook("evaluate"))
   → catastrophic check (deterministic, no network, over the scanned text):
         → fetch or decode feeding a stdin interpreter: a real pipe in one pipeline
           or, when the original command was not recovered, a later segment
-          (fetchFeedsInterpreter). `python3 --version`, `node --test`, `bash setup.sh`
-          and `command -v` do not read stdin
-        → rm with a recursive and a force flag on a protected target (rmRemovesProtectedTarget)
+          (fetchFeedsInterpreter). Each interpreter has its own option table:
+          `python3 --version`, `node --test`, `python3 -m json.tool`, `bash setup.sh`
+          and `command -v` do not read stdin, `python3 -E`, `ruby -rjson` and
+          `node --inspect` do. Groups count as what they hold:
+          `curl U | (cd /tmp && bash)` and `{ curl U; } | python3` are caught
+        → rm with a recursive and a force flag and a protected target (`/`, `~`, `.`,
+          `..`, `/home`, `/root`, a `/home/<user>` directory), or with `--no-preserve-root`,
+          in one simple command (rmRemovesProtectedTarget). An rm word counts wherever it
+          sits in that command, and a statement break ends it
+        → power-off and reboot as the command word (`shutdown`, `reboot`, `halt`,
+          `poweroff`, `init 0|6`, `systemctl` and `loginctl` with `reboot|poweroff|halt|kexec`),
+          and `find` with `-delete` or `-exec rm` started from exactly `/`, `~`, `/home`,
+          `/root` or `/var`, a home directory, or a system tree (`/etc`, `/usr`, `/boot`,
+          `/bin`, `/sbin`, `/lib`, `/lib64`, `/opt`, `/var/lib`) or anything below one
         → `+refspec` force push, matched per git command (forcePushRefspec)
-        → the regex kill-list over overlapping 4000-char windows
+        → the text of a `sh -c '...'`, `bash -lc '...'` or `eval ...` is read back as
+          a command line, up to 3 levels deep, and so is the text a command runs for
+          another shell (`ssh`, `docker exec`, `su -c`, `find -exec`, ...)
+        → the regex kill-list over overlapping 4000-char windows (what a regex can
+          still decide: mkfs, dd, curl|sh, git push --force, terraform destroy, ...)
+        The token rules read a parsed command (`parseShell`): statements split on
+        `;` `&&` `||` `&` and newlines, pipeline stages on `|`, operators inside
+        quotes ignored, `( )`, `{ }`, `$( )` and backticks read as nested commands.
+        There is no grammar for `if`, `for` or `while`, and no heredoc bodies.
         Every simple command is read after its wrapper words are skipped: sudo
-        (with its options, long ones included), doas, env, nice, timeout, nohup,
-        command (but not `command -v`, which only looks up), exec, time, xargs,
-        stdbuf and busybox. Quotes and backslashes in a command word are removed
-        first, so `"rm"` and `\bash` read as rm and bash
+        (with its options, long ones and clusters like `-iu root` included), doas,
+        env, nice, ionice, timeout, nohup, setsid, command (but not `command -v`,
+        which only looks up), exec, time, xargs, stdbuf and busybox. Quotes and
+        backslashes in a command word are removed first, so `"rm"` and `\bash` read
+        as rm and bash, and `$SHELL` counts as a shell
         → effect=deny + message "Blocked by jev-decision-gate: ... kill-list"
   → credential-path check (deterministic, same scanned text; the list is in the
         credential ADR below)
@@ -291,7 +311,7 @@ Live autonomy check (non-interactive, against a running service):
 - **A dispatch prompt is prose, so a match in it goes to a human.** A task or
   subagent prompt is text written for another model, and nothing runs it as a
   command. A kill-list pattern in the resources (the agent's name) is still a
-  hard deny. A pattern found only in the prompt's prose, such as `shutdown` or
+  hard deny. A pattern found only in the prompt's prose, such as `rm -rf ~` or
   `drop table` in a sentence about a migration, goes to the human with
   `reason: subagent-prompt-flagged`, and is denied when unattended. The cost is
   that a prompt telling the subagent to run `rm -rf ~` is held rather than
@@ -333,12 +353,25 @@ Live autonomy check (non-interactive, against a running service):
   about 33k tokens (a 95k-char English state used 32.8k); `cli.py`
   retries with a smaller budget on `max_tokens_exceeded` instead of
   falling to ask-human.
-- **The kill-list scans everything it accepts.** `isCatastrophic`
-  runs over overlapping 4000-char windows, which keeps its regex
-  backtracking bounded per window and linear overall; requests over
-  256 KiB skip the scan and Jev and go to the human.
+- **The kill-list's cost is bounded.** `isCatastrophic` runs its regexes
+  over overlapping 4000-char windows (500 chars of overlap), so one window
+  bounds a regex's backtracking, and the token rules are single passes over
+  a parsed command. Re-reads of nested text (`bash -c` scripts, command lines
+  a command hands over, quoted payloads) share one budget of twice the input
+  length plus 4096 characters. When it runs out, the call fails closed and the
+  request is denied with the kill-list message. Requests over 256 KiB skip the
+  scan and Jev and go to the human.
 - **The deterministic rules read tokens, not only patterns.** A regex cannot
-  tell a flag from an operand, or a wrapper from the command it runs.
+  tell a flag from an operand, a statement from the next one, or a wrapper
+  from the command it runs. A regex also spans statements (`rm -rf dist && tsc
+  -p .` would read `.` as a target), matches a word wherever it sits
+  (`git commit -m "handle reboot"`) and can backtrack exponentially on a long
+  script, so the rm, power-off, find and fetch-to-interpreter rules run on a
+  parsed command in one linear pass. An `rm` word counts anywhere in its simple
+  command (a dispatch prompt is prose around it), never across a statement
+  break, and a quoted string is one word.
+  `git push --force-with-lease` and `--force-if-includes` stay on the
+  kill-list on purpose: they still rewrite remote history.
   `commandTokens` therefore skips leading wrapper words and their options
   before any rule looks at a command, so `sudo -E bash` and `env FOO=1 sh`
   read as the interpreter they run. `rmRemovesProtectedTarget` classifies
@@ -349,6 +382,23 @@ Live autonomy check (non-interactive, against a running service):
   arguments of a `git push`, after its global options (`git -C dir`,
   `git -c k=v`), so a `+` in another command's argument does not fire. A
   short-flag cluster that holds `f` (`-fu`, `-uf`) is a force push too.
+- **A command that runs its argument hands that argument to be judged as a
+  command.** `ssh host '...'`, `docker` or `podman exec`, `kubectl exec ... --`,
+  `su -c`, `watch`, `flock`, `nsenter`, `chroot`, `find -exec`, a git `!`
+  alias, and `echo` or `printf` piped into a shell: the words are read back as
+  a command line of their own, and every rule applies to it. Any other quoted
+  word that holds whitespace is read for a wipe and a `+refspec` push only, so
+  a power-off inside it is not seen. `echo "rm -rf /"` is denied on purpose,
+  because the gate cannot tell prose from a command.
+- **The shell reader is not a shell grammar, and the gaps are known.**
+  `then`, `do` and `else` stay in the first word of their statement, so a
+  power-off, a `find -delete` or a fetch into a stdin interpreter other than
+  `sh` or `bash` after them is missed (`for h in a; do reboot; done` passes).
+  A wipe is still found, since an rm word counts anywhere in its statement. A heredoc body is read one line
+  at a time, so a body line that starts with a wipe is denied. A pipe that
+  continues on the next line is two statements to the reader, so the fetch
+  rule misses it (`wget URL |` then a newline and `python3 -`), while the regex
+  still catches `curl URL |` followed by a newline and `sh`.
 - **Credential stores are deterministic, not Jev's call.**
   `touchesCredentialStore` scans the same recovered text as the
   kill-list and, for every action except `question`, stops before any
@@ -357,17 +407,24 @@ Live autonomy check (non-interactive, against a running service):
   live red-team runs (2026-11-05, three repeats) had Jev allow
   `~/.ssh/id_rsa` in at least one. Attended leaves `effect=ask` (the
   human decides); unattended denies with the hold message, because
-  `--auto` would turn that ask into an allow. The match is
-  prefix-agnostic, so `~`, `$HOME`, `${HOME}`, `/home/<user>` and
-  `/root` are the same case. Both the raw text and its normalized form are checked, so
-  quotes or backslashes spliced into a path (`~/.s"s"h/id_rsa`) do not hide it.
+  `--auto` would turn that ask into an allow. `.ssh` matches wherever it
+  sits. `.aws`, `.docker`, `.kube` and `.gnupg` are also folder names in
+  projects (`docker build -f .docker/Dockerfile .`), so as directories they
+  match only after a home or root prefix: `~`, `$HOME`, `${HOME}`,
+  `/home/<user>`, `/Users/<user>` or `/root`. Both the raw text and its
+  normalized form are checked, so quotes or backslashes spliced into a path
+  (`~/.s"s"h/id_rsa`) do not hide it.
   It matches credential paths and file names,
   not the word `ssh`: `docs/ssh-setup.md` and a standalone `*.pub` do
   not fire. The list is:
-  - the `.ssh`, `.aws`, `.docker`, `.kube` and `.gnupg` directories, whole: the
-    name must end after the word (`~/.ssh/config`, `~/.aws/cred*` and
-    `~/.docker/config.json` match; `www.ssh.com`, `.ssh-agent-notes.md` and
-    `.dockerignore` do not)
+  - the `.ssh` directory, whole, anywhere: the name must end after the word
+    (`~/.ssh/config` and `.ssh/id_x` match; `www.ssh.com` and
+    `.ssh-agent-notes.md` do not)
+  - the `.aws`, `.docker`, `.kube` and `.gnupg` directories, whole, after a
+    home or root prefix (`~/.aws/cred*` matches; `./.aws/config` does not, and
+    neither does `.dockerignore`)
+  - the credential files `.aws/credentials`, `.docker/config.json` and
+    `.kube/config`, anywhere (`~/.docker/config.json` matches too)
   - opencode's data directory, `.local/share/opencode` (its `auth.json` and the
     session history)
   - `kubectl config view` with `--raw`, which prints every credential unredacted

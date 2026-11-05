@@ -32,9 +32,10 @@ or export `JEV_GATE_UNATTENDED=1`. Check the log after a run: a shell command
 with `gateAction: "allow"` or `"ask-human"` and no `unattended` field, from a
 session started with `--auto`, means the option was not set in that process.
 
-Evidence (2026-11-05, opencode 2.2.3, unattended live run): all 81 unsafe
-corpus cases denied, none allowed. The five benign cases that the attended run
-held for a human were denied. See [EVALUATION.md](EVALUATION.md).
+Evidence (2026-11-05, opencode 2.2.3, unattended live run): all 94 unsafe
+corpus cases denied, none allowed. The 12 benign cases it denied are all among
+the 13 that the attended run held for a human or denied. See
+[EVALUATION.md](EVALUATION.md).
 
 ## "It never asks Jev, I always get the manual prompt"
 
@@ -53,9 +54,9 @@ tail -5 <that path>
 | `error_class: gate timeout` | Jev slow / offline | raise `timeoutMs` (max 30000) |
 | no log lines at all, `permission: "allow"` in config | no `permission.asked` fires at all when the ambient mode is already `allow`, nothing to intercept | set `"permission": "ask"` (global or project config); that's what lets the gate substitute Jev for the human in the first place |
 | no log lines at all, `permission: "ask"` already set | hook never fired for another reason | check `opencode debug config` resolves your plugin path; re-check with `python3 -m jev_gate.doctor` |
-| `reason: catastrophic-pattern` | command matched kill-list | intended: rewrite the command |
+| `reason: catastrophic-pattern` | command matched kill-list: a recursive forced `rm` of a protected target, a power-off or reboot as a command, a `find -delete` from a system root, a force push, pipe-to-shell, ... A quoted wipe in prose, such as `echo "rm -rf /"`, matches too | intended: rewrite the command. A quoted wipe in prose is denied on purpose, so reword the text to leave the wipe out |
 | `reason: credential-path` | the command or edit touches a credential store (SSH keys, cloud tokens, `.netrc`, ...) | intended: Jev is not consulted; attended, the prompt is yours; unattended, denied |
-| `reason: subagent-prompt-flagged` | a task or subagent dispatch prompt matches a kill-list pattern only in its prose, for example `shutdown` or `drop table` in a sentence about a migration | intended: the prompt is prose, so this match alone is not a hard deny; attended, the human decides; unattended, denied with the hold message. If it is a false positive, reword the prompt so the pattern is not in it |
+| `reason: subagent-prompt-flagged` | a task or subagent dispatch prompt matches a kill-list rule only in its prose, for example `drop table` in a sentence about a migration, or a command such as `shutdown -r` in backticks | intended: the prompt is prose, so this match alone is not a hard deny; attended, the human decides; unattended, denied with the hold message. If it is a false positive, reword the prompt so the pattern is not in it |
 | `reason: context-lookup-failed` | the session lookup that recovers the shell command or the dispatch prompt threw, or went past 3 s (`error_class: lookup timeout`) | intended: the gate holds the request rather than judge fragments; attended, the human decides; unattended, denied. Repeated timeouts point at a slow or stuck opencode service |
 | `reason: config-unattended-unrecognised` | `unattended` in the plugin options or `JEV_GATE_UNATTENDED` holds a value that is neither a known on nor a known off spelling (a typo such as `ture`, a number other than 0 or 1, an object) | logged once per setup, without the value. The value is treated as on. Set `true` or `false`, or unset the variable |
 
