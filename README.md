@@ -7,9 +7,9 @@
 
 An LLM permission gate for OpenCode agents that blocks irreversible actions before they run and only interrupts a human when it matters.
 
-![jev-decision-gate demo](docs/demo/demo.gif)
-
-[Watch the full demo (MP4, 111 s)](docs/demo/demo.mp4)
+<div align="center">
+  <img src="docs/demo/demo.gif" alt="jev-decision-gate demo" />
+</div>
 
 ## Project overview
 
