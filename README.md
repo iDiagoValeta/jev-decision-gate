@@ -1,5 +1,7 @@
 # jev-decision-gate
 
+> **Context.** Built in September 2026 as a personal project, when I was starting as AI Engineer at Inditex, right after leading the back end and engineering standard of a four-person team at Auro AI. It follows the way I work now: a design spec and implementation plan before the code (the first commits), tests, CI and an agent guide (`AGENTS.md`).
+
 [![CI](https://github.com/iDiagoValeta/jev-decision-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/iDiagoValeta/jev-decision-gate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
